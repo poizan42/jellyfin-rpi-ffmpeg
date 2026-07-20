@@ -21,6 +21,7 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <sys/ioctl.h>
 
 /* This was introduced in version 4.6. And may not exist all without an
  * optional package. So to prevent a hard dependency on needing the Linux
@@ -31,6 +32,7 @@
 #endif
 
 #include <drm.h>
+#include <libdrm/drm_fourcc.h>
 #include <xf86drm.h>
 
 #include "avassert.h"
@@ -40,19 +42,89 @@
 #include "imgutils.h"
 #include "mem.h"
 
+#if CONFIG_SAND
+#include "libavutil/rpi_sand_fns.h"
+#endif
+
+typedef struct drm_dev_ctx {
+    AVDRMDeviceContext ctx;
+    AVDictionary * opts;
+    uint32_t *fmts;
+} drm_dev_ctx;
 
 static void drm_device_free(AVHWDeviceContext *hwdev)
 {
-    AVDRMDeviceContext *hwctx = hwdev->hwctx;
+    drm_dev_ctx *ctx = hwdev->hwctx;
+    AVDRMDeviceContext *hwctx = &ctx->ctx;
 
-    close(hwctx->fd);
+    if (hwctx->fd != -1)
+        close(hwctx->fd);
+
+    av_dict_free(&ctx->opts);
+    av_freep(&ctx->fmts);
+}
+
+static uint32_t *
+mk_fmt_list(AVHWDeviceContext *hwdev, AVDictionary * opts)
+{
+    AVDictionaryEntry * ent;
+    char * fmtsstr;
+    uint32_t * fmts = NULL;
+    uint32_t * d;
+    unsigned int n;
+    const uint8_t * p;
+    const uint8_t * e;
+
+    if ((ent = av_dict_get(opts, "v4l2fmts", NULL, 0)) == NULL)
+        return NULL;
+    fmtsstr = ent->value;
+
+    n = strlen(fmtsstr);
+    if ((fmts = av_mallocz(((n + 6) / 5) * sizeof(*fmts))) == NULL)
+        return NULL;
+
+    p = fmtsstr;
+    d = fmts;
+    do {
+        if ((e = strchr(p, '/')) == NULL)
+            e = fmtsstr + n;
+
+        if (e - p == 4)
+            *d++ = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+        else
+            av_log(hwdev, AV_LOG_ERROR, "Bad V4L2 fourcc: '%.*s'\n", (int)(e - p), p);
+
+        p = e + 1;
+    } while (*e != 0);
+
+    if (d == fmts)
+        av_freep(&fmts);
+
+    return fmts;
 }
 
 static int drm_device_create(AVHWDeviceContext *hwdev, const char *device,
                              AVDictionary *opts, int flags)
 {
-    AVDRMDeviceContext *hwctx = hwdev->hwctx;
+    drm_dev_ctx *ctx = hwdev->hwctx;
+    AVDRMDeviceContext *hwctx = &ctx->ctx;
     drmVersionPtr version;
+
+    hwctx->fd = -1;
+    ctx->opts = NULL;
+    ctx->fmts = NULL;
+    hwdev->free = &drm_device_free;
+
+    if (opts != NULL) {
+        int rv = av_dict_copy(&ctx->opts, opts, 0);
+        if (rv != 0)
+            return rv;
+
+        ctx->fmts = mk_fmt_list(hwdev, ctx->opts);
+    }
+
+    if (device == NULL)
+        return 0;
 
     hwctx->fd = open(device, O_RDWR);
     if (hwctx->fd < 0)
@@ -73,8 +145,33 @@ static int drm_device_create(AVHWDeviceContext *hwdev, const char *device,
 
     drmFreeVersion(version);
 
-    hwdev->free = &drm_device_free;
+    return 0;
+}
 
+int av_hwcontext_drm_v4l2_4cc_test(AVBufferRef * hw_device_ctx, uint32_t fcc)
+{
+    AVHWDeviceContext * dev_ctx;
+    drm_dev_ctx * ctx;
+    const uint32_t * p;
+
+    if (hw_device_ctx == NULL)
+        return 0;
+
+    dev_ctx = (AVHWDeviceContext *)hw_device_ctx->data;
+    if (dev_ctx == NULL || dev_ctx->type != AV_HWDEVICE_TYPE_DRM)
+        return 0;
+
+    ctx = dev_ctx->hwctx;
+    if (ctx == NULL)
+        return 0;
+
+    // If unspecified then all are OK
+    if (ctx->fmts == NULL)
+        return 1;
+
+    for (p = ctx->fmts; *p != 0; ++p)
+        if (*p == fcc)
+            return 1;
     return 0;
 }
 
@@ -140,6 +237,8 @@ static int drm_map_frame(AVHWFramesContext *hwfc,
     if (flags & AV_HWFRAME_MAP_WRITE)
         mmap_prot |= PROT_WRITE;
 
+    if (dst->format == AV_PIX_FMT_NONE)
+        dst->format = hwfc->sw_format;
 #if HAVE_LINUX_DMA_BUF_H
     if (flags & AV_HWFRAME_MAP_READ)
         map->sync_flags |= DMA_BUF_SYNC_READ;
@@ -186,12 +285,34 @@ static int drm_map_frame(AVHWFramesContext *hwfc,
 
     dst->width  = src->width;
     dst->height = src->height;
+    // Crop copied with props
+
+#if CONFIG_SAND
+    // Rework for sand frames
+    if (av_rpi_is_sand_frame(dst)) {
+        // As it stands the sand formats hold stride2 in linesize[3]
+        // linesize[0] & [1] contain stride1 which is always 128 for everything we do
+        // * Arguably this should be reworked s.t. stride2 is in linesize[0] & [1]
+        int mod_stride = fourcc_mod_broadcom_param(desc->objects[0].format_modifier);
+        if (mod_stride == 0) {
+            dst->linesize[3] = dst->linesize[0];
+            dst->linesize[4] = dst->linesize[1];
+        }
+        else {
+            dst->linesize[3] = mod_stride;
+            dst->linesize[4] = mod_stride;
+        }
+        dst->linesize[0] = 128;
+        dst->linesize[1] = 128;
+    }
+#endif
 
     err = ff_hwframe_map_create(src->hw_frames_ctx, dst, src,
-                                &drm_unmap_frame, map);
+                                drm_unmap_frame, map);
     if (err < 0)
         goto fail;
 
+    av_frame_copy_props(dst, src);
     return 0;
 
 fail:
@@ -207,16 +328,29 @@ static int drm_transfer_get_formats(AVHWFramesContext *ctx,
                                     enum AVHWFrameTransferDirection dir,
                                     enum AVPixelFormat **formats)
 {
-    enum AVPixelFormat *pix_fmts;
+    enum AVPixelFormat *p;
 
-    pix_fmts = av_malloc_array(2, sizeof(*pix_fmts));
-    if (!pix_fmts)
+    p = *formats = av_malloc_array(3, sizeof(*p));
+    if (!p)
         return AVERROR(ENOMEM);
 
-    pix_fmts[0] = ctx->sw_format;
-    pix_fmts[1] = AV_PIX_FMT_NONE;
+    // **** Offer native sand too ????
+    *p++ =
+#if CONFIG_SAND
+        ctx->sw_format == AV_PIX_FMT_RPI4_8 || ctx->sw_format == AV_PIX_FMT_SAND128 ?
+            AV_PIX_FMT_YUV420P :
+        ctx->sw_format == AV_PIX_FMT_RPI4_10 ?
+            AV_PIX_FMT_YUV420P10LE :
+#endif
+            ctx->sw_format;
 
-    *formats = pix_fmts;
+#if CONFIG_SAND
+    if (ctx->sw_format == AV_PIX_FMT_RPI4_10 ||
+        ctx->sw_format == AV_PIX_FMT_RPI4_8 || ctx->sw_format == AV_PIX_FMT_SAND128)
+        *p++ = AV_PIX_FMT_NV12;
+#endif
+
+    *p = AV_PIX_FMT_NONE;
     return 0;
 }
 
@@ -232,18 +366,62 @@ static int drm_transfer_data_from(AVHWFramesContext *hwfc,
     map = av_frame_alloc();
     if (!map)
         return AVERROR(ENOMEM);
-    map->format = dst->format;
 
+    // Map to default
+    map->format = AV_PIX_FMT_NONE;
     err = drm_map_frame(hwfc, map, src, AV_HWFRAME_MAP_READ);
     if (err)
         goto fail;
 
-    map->width  = dst->width;
-    map->height = dst->height;
+#if 0
+    av_log(hwfc, AV_LOG_INFO, "%s: src fmt=%d (%d), dst fmt=%d (%d) s=%dx%d l=%d/%d/%d/%d, d=%dx%d l=%d/%d/%d\n", __func__,
+           hwfc->sw_format, AV_PIX_FMT_RPI4_8, dst->format, AV_PIX_FMT_YUV420P10LE,
+           map->width, map->height,
+           map->linesize[0],
+           map->linesize[1],
+           map->linesize[2],
+           map->linesize[3],
+           dst->width, dst->height,
+           dst->linesize[0],
+           dst->linesize[1],
+           dst->linesize[2]);
+#endif
+#if CONFIG_SAND
+    if (av_rpi_is_sand_frame(map)) {
+        const unsigned int w = FFMIN(dst->width, map->width);
+        const unsigned int h = FFMIN(dst->height, map->height);
 
-    err = av_frame_copy(dst, map);
+        map->crop_top = 0;
+        map->crop_bottom = 0;
+        map->crop_left = 0;
+        map->crop_right = 0;
+
+        if (av_rpi_sand_to_planar_frame(dst, map) != 0)
+        {
+            av_log(hwfc, AV_LOG_ERROR, "%s: Incompatible output pixfmt for sand\n", __func__);
+            err = AVERROR(EINVAL);
+            goto fail;
+        }
+
+        dst->width = w;
+        dst->height = h;
+        // Cropping restored as part of props
+    }
+    else
+#endif
+    {
+        dst->width  = map->width;
+        dst->height = map->height;
+        err = av_frame_copy(dst, map);
+    }
+
+    av_frame_copy_props(dst, src);
+
     if (err)
+    {
+        av_log(hwfc, AV_LOG_ERROR, "%s: Copy fail\n", __func__);
         goto fail;
+    }
 
     err = 0;
 fail:
@@ -258,7 +436,10 @@ static int drm_transfer_data_to(AVHWFramesContext *hwfc,
     int err;
 
     if (src->width > hwfc->width || src->height > hwfc->height)
+    {
+        av_log(hwfc, AV_LOG_ERROR, "%s: H/w mismatch: %d/%d, %d/%d\n", __func__, dst->width, hwfc->width, dst->height, hwfc->height);
         return AVERROR(EINVAL);
+    }
 
     map = av_frame_alloc();
     if (!map)
@@ -288,9 +469,7 @@ static int drm_map_from(AVHWFramesContext *hwfc, AVFrame *dst,
 {
     int err;
 
-    if (dst->format == AV_PIX_FMT_NONE)
-        dst->format = hwfc->sw_format;
-    else if (hwfc->sw_format != dst->format)
+    if (hwfc->sw_format != dst->format && dst->format != AV_PIX_FMT_NONE)
         return AVERROR(ENOSYS);
 
     err = drm_map_frame(hwfc, dst, src, flags);
@@ -308,7 +487,7 @@ const HWContextType ff_hwcontext_type_drm = {
     .type                   = AV_HWDEVICE_TYPE_DRM,
     .name                   = "DRM",
 
-    .device_hwctx_size      = sizeof(AVDRMDeviceContext),
+    .device_hwctx_size      = sizeof(drm_dev_ctx),
 
     .device_create          = &drm_device_create,
 

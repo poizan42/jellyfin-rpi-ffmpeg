@@ -42,6 +42,14 @@ static const struct fmt_conversion {
     { AV_FMT(RGB24),       AV_CODEC(RAWVIDEO),    V4L2_FMT(RGB24) },
     { AV_FMT(BGR0),        AV_CODEC(RAWVIDEO),    V4L2_FMT(BGR32) },
     { AV_FMT(0RGB),        AV_CODEC(RAWVIDEO),    V4L2_FMT(RGB32) },
+    { AV_FMT(BGR0),        AV_CODEC(RAWVIDEO),    V4L2_FMT(BGRX32) },
+    { AV_FMT(RGB0),        AV_CODEC(RAWVIDEO),    V4L2_FMT(RGBX32) },
+    { AV_FMT(0BGR),        AV_CODEC(RAWVIDEO),    V4L2_FMT(XBGR32) },
+    { AV_FMT(0RGB),        AV_CODEC(RAWVIDEO),    V4L2_FMT(XRGB32) },
+    { AV_FMT(BGRA),        AV_CODEC(RAWVIDEO),    V4L2_FMT(BGRA32) },
+    { AV_FMT(RGBA),        AV_CODEC(RAWVIDEO),    V4L2_FMT(RGBA32) },
+    { AV_FMT(ABGR),        AV_CODEC(RAWVIDEO),    V4L2_FMT(ABGR32) },
+    { AV_FMT(ARGB),        AV_CODEC(RAWVIDEO),    V4L2_FMT(ARGB32) },
     { AV_FMT(GRAY8),       AV_CODEC(RAWVIDEO),    V4L2_FMT(GREY) },
     { AV_FMT(YUV420P),     AV_CODEC(RAWVIDEO),    V4L2_FMT(YUV420) },
     { AV_FMT(YUYV422),     AV_CODEC(RAWVIDEO),    V4L2_FMT(YUYV) },
@@ -51,6 +59,7 @@ static const struct fmt_conversion {
     { AV_FMT(YUV410P),     AV_CODEC(RAWVIDEO),    V4L2_FMT(YUV410) },
     { AV_FMT(YUV410P),     AV_CODEC(RAWVIDEO),    V4L2_FMT(YVU410) },
     { AV_FMT(NV12),        AV_CODEC(RAWVIDEO),    V4L2_FMT(NV12) },
+    { AV_FMT(P010),        AV_CODEC(RAWVIDEO),    V4L2_FMT(P010) },
     { AV_FMT(NONE),        AV_CODEC(MJPEG),       V4L2_FMT(MJPEG) },
     { AV_FMT(NONE),        AV_CODEC(MJPEG),       V4L2_FMT(JPEG) },
 #ifdef V4L2_PIX_FMT_SRGGB8
@@ -103,6 +112,9 @@ static const struct fmt_conversion {
 #endif
 #ifdef V4L2_PIX_FMT_HEVC
     { AV_FMT(NONE),        AV_CODEC(HEVC),        V4L2_FMT(HEVC) },
+#endif
+#ifdef V4L2_PIX_FMT_AV1
+    { AV_FMT(NONE),        AV_CODEC(AV1),         V4L2_FMT(AV1) },
 #endif
 #ifdef V4L2_PIX_FMT_VC1_ANNEX_G
     { AV_FMT(NONE),        AV_CODEC(VC1),         V4L2_FMT(VC1_ANNEX_G) },

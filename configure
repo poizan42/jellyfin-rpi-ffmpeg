@@ -203,6 +203,7 @@ External library support:
   --enable-cairo           enable cairo [no]
   --disable-coreimage      disable Apple CoreImage framework [autodetect]
   --enable-chromaprint     enable audio fingerprinting with chromaprint [no]
+  --disable-epoxy          disable epoxy [autodetect]
   --enable-frei0r          enable frei0r video filtering [no]
   --enable-gcrypt          enable gcrypt, needed for rtmp(t)e support
                            if openssl, librtmp or gmp is not used [no]
@@ -292,6 +293,7 @@ External library support:
   --enable-libtorch        enable Torch as one DNN backend [no]
   --enable-libtwolame      enable MP2 encoding via libtwolame [no]
   --enable-libuavs3d       enable AVS3 decoding via libuavs3d [no]
+  --disable-libudev        disable libudev [autodetect]
   --enable-libv4l2         enable libv4l2/v4l-utils [no]
   --enable-libvidstab      enable video stabilization using vid.stab [no]
   --enable-libvmaf         enable vmaf filter via libvmaf [no]
@@ -362,12 +364,16 @@ External library support:
   --enable-libvpl          enable Intel oneVPL code via libvpl if libmfx is not used [no]
   --enable-libnpp          enable Nvidia Performance Primitives-based code [no]
   --enable-mmal            enable Broadcom Multi-Media Abstraction Layer (Raspberry Pi) via MMAL [no]
+  --enable-sand            enable sand video formats [rpi]
+  --enable-vout-drm        enable the vout_drm module - for internal testing only [no]
+  --enable-vout-egl        enable the vout_egl module - for internal testing only [no]
   --disable-nvdec          disable Nvidia video decoding acceleration (via hwaccel) [autodetect]
   --disable-nvenc          disable Nvidia video encoding code [autodetect]
   --enable-omx             enable OpenMAX IL code [no]
   --enable-omx-rpi         enable OpenMAX IL code for Raspberry Pi [no]
   --enable-rkmpp           enable Rockchip Media Process Platform code [no]
   --disable-v4l2-m2m       disable V4L2 mem2mem code [autodetect]
+  --enable-v4l2-request    enable V4L2 request API code [no]
   --disable-vaapi          disable Video Acceleration API (mainly Unix/Intel) code [autodetect]
   --disable-vdpau          disable Nvidia Video Decode and Presentation API for Unix code [autodetect]
   --disable-videotoolbox   disable VideoToolbox code [autodetect]
@@ -1969,7 +1975,9 @@ EXTERNAL_AUTODETECT_LIBRARY_LIST="
     avfoundation
     bzlib
     coreimage
+    epoxy
     iconv
+    libudev
     libxcb
     libxcb_shm
     libxcb_shape
@@ -2044,6 +2052,7 @@ EXTERNAL_LIBRARY_LIST="
     libcodec2
     libdav1d
     libdc1394
+    libdrm
     libflite
     libfontconfig
     libfreetype
@@ -2162,6 +2171,7 @@ HWACCEL_LIBRARY_LIST="
     mmal
     omx
     opencl
+    v4l2_request
 "
 
 DOCUMENT_LIST="
@@ -2179,11 +2189,15 @@ FEATURE_LIST="
     omx_rpi
     runtime_cpudetect
     safe_bitstream_reader
+    sand
     shared
     small
     static
     swscale_alpha
     unstable
+    v4l2_req_hevc_vx
+    vout_drm
+    vout_egl
 "
 
 # this list should be kept in linking order
@@ -2781,6 +2795,7 @@ CONFIG_EXTRA="
     rtpdec
     rtpenc_chain
     rv34dsp
+    sand
     scene_sad
     sinewin
     smpte_436m
@@ -3341,6 +3356,7 @@ dxva2_deps="dxva2api_h DXVA2_ConfigPictureDecode ole32 user32"
 ffnvcodec_deps_any="libdl LoadLibrary"
 mediacodec_deps="android mediandk pthreads"
 nvdec_deps="ffnvcodec"
+v4l2_request_deps="linux_videodev2_h linux_media_h v4l2_timeval_to_ns libdrm libudev"
 vaapi_x11_deps="xlib_x11"
 videotoolbox_hwaccel_deps="videotoolbox pthreads"
 videotoolbox_hwaccel_extralibs="-framework QuartzCore"
@@ -3401,6 +3417,8 @@ hevc_dxva2_hwaccel_deps="dxva2 DXVA_PicParams_HEVC"
 hevc_dxva2_hwaccel_select="hevc_decoder"
 hevc_nvdec_hwaccel_deps="nvdec"
 hevc_nvdec_hwaccel_select="hevc_decoder"
+hevc_v4l2request_hwaccel_deps="v4l2_request"
+hevc_v4l2request_hwaccel_select="hevc_decoder"
 hevc_vaapi_hwaccel_deps="vaapi VAPictureParameterBufferHEVC"
 hevc_vaapi_hwaccel_select="hevc_decoder"
 hevc_vdpau_hwaccel_deps="vdpau VdpPictureInfoHEVC"
@@ -3563,6 +3581,7 @@ av1_nvenc_encoder_select="atsc_a53"
 av1_qsv_decoder_select="qsvdec"
 av1_qsv_encoder_deps="libvpl"
 av1_qsv_encoder_select="qsvenc"
+av1_v4l2m2m_decoder_deps="v4l2_m2m av1_v4l2_m2m"
 av1_vaapi_encoder_deps="VAEncPictureParameterBufferAV1"
 av1_vaapi_encoder_select="cbs_av1 vaapi_encode"
 av1_vulkan_encoder_deps="vulkan_1_4"
@@ -4000,8 +4019,11 @@ sndio_indev_deps="sndio"
 sndio_outdev_deps="sndio"
 v4l2_indev_deps_any="linux_videodev2_h sys_videoio_h"
 v4l2_indev_suggest="libv4l2"
+v4l2_outdev_deps="libdrm"
 v4l2_outdev_deps_any="linux_videodev2_h sys_videoio_h"
 v4l2_outdev_suggest="libv4l2"
+vout_drm_outdev_deps="libdrm"
+vout_egl_outdev_deps="xlib epoxy"
 vfwcap_indev_deps="vfw32 vfwcap_defines"
 xcbgrab_indev_deps="libxcb"
 xcbgrab_indev_suggest="libxcb_shm libxcb_shape libxcb_xfixes"
@@ -4112,6 +4134,7 @@ cropdetect_filter_deps="gpl"
 deinterlace_qsv_filter_deps="libmfx"
 deinterlace_qsv_filter_select="qsvvpp"
 deinterlace_vaapi_filter_deps="vaapi"
+deinterlace_v4l2m2m_filter_deps="libdrm v4l2_m2m"
 delogo_filter_deps="gpl"
 denoise_vaapi_filter_deps="vaapi"
 derain_filter_select="dnn"
@@ -4227,6 +4250,7 @@ transpose_opencl_filter_deps="opencl"
 transpose_vaapi_filter_deps="vaapi VAProcPipelineCaps_rotation_flags"
 transpose_vt_filter_deps="videotoolbox VTPixelRotationSessionCreate"
 transpose_vulkan_filter_deps="vulkan spirv_library"
+unsand_filter_select="sand"
 unsharp_opencl_filter_deps="opencl"
 uspp_filter_deps="gpl avcodec"
 vaguedenoiser_filter_deps="gpl"
@@ -4238,6 +4262,7 @@ libvmaf_cuda_filter_deps="libvmaf libvmaf_cuda ffnvcodec"
 zmq_filter_deps="libzmq"
 zoompan_filter_deps="swscale"
 zscale_filter_deps="libzimg const_nan"
+scale_v4l2m2m_filter_deps="libdrm v4l2_m2m"
 scale_vaapi_filter_deps="vaapi"
 scale_vt_filter_deps="videotoolbox VTPixelTransferSessionCreate"
 scale_vulkan_filter_deps="vulkan spirv_compiler spirv_library"
@@ -6966,6 +6991,12 @@ if enabled xlib; then
         disable xlib
 fi
 
+enabled libudev &&
+    check_pkg_config libudev libudev libudev.h udev_new
+
+enabled epoxy &&
+    check_pkg_config epoxy epoxy epoxy/egl.h epoxy_egl_version
+
 check_headers direct.h
 check_headers dirent.h
 check_headers dxgidebug.h
@@ -7501,7 +7532,15 @@ enabled rkmpp             && { require_pkg_config rkmpp "rockchip_mpp >= 1.3.8" 
                                { enabled libdrm ||
                                  die "ERROR: rkmpp requires --enable-libdrm"; }
                              }
+enabled v4l2_request      && { enabled libdrm ||
+                               die "ERROR: v4l2-request requires --enable-libdrm"; } &&
+                             { enabled libudev ||
+                               die "ERROR: v4l2-request requires libudev"; }
 enabled vapoursynth       && require_headers "vapoursynth/VSScript4.h vapoursynth/VapourSynth4.h"
+
+enabled vout_drm && { enabled libdrm || die "ERROR: vout_drm requires --enable-libdrm"; }
+enabled vout_egl && { enabled epoxy || die "ERROR: vout_egl requires epoxy"; } &&
+                    { enabled xlib  || die "ERROR: vout_egl requires xlib"; }
 
 if enabled gcrypt; then
     GCRYPT_CONFIG="${cross_prefix}libgcrypt-config"
@@ -7586,7 +7625,12 @@ if enabled v4l2_m2m; then
     check_cc h264_v4l2_m2m linux/videodev2.h "int i = V4L2_PIX_FMT_H264;"
     check_cc vp8_v4l2_m2m linux/videodev2.h "int i = V4L2_PIX_FMT_VP8;"
     check_cc vp9_v4l2_m2m linux/videodev2.h "int i = V4L2_PIX_FMT_VP9;"
+    check_cc av1_v4l2_m2m linux/videodev2.h "int i = V4L2_PIX_FMT_AV1;"
 fi
+
+check_func_headers "linux/media.h linux/videodev2.h" v4l2_timeval_to_ns
+check_cc hevc_v4l2_request linux/videodev2.h "int i = V4L2_PIX_FMT_HEVC_SLICE;"
+disable v4l2_req_hevc_vx
 
 check_headers sys/videoio.h
 test_code cc sys/videoio.h "struct v4l2_frmsizeenum vfse; vfse.discrete.width = 0;" && enable_sanitized struct_v4l2_frmivalenum_discrete
@@ -8195,6 +8239,9 @@ enabled threads || warn \
     "This means that not only is this build not multi-threaded, but also"    \
     "that the libraries from this build MUST NOT be used in a multi-threaded"\
     "environment."
+
+# Sub-feature of hevc_v4l2request_hwaccel - can only be set once deps are done
+enabled hevc_v4l2request_hwaccel && disabled hevc_v4l2_request && enable v4l2_req_hevc_vx
 
 case $target_os in
 *-dos|freedos|opendos)
