@@ -820,7 +820,7 @@ static int v4l2_buffer_swframe_to_buf(const AVFrame *frame, V4L2Buffer *out)
 
             if (is_chroma(desc, i, num_planes)) {
                 // Is chroma
-                dst_stride >>= desc->log2_chroma_w;
+                dst_stride = (dst_stride >> desc->log2_chroma_w) * pel_strides[i];
                 offset += dst_stride * (out->context->height >> desc->log2_chroma_h);
                 w = AV_CEIL_RSHIFT(w, desc->log2_chroma_w);
                 h = AV_CEIL_RSHIFT(h, desc->log2_chroma_h);
