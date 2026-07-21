@@ -619,6 +619,148 @@ function ff_rpi_sand30_lines_to_planar_c16, export=1
 
 endfunc
 
+@ void ff_rpi_sand30_lines_to_planar_c8(
+@   uint8_t * dst_u,            // [r0]
+@   unsigned int dst_stride_u,  // [r1]
+@   uint8_t * dst_v,            // [r2]
+@   unsigned int dst_stride_v,  // [r3]
+@   const uint8_t * src,        // [sp, #0]  -> r4, r5
+@   unsigned int stride1,       // [sp, #4]  128
+@   unsigned int stride2,       // [sp, #8]  -> r8
+@   unsigned int _x,            // [sp, #12] 0
+@   unsigned int y,             // [sp, #16] (r7 in prefix)
+@   unsigned int _w,            // [sp, #20] -> r6, r9
+@   unsigned int h);            // [sp, #24] -> r7
+@
+@ 10-bit SAND30 chroma -> two 8-bit U/V planes (low 2 bits dropped, as _y8).
+@ Body (deinterleave + mask) is identical to _c16; only the store differs:
+@ the clean 10-bit U (q9,q10,q11) / V (q0,q1,q2) are narrowed >>2 to 8 bits
+@ (vshrn.u16 #2) and written as two interleaved 8-bit planes.
+@
+@ NOTE: UNTESTED. Authored on aarch64 with no 32-bit ARM build/assemble/run
+@ environment available; the aarch64 twin is checkasm bit-exact. Verify with
+@ tests/checkasm on a 32-bit ARM build before relying on this.
+@
+@ Assumes that we are starting on a stripe boundary and that overreading
+@ within the stripe is OK. However it does respect the dest size for writing
+
+function ff_rpi_sand30_lines_to_planar_c8, export=1
+                push            {r4-r10, lr}    @ +32
+                ldr             r5,  [sp, #32]
+                ldr             r8,  [sp, #40]
+                ldr             r7,  [sp, #48]
+                ldr             r9,  [sp, #52]
+                sub             r8,  #1
+                lsl             r8,  #7
+                add             r5,  r5,  r7,  lsl #7
+                sub             r1,  r1,  r9
+                sub             r3,  r3,  r9
+                ldr             r7,  [sp, #56]
+10:
+                mov             lr,  #0
+                mov             r4,  r5
+                mov             r6,  r9
+1:
+                vldm            r4!, {q0-q3}
+                add             lr,  #64
+
+                @ N.B. unpack [0,1,2] -> (reg order) 1, 0, 2
+                vshrn.u32       d20, q0,  #14
+                vmovn.u32       d18, q0
+                vshrn.u32       d0,  q0,  #10
+                ands            lr,  #127
+
+                vshrn.u32       d21, q1,  #14
+                vmovn.u32       d19, q1
+                vshrn.u32       d1,  q1,  #10
+
+                vshrn.u32       d22, q2,  #10
+                vmovn.u32       d2,  q2
+                vshrn.u32       d4,  q2,  #14
+
+                vshrn.u32       d23, q3,  #10
+                vmovn.u32       d3,  q3
+                vshrn.u32       d5,  q3,  #14
+
+                it              eq
+                addeq           r4,  r8
+                vuzp.16         q0,  q11
+                vuzp.16         q9,  q1
+                vuzp.16         q10, q2
+
+                @ q0   V0, V3,..
+                @ q9   U0, U3...
+                @ q10  U1, U4...
+                @ q11  U2, U5,..
+                @ q1   V1, V4,
+                @ q2   V2, V5,..
+
+                subs            r6,  #24
+                vbic.u16        q11, #0xfc00
+                vbic.u16        q9,  #0xfc00
+                vshr.u16        q10, #6
+                vshr.u16        q2,  #6
+                vbic.u16        q0,  #0xfc00
+                vbic.u16        q1,  #0xfc00
+
+                @ Narrow clean 10-bit -> 8-bit (drop low 2 bits)
+                vshrn.u16       d24, q9,  #2    @ U0, U3,..
+                vshrn.u16       d25, q10, #2    @ U1, U4,..
+                vshrn.u16       d26, q11, #2    @ U2, U5,..
+                vshrn.u16       d27, q0,  #2    @ V0, V3,..
+                vshrn.u16       d28, q1,  #2    @ V1, V4,..
+                vshrn.u16       d29, q2,  #2    @ V2, V5,..
+
+                blt             2f
+
+                vst3.8          {d24, d25, d26}, [r0]!
+                vst3.8          {d27, d28, d29}, [r2]!
+
+                bne             1b
+
+11:
+                subs            r7,  #1
+                add             r5,  #128
+                add             r0,  r1
+                add             r2,  r3
+                bne             10b
+
+                pop             {r4-r10, pc}
+
+@ Partial final write: r6 = (remaining - 24) < 0, so N = r6 + 24 in [1,23].
+@ Always store from lane 0 and shift each reg down one sample (8 bits) per
+@ group, so U/V stay interleaved correctly.
+2:
+                adds            r6,  #24            @ r6 = N
+30:
+                cmp             r6,  #3
+                blt             31f
+                vst3.8          {d24[0], d25[0], d26[0]}, [r0]!
+                vst3.8          {d27[0], d28[0], d29[0]}, [r2]!
+                subs            r6,  #3
+                beq             11b
+                vshr.u64        d24, d24, #8
+                vshr.u64        d25, d25, #8
+                vshr.u64        d26, d26, #8
+                vshr.u64        d27, d27, #8
+                vshr.u64        d28, d28, #8
+                vshr.u64        d29, d29, #8
+                b               30b
+31:
+                cmp             r6,  #2
+                blt             32f
+                vst2.8          {d24[0], d25[0]}, [r0]!
+                vst2.8          {d27[0], d28[0]}, [r2]!
+                b               11b
+32:
+                cmp             r6,  #1
+                blt             11b
+                vst1.8          {d24[0]}, [r0]!
+                vst1.8          {d27[0]}, [r2]!
+                b               11b
+
+endfunc
+
 @ void ff_rpi_sand30_lines_to_planar_p010(
 @   uint8_t * dest,             // [r0]
 @   unsigned int dst_stride,    // [r1]
