@@ -33,6 +33,8 @@
 #define have_neon(flags) 0
 #define ff_rpi_sand30_lines_to_planar_y16 NULL
 #define ff_rpi_sand30_lines_to_planar_c16 NULL
+#define ff_rpi_sand30_lines_to_planar_y8 NULL
+#define ff_rpi_sand30_lines_to_planar_c8 NULL
 #endif
 
 static inline uint32_t pack30(unsigned int a, unsigned int b, unsigned int c)
@@ -86,6 +88,50 @@ void checkasm_check_rpi_sand(void)
     }
 
     if (check_func(have_neon(av_get_cpu_flags()) ? ff_rpi_sand30_lines_to_planar_c16 : av_rpi_sand30_to_planar_c16, "rpi_sand30_to_planar_c16")) {
+        declare_func(void, uint8_t * u_dst, const unsigned int u_stride,
+                     uint8_t * v_dst, const unsigned int v_stride,
+                     const uint8_t * src,
+                     unsigned int stride1, unsigned int stride2,
+                     unsigned int _x, unsigned int y,
+                     unsigned int _w, unsigned int h);
+
+        memset(ybuf0, 0xbb, ysize);
+        memset(ybuf1, 0xbb, ysize);
+        memset(vbuf0, 0xbb, ysize);
+        memset(vbuf1, 0xbb, ysize);
+
+        call_ref(yframe0, (w + 32), vframe0, (w + 32), sbuf0, stride1, stride2, 0, 0, w/2, h/2);
+        call_new(yframe1, (w + 32), vframe1, (w + 32), sbuf1, stride1, stride2, 0, 0, w/2, h/2);
+
+        if (memcmp(sbuf0, sbuf1, ssize)
+            || memcmp(ybuf0, ybuf1, ysize)
+            || memcmp(vbuf0, vbuf1, ysize))
+            fail();
+
+        bench_new(yframe1, (w + 32), vframe1, (w + 32), sbuf1, stride1, stride2, 0, 0, w/2, h/2);
+    }
+
+    if (check_func(have_neon(av_get_cpu_flags()) ? ff_rpi_sand30_lines_to_planar_y8 : av_rpi_sand30_to_planar_y8, "rpi_sand30_to_planar_y8")) {
+        declare_func(void, uint8_t * dst, const unsigned int dst_stride,
+                     const uint8_t * src,
+                     unsigned int stride1, unsigned int stride2,
+                     unsigned int _x, unsigned int y,
+                     unsigned int _w, unsigned int h);
+
+        memset(ybuf0, 0xbb, ysize);
+        memset(ybuf1, 0xbb, ysize);
+
+        call_ref(yframe0, (w + 32), sbuf0, stride1, stride2, 0, 0, w, h);
+        call_new(yframe1, (w + 32), sbuf1, stride1, stride2, 0, 0, w, h);
+
+        if (memcmp(sbuf0, sbuf1, ssize)
+            || memcmp(ybuf0, ybuf1, ysize))
+            fail();
+
+        bench_new(ybuf1, (w + 32), sbuf1, stride1, stride2, 0, 0, w, h);
+    }
+
+    if (check_func(have_neon(av_get_cpu_flags()) ? ff_rpi_sand30_lines_to_planar_c8 : av_rpi_sand30_to_planar_c8, "rpi_sand30_to_planar_c8")) {
         declare_func(void, uint8_t * u_dst, const unsigned int u_stride,
                      uint8_t * v_dst, const unsigned int v_stride,
                      const uint8_t * src,

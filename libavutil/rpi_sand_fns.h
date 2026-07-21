@@ -91,6 +91,13 @@ void av_rpi_sand30_to_planar_y8(uint8_t * dst, const unsigned int dst_stride,
                              unsigned int _x, unsigned int y,
                              unsigned int _w, unsigned int h);
 
+void av_rpi_sand30_to_planar_c8(uint8_t * dst_u, const unsigned int dst_stride_u,
+                             uint8_t * dst_v, const unsigned int dst_stride_v,
+                             const uint8_t * src,
+                             unsigned int stride1, unsigned int stride2,
+                             unsigned int _x, unsigned int y,
+                             unsigned int _w, unsigned int h);
+
 // w/h in pixels
 void av_rpi_sand16_to_sand8(uint8_t * dst, const unsigned int dst_stride1, const unsigned int dst_stride2,
                          const uint8_t * src, const unsigned int src_stride1, const unsigned int src_stride2,

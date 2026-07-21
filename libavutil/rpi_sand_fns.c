@@ -231,6 +231,90 @@ void av_rpi_sand30_to_planar_c16(uint8_t * dst_u, const unsigned int dst_stride_
     }
 }
 
+// As av_rpi_sand30_to_planar_c16 but narrows the 10-bit chroma to 8-bit
+// (drop bottom 2 bits, matching the y8 truncation) into two 8-bit planes.
+void av_rpi_sand30_to_planar_c8(uint8_t * dst_u, const unsigned int dst_stride_u,
+                             uint8_t * dst_v, const unsigned int dst_stride_v,
+                             const uint8_t * src,
+                             unsigned int stride1, unsigned int stride2,
+                             unsigned int _x, unsigned int y,
+                             unsigned int _w, unsigned int h)
+{
+    const unsigned int x0 = (_x / 3) * 8; // Byte offset of the word
+    const unsigned int xskip0 = _x - (x0 >> 3) * 3;
+    const unsigned int x1 = ((_x + _w) / 3) * 8;
+    const unsigned int xrem1 = _x + _w - (x1 >> 3) * 3;
+    const unsigned int mask = stride1 - 1;
+    const uint8_t * p0 = src + (x0 & mask) + y * stride1 + (x0 & ~mask) * stride2;
+    const unsigned int slice_inc = ((stride2 - 1) * stride1) >> 2;  // RHS of a stripe to LHS of next in words
+
+#if HAVE_SAND_ASM
+    if (_x == 0 && have_neon(av_get_cpu_flags())) {
+        ff_rpi_sand30_lines_to_planar_c8(dst_u, dst_stride_u, dst_v, dst_stride_v,
+                                       src, stride1, stride2, _x, y, _w, h);
+        return;
+    }
+#endif
+
+    if (x0 == x1) {
+        // *******************
+        // Partial single word xfer
+        return;
+    }
+
+    for (unsigned int i = 0; i != h; ++i, dst_u += dst_stride_u, dst_v += dst_stride_v, p0 += stride1)
+    {
+        unsigned int x = x0;
+        const uint32_t * p = (const uint32_t *)p0;
+        uint8_t * du = dst_u;
+        uint8_t * dv = dst_v;
+
+        if (xskip0 != 0) {
+            const uint32_t p3a = *p++;
+            const uint32_t p3b = *p++;
+
+            if (xskip0 == 1)
+            {
+                *du++ = (p3a >> 22) & 0xff;
+                *dv++ = (p3b >>  2) & 0xff;
+            }
+            *du++ = (p3b >> 12) & 0xff;
+            *dv++ = (p3b >> 22) & 0xff;
+
+            if (((x += 8) & mask) == 0)
+                p += slice_inc;
+        }
+
+        while (x != x1) {
+            const uint32_t p3a = *p++;
+            const uint32_t p3b = *p++;
+
+            *du++ = (p3a >>  2) & 0xff;
+            *dv++ = (p3a >> 12) & 0xff;
+            *du++ = (p3a >> 22) & 0xff;
+            *dv++ = (p3b >>  2) & 0xff;
+            *du++ = (p3b >> 12) & 0xff;
+            *dv++ = (p3b >> 22) & 0xff;
+
+            if (((x += 8) & mask) == 0)
+                p += slice_inc;
+        }
+
+        if (xrem1 != 0) {
+            const uint32_t p3a = *p++;
+            const uint32_t p3b = *p++;
+
+            *du++ = (p3a >>  2) & 0xff;
+            *dv++ = (p3a >> 12) & 0xff;
+            if (xrem1 == 2)
+            {
+                *du++ = (p3a >> 22) & 0xff;
+                *dv++ = (p3b >>  2) & 0xff;
+            }
+        }
+    }
+}
+
 // Fetches a single patch - offscreen fixup not done here
 // w <= stride1
 // single lose bottom 2 bits truncation
@@ -250,7 +334,7 @@ void av_rpi_sand30_to_planar_y8(uint8_t * dst, const unsigned int dst_stride,
     const unsigned int slice_inc = ((stride2 - 1) * stride1) >> 2;  // RHS of a stripe to LHS of next in words
 
 #if HAVE_SAND_ASM
-    if (_x == 0) {
+    if (_x == 0 && have_neon(av_get_cpu_flags())) {
         ff_rpi_sand30_lines_to_planar_y8(dst, dst_stride, src, stride1, stride2, _x, y, _w, h);
         return;
     }
@@ -416,6 +500,17 @@ int av_rpi_sand_to_planar_frame(AVFrame * const dst, const AVFrame * const src)
             break;
         case AV_PIX_FMT_RPI4_10:
             switch (dst->format){
+                case AV_PIX_FMT_YUV420P:
+                    av_rpi_sand30_to_planar_y8(dst->data[0], dst->linesize[0],
+                                             src->data[0],
+                                             av_rpi_sand_frame_stride1(src), stride2_y,
+                                             x, y, w, h);
+                    av_rpi_sand30_to_planar_c8(dst->data[1], dst->linesize[1],
+                                             dst->data[2], dst->linesize[2],
+                                             src->data[1],
+                                             av_rpi_sand_frame_stride1(src), stride2_c,
+                                             x/2, y/2, w/2, h/2);
+                    break;
                 case AV_PIX_FMT_YUV420P10:
                     av_rpi_sand30_to_planar_y16(dst->data[0], dst->linesize[0],
                                              src->data[0],

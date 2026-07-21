@@ -330,7 +330,7 @@ static int drm_transfer_get_formats(AVHWFramesContext *ctx,
 {
     enum AVPixelFormat *p;
 
-    p = *formats = av_malloc_array(3, sizeof(*p));
+    p = *formats = av_malloc_array(4, sizeof(*p));
     if (!p)
         return AVERROR(ENOMEM);
 
@@ -348,6 +348,11 @@ static int drm_transfer_get_formats(AVHWFramesContext *ctx,
     if (ctx->sw_format == AV_PIX_FMT_RPI4_10 ||
         ctx->sw_format == AV_PIX_FMT_RPI4_8 || ctx->sw_format == AV_PIX_FMT_SAND128)
         *p++ = AV_PIX_FMT_NV12;
+
+    // 8-bit split-plane download for 10-bit sand (drops low 2 bits): lets a
+    // "-hwaccel_output_format yuv420p" transcode skip the 16-bit intermediate.
+    if (ctx->sw_format == AV_PIX_FMT_RPI4_10)
+        *p++ = AV_PIX_FMT_YUV420P;
 #endif
 
     *p = AV_PIX_FMT_NONE;

@@ -433,6 +433,150 @@ function ff_rpi_sand30_lines_to_planar_c16, export=1
 endfunc
 
 
+// void ff_rpi_sand30_lines_to_planar_c8(
+//   uint8_t * dst_u,            // [x0]
+//   unsigned int dst_stride_u,  // [w1]
+//   uint8_t * dst_v,            // [x2]
+//   unsigned int dst_stride_v,  // [w3]
+//   const uint8_t * src,        // [x4]
+//   unsigned int stride1,       // [w5]      128
+//   unsigned int stride2,       // [w6]
+//   unsigned int _x,            // [w7]      0
+//   unsigned int y,             // [sp, #0]
+//   unsigned int _w,            // [sp, #8]  w8
+//   unsigned int h);            // [sp, #16] w10
+//
+// As ff_rpi_sand30_lines_to_planar_c16 but narrows the (clean) 10-bit U/V
+// samples to 8-bit (lose low 2 bits) and writes two 8-bit chroma planes.
+
+function ff_rpi_sand30_lines_to_planar_c8, export=1
+                ldr             w7,  [sp, #0]                   // y
+                ldr             w8,  [sp, #8]                   // _w
+                ldr             w10, [sp, #16]                  // h
+                lsl             w6,  w6,  #7                    // Fixup stride2
+                sub             w6,  w6,  #64
+                uxtw            x6,  w6
+                sub             w1,  w1,  w8                    // Fixup chroma strides (8-bit)
+                sub             w3,  w3,  w8
+                lsl             w7,  w7,  #7                    // Add y to src
+                add             x4,  x4,  w7,  UXTW
+10:
+                mov             x5,  x4
+                mov             w9,  w8
+1:
+                ld1             {v0.4s-v3.4s}, [x5], #64
+                ld1             {v4.4s-v7.4s}, [x5], x6
+                subs            w9,  w9,  #48
+
+                USAND10         v17, v16, v18, v0, v1
+                USAND10         v20, v19, v21, v2, v3
+                UZPH_C          v0, v1, v2, v16, v17, v18, v19, v20, v21
+                USAND10         v23, v22, v24, v4, v5
+                USAND10         v26, v25, v27, v6, v7
+                UZPH_C          v4, v5, v6, v22, v23, v24, v25, v26, v27
+
+                // Narrow 10->8 (>>2). U -> v28-v30, V -> v25-v27, each 48 * u8
+                shrn            v28.8b,  v0.8h,  #2
+                shrn2           v28.16b, v4.8h,  #2
+                shrn            v29.8b,  v1.8h,  #2
+                shrn2           v29.16b, v5.8h,  #2
+                shrn            v30.8b,  v2.8h,  #2
+                shrn2           v30.16b, v6.8h,  #2
+                shrn            v25.8b,  v16.8h, #2
+                shrn2           v25.16b, v22.8h, #2
+                shrn            v26.8b,  v17.8h, #2
+                shrn2           v26.16b, v23.8h, #2
+                shrn            v27.8b,  v18.8h, #2
+                shrn2           v27.16b, v24.8h, #2
+
+                blt             2f
+
+                st3             {v28.16b, v29.16b, v30.16b}, [x0], #48
+                st3             {v25.16b, v26.16b, v27.16b}, [x2], #48
+
+                bne             1b
+11:
+                subs            w10, w10, #1
+                add             x4,  x4,  #128
+                add             x0,  x0,  w1,  UXTW
+                add             x2,  x2,  w3,  UXTW
+                bne             10b
+99:
+                ret
+
+// Partial final write (samples remaining = w9 + 48, in [1,47]).
+// U in v28-v30, V in v25-v27 (.16b).
+2:
+                cmp             w9,  #24-48
+                blt             1f
+                st3             {v28.8b, v29.8b, v30.8b}, [x0], #24
+                st3             {v25.8b, v26.8b, v27.8b}, [x2], #24
+                beq             11b
+                mov             v28.d[0], v28.d[1]
+                mov             v29.d[0], v29.d[1]
+                mov             v30.d[0], v30.d[1]
+                mov             v25.d[0], v25.d[1]
+                mov             v26.d[0], v26.d[1]
+                mov             v27.d[0], v27.d[1]
+                sub             w9,  w9,  #24
+1:
+                cmp             w9,  #12-48
+                blt             1f
+                st3             {v28.b, v29.b, v30.b}[0], [x0], #3
+                st3             {v28.b, v29.b, v30.b}[1], [x0], #3
+                st3             {v28.b, v29.b, v30.b}[2], [x0], #3
+                st3             {v28.b, v29.b, v30.b}[3], [x0], #3
+                st3             {v25.b, v26.b, v27.b}[0], [x2], #3
+                st3             {v25.b, v26.b, v27.b}[1], [x2], #3
+                st3             {v25.b, v26.b, v27.b}[2], [x2], #3
+                st3             {v25.b, v26.b, v27.b}[3], [x2], #3
+                beq             11b
+                mov             v28.s[0], v28.s[1]
+                mov             v29.s[0], v29.s[1]
+                mov             v30.s[0], v30.s[1]
+                mov             v25.s[0], v25.s[1]
+                mov             v26.s[0], v26.s[1]
+                mov             v27.s[0], v27.s[1]
+                sub             w9,  w9,  #12
+1:
+                cmp             w9,  #6-48
+                blt             1f
+                st3             {v28.b, v29.b, v30.b}[0], [x0], #3
+                st3             {v28.b, v29.b, v30.b}[1], [x0], #3
+                st3             {v25.b, v26.b, v27.b}[0], [x2], #3
+                st3             {v25.b, v26.b, v27.b}[1], [x2], #3
+                beq             11b
+                mov             v28.h[0], v28.h[1]
+                mov             v29.h[0], v29.h[1]
+                mov             v30.h[0], v30.h[1]
+                mov             v25.h[0], v25.h[1]
+                mov             v26.h[0], v26.h[1]
+                mov             v27.h[0], v27.h[1]
+                sub             w9,  w9,  #6
+1:
+                cmp             w9,  #3-48
+                blt             1f
+                st3             {v28.b, v29.b, v30.b}[0], [x0], #3
+                st3             {v25.b, v26.b, v27.b}[0], [x2], #3
+                beq             11b
+                mov             v28.b[0], v28.b[1]
+                mov             v29.b[0], v29.b[1]
+                mov             v25.b[0], v25.b[1]
+                mov             v26.b[0], v26.b[1]
+                sub             w9,  w9,  #3
+1:
+                cmp             w9,  #2-48
+                blt             1f
+                st2             {v28.b, v29.b}[0], [x0], #2
+                st2             {v25.b, v26.b}[0], [x2], #2
+                b               11b
+1:
+                st1             {v28.b}[0], [x0], #1
+                st1             {v25.b}[0], [x2], #1
+                b               11b
+endfunc
+
+
 //void ff_rpi_sand30_lines_to_planar_p010(
 //  uint8_t * dest,
 //  unsigned int dst_stride,
