@@ -637,9 +637,8 @@ endfunc
 @ the clean 10-bit U (q9,q10,q11) / V (q0,q1,q2) are narrowed >>2 to 8 bits
 @ (vshrn.u16 #2) and written as two interleaved 8-bit planes.
 @
-@ NOTE: UNTESTED. Authored on aarch64 with no 32-bit ARM build/assemble/run
-@ environment available; the aarch64 twin is checkasm bit-exact. Verify with
-@ tests/checkasm on a 32-bit ARM build before relying on this.
+@ Verified checkasm bit-exact against the C reference via an armhf cross-build
+@ (gcc-arm-linux-gnueabihf) run under qemu-arm on aarch64.
 @
 @ Assumes that we are starting on a stripe boundary and that overreading
 @ within the stripe is OK. However it does respect the dest size for writing
