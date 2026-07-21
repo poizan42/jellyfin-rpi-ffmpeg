@@ -138,6 +138,39 @@ static void dmabuf_sync(int fd, uint64_t flags)
     ioctl(fd, DMA_BUF_IOCTL_SYNC, &s);   /* best-effort */
 }
 
+/* Slice-threaded unpack. The SAND->planar detile is per-row independent (SAND is
+ * column-tiled, no vertical tiling), so each thread converts a horizontal band.
+ * Bands are aligned to 2 luma rows so the 4:2:0 chroma split stays exact. */
+typedef struct ThreadData {
+    AVFrame       *dst;   /* YU12 into the dma-buf (template; shallow-copied per band) */
+    const AVFrame *src;   /* mapped SAND frame (template)                              */
+    unsigned       H;     /* cropped luma height                                       */
+} ThreadData;
+
+static int unpack_slice(AVFilterContext *avctx, void *arg, int jobnr, int nb_jobs)
+{
+    const ThreadData *td = arg;
+    const unsigned H  = td->H;
+    unsigned y0 = ((uint64_t)H *  jobnr      / nb_jobs) & ~1u;
+    unsigned y1 = (jobnr == nb_jobs - 1) ? H
+                : (((uint64_t)H * (jobnr + 1) / nb_jobs) & ~1u);
+    if (y1 <= y0)
+        return 0;
+    const unsigned bh = y1 - y0;
+
+    /* Shallow views: share the underlying buffers, never unref'd. */
+    AVFrame src = *td->src;
+    src.crop_top    = td->src->crop_top + y0;
+    src.crop_bottom = td->src->height - (td->src->crop_top + y0 + bh);
+
+    AVFrame dst = *td->dst;
+    dst.data[0] += (size_t) y0      * dst.linesize[0];
+    dst.data[1] += (size_t)(y0 / 2) * dst.linesize[1];
+    dst.data[2] += (size_t)(y0 / 2) * dst.linesize[2];
+
+    return av_rpi_sand_to_planar_frame(&dst, &src);
+}
+
 static int filter_frame(AVFilterLink *inlink, AVFrame *in)
 {
     AVFilterContext *avctx = inlink->dst;
@@ -174,12 +207,19 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     tmp->data[1] = (uint8_t *)map + ysz;       tmp->linesize[1] = bpl / 2;
     tmp->data[2] = (uint8_t *)map + ysz + csz; tmp->linesize[2] = bpl / 2;
 
+    int nb = FFMIN(ff_filter_get_nb_threads(avctx), (int)(h / 2));
+    nb = av_clip(nb, 1, 64);
+    ThreadData td = { .dst = tmp, .src = mapped, .H = h };
+    int rets[64] = { 0 };
+
     dmabuf_sync(fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE);
-    if (av_rpi_sand_to_planar_frame(tmp, mapped) != 0) {
-        av_log(avctx, AV_LOG_ERROR, "sand->planar failed (fmt %d)\n", mapped->format);
-        rv = AVERROR(EINVAL); goto fail_release;
-    }
+    ff_filter_execute(avctx, unpack_slice, &td, rets, nb);
     dmabuf_sync(fd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
+    for (int i = 0; i < nb; i++)
+        if (rets[i] != 0) {
+            av_log(avctx, AV_LOG_ERROR, "sand->planar failed (fmt %d)\n", mapped->format);
+            rv = AVERROR(EINVAL); goto fail_release;
+        }
 
     if (!(b = av_mallocz(sizeof(*b)))) { rv = AVERROR(ENOMEM); goto fail_release; }
     b->s = s; b->idx = idx;
@@ -244,6 +284,7 @@ FFFilter ff_vf_sand_to_yuv420p_drm = {
     .p.name        = "sand_to_yuv420p_drm",
     .p.description = NULL_IF_CONFIG_SMALL("Unpack SAND (DRM_PRIME) to YU12 (DRM_PRIME) via NEON, for the ISP scaler"),
     .p.priv_class  = &sand_to_yuv420p_drm_class,
+    .p.flags       = AVFILTER_FLAG_SLICE_THREADS,
     .priv_size     = sizeof(BridgeContext),
     .init          = init,
     .uninit        = uninit,
