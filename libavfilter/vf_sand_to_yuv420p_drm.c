@@ -346,6 +346,123 @@ static void lut1d_apply(uint8_t *dst, const uint16_t *src, unsigned n,
         dst[x] = t1024[src[x] & 1023];
 }
 
+/* Accurate-tier chroma: fixed-point tetrahedral 3D-LUT (Cb,Cr) for one chroma row,
+ * x in [x0,cw). Scalar reference — the correctness oracle, the non-NEON fallback, and
+ * the NEON tail. avgY4 = 2x2 luma block sum (co-sited with the 4:2:0 chroma sample). */
+static void tm3d_chroma_scalar(uint8_t *OU, uint8_t *OV,
+                               const uint16_t *Y0, const uint16_t *Y1,
+                               const uint16_t *U, const uint16_t *V,
+                               unsigned x0, unsigned cw)
+{
+    const int N = RPI_TM_LUT3D_N;
+    const int64_t MY = ((int64_t)(N-1)*64 *65536 + 438) / 876;
+    const int64_t MC = ((int64_t)(N-1)*256*65536 + 448) / 896;
+    const int LIMQ = (N-1) << 8;
+    for (unsigned x = x0; x < cw; x++) {
+        int avgY4 = Y0[2*x] + Y0[2*x+1] + Y1[2*x] + Y1[2*x+1];
+        int ybq = (int)(((int64_t)(avgY4 - 256) * MY + 32768) >> 16);
+        int ubq = (int)(((int64_t)((int)(U[x] & 1023) - 64) * MC + 32768) >> 16);
+        int vbq = (int)(((int64_t)((int)(V[x] & 1023) - 64) * MC + 32768) >> 16);
+        ybq = ybq < 0 ? 0 : (ybq > LIMQ ? LIMQ : ybq);
+        ubq = ubq < 0 ? 0 : (ubq > LIMQ ? LIMQ : ubq);
+        vbq = vbq < 0 ? 0 : (vbq > LIMQ ? LIMQ : vbq);
+        int yi = ybq>>8, ui = ubq>>8, vi = vbq>>8;
+        int fy = ybq&255, fu = ubq&255, fv = vbq&255;
+        int yj = yi<N-1?yi+1:yi, uj = ui<N-1?ui+1:ui, vj = vi<N-1?vi+1:vi;
+#define C3(iy,iu,iv) (&ff_rpi_tm_lut3d[(((iy)*N+(iu))*N+(iv))*3])
+        const uint8_t *c0 = C3(yi,ui,vi), *c3 = C3(yj,uj,vj), *a, *b;
+        int w0, w1, w2, w3;
+        if (fy >= fu) {
+            if (fu >= fv)      { a=C3(yj,ui,vi); b=C3(yj,uj,vi); w0=256-fy; w1=fy-fu; w2=fu-fv; w3=fv; }
+            else if (fy >= fv) { a=C3(yj,ui,vi); b=C3(yj,ui,vj); w0=256-fy; w1=fy-fv; w2=fv-fu; w3=fu; }
+            else               { a=C3(yi,ui,vj); b=C3(yj,ui,vj); w0=256-fv; w1=fv-fy; w2=fy-fu; w3=fu; }
+        } else {
+            if (fy >= fv)      { a=C3(yi,uj,vi); b=C3(yj,uj,vi); w0=256-fu; w1=fu-fy; w2=fy-fv; w3=fv; }
+            else if (fu >= fv) { a=C3(yi,uj,vi); b=C3(yi,uj,vj); w0=256-fu; w1=fu-fv; w2=fv-fy; w3=fy; }
+            else               { a=C3(yi,ui,vj); b=C3(yi,uj,vj); w0=256-fv; w1=fv-fu; w2=fu-fy; w3=fy; }
+        }
+#undef C3
+        int iu = (w0*c0[1] + w1*a[1] + w2*b[1] + w3*c3[1] + 128) >> 8;
+        int iv = (w0*c0[2] + w1*a[2] + w2*b[2] + w3*c3[2] + 128) >> 8;
+        OU[x] = iu<0?0:(iu>255?255:iu); OV[x] = iv<0?0:(iv>255?255:iv);
+    }
+}
+
+/* NEON port of tm3d_chroma_scalar: 4 chroma samples/iter, bit-identical to the scalar
+ * (int32 coord map — products < 2^31; branchless tetrahedron select via argmax/argmin
+ * masks; software gather of the 4 corners, Cb|Cr adjacent so one u16 load each). */
+static void tm3d_chroma_row(uint8_t *OU, uint8_t *OV,
+                            const uint16_t *Y0, const uint16_t *Y1,
+                            const uint16_t *U, const uint16_t *V, unsigned cw)
+{
+    unsigned x = 0;
+#if defined(__aarch64__)
+    enum { N = RPI_TM_LUT3D_N };
+    const int32_t MY = (int32_t)(((int64_t)(N-1)*64 *65536 + 438) / 876);
+    const int32_t MC = (int32_t)(((int64_t)(N-1)*256*65536 + 448) / 896);
+    const int32x4_t v256=vdupq_n_s32(256), v64=vdupq_n_s32(64), v32768=vdupq_n_s32(32768);
+    const int32x4_t vLIMQ=vdupq_n_s32((N-1)<<8), vzero=vdupq_n_s32(0), vNm1=vdupq_n_s32(N-1);
+    const int32x4_t vone=vdupq_n_s32(1), v255=vdupq_n_s32(255), vN=vdupq_n_s32(N), vST=vdupq_n_s32(3);
+    const uint16x4_t m1023=vdup_n_u16(1023), m8=vdup_n_u16(0xff);
+    for (; x + 4 <= cw; x += 4) {
+        uint16x8_t y0=vld1q_u16(Y0+2*x), y1=vld1q_u16(Y1+2*x);
+        uint16x4_t s0=vpadd_u16(vget_low_u16(y0),vget_high_u16(y0));   /* col sums Y0[2x]+Y0[2x+1]... */
+        uint16x4_t s1=vpadd_u16(vget_low_u16(y1),vget_high_u16(y1));
+        int32x4_t Y =vreinterpretq_s32_u32(vmovl_u16(vadd_u16(s0,s1)));/* avgY4, 0..4092 */
+        int32x4_t Uu=vreinterpretq_s32_u32(vmovl_u16(vand_u16(vld1_u16(U+x),m1023)));
+        int32x4_t Vv=vreinterpretq_s32_u32(vmovl_u16(vand_u16(vld1_u16(V+x),m1023)));
+        int32x4_t ybq=vshrq_n_s32(vaddq_s32(vmulq_s32(vsubq_s32(Y ,v256),vdupq_n_s32(MY)),v32768),16);
+        int32x4_t ubq=vshrq_n_s32(vaddq_s32(vmulq_s32(vsubq_s32(Uu,v64 ),vdupq_n_s32(MC)),v32768),16);
+        int32x4_t vbq=vshrq_n_s32(vaddq_s32(vmulq_s32(vsubq_s32(Vv,v64 ),vdupq_n_s32(MC)),v32768),16);
+        ybq=vminq_s32(vmaxq_s32(ybq,vzero),vLIMQ);
+        ubq=vminq_s32(vmaxq_s32(ubq,vzero),vLIMQ);
+        vbq=vminq_s32(vmaxq_s32(vbq,vzero),vLIMQ);
+        int32x4_t yi=vshrq_n_s32(ybq,8), ui=vshrq_n_s32(ubq,8), vi=vshrq_n_s32(vbq,8);
+        int32x4_t fy=vandq_s32(ybq,v255), fu=vandq_s32(ubq,v255), fv=vandq_s32(vbq,v255);
+        int32x4_t incy=vandq_s32(vreinterpretq_s32_u32(vcltq_s32(yi,vNm1)),vone);
+        int32x4_t incu=vandq_s32(vreinterpretq_s32_u32(vcltq_s32(ui,vNm1)),vone);
+        int32x4_t incv=vandq_s32(vreinterpretq_s32_u32(vcltq_s32(vi,vNm1)),vone);
+        int32x4_t base=vmulq_s32(vaddq_s32(vmulq_s32(vaddq_s32(vmulq_s32(yi,vN),ui),vN),vi),vST); /* byte offset */
+        int32x4_t dY=vmulq_s32(incy,vdupq_n_s32(N*N*3));
+        int32x4_t dU=vmulq_s32(incu,vdupq_n_s32(N*3));
+        int32x4_t dV=vmulq_s32(incv,vST);
+        int32x4_t allo=vaddq_s32(vaddq_s32(vaddq_s32(base,dY),dU),dV);
+        int32x4_t fmax=vmaxq_s32(vmaxq_s32(fy,fu),fv);
+        int32x4_t fmin=vminq_s32(vminq_s32(fy,fu),fv);
+        int32x4_t fmid=vsubq_s32(vsubq_s32(vaddq_s32(vaddq_s32(fy,fu),fv),fmax),fmin);
+        int32x4_t w0=vsubq_s32(v256,fmax), w1=vsubq_s32(fmax,fmid), w2=vsubq_s32(fmid,fmin), w3=fmin;
+        uint32x4_t c_yu=vcgeq_s32(fy,fu), c_uv=vcgeq_s32(fu,fv), c_yv=vcgeq_s32(fy,fv);
+        uint32x4_t ymax=vandq_u32(c_yu,c_yv), umax=vandq_u32(vmvnq_u32(c_yu),c_uv);
+        int32x4_t dmax=vbslq_s32(ymax,dY,vbslq_s32(umax,dU,dV));
+        uint32x4_t vmn=vandq_u32(c_uv,c_yv), umn=vandq_u32(c_yu,vmvnq_u32(c_uv));
+        int32x4_t dmin=vbslq_s32(vmn,dV,vbslq_s32(umn,dU,dY));
+        int32_t o0[4],oa[4],ob[4],o3[4]; uint16_t g0[4],ga[4],gb[4],g3[4];
+        vst1q_s32(o0,base); vst1q_s32(oa,vaddq_s32(base,dmax));
+        vst1q_s32(ob,vsubq_s32(allo,dmin)); vst1q_s32(o3,allo);
+        for (int i=0;i<4;i++) {   /* software gather: one u16 (Cb|Cr) per corner per lane */
+            memcpy(&g0[i], ff_rpi_tm_lut3d+o0[i]+1, 2); memcpy(&ga[i], ff_rpi_tm_lut3d+oa[i]+1, 2);
+            memcpy(&gb[i], ff_rpi_tm_lut3d+ob[i]+1, 2); memcpy(&g3[i], ff_rpi_tm_lut3d+o3[i]+1, 2);
+        }
+        uint16x4_t h0=vld1_u16(g0),ha=vld1_u16(ga),hb=vld1_u16(gb),h3=vld1_u16(g3);
+        uint32x4_t uw0=vreinterpretq_u32_s32(w0),uw1=vreinterpretq_u32_s32(w1),
+                   uw2=vreinterpretq_u32_s32(w2),uw3=vreinterpretq_u32_s32(w3);
+        uint32x4_t accb=vmulq_u32(uw0,vmovl_u16(vand_u16(h0,m8)));
+        accb=vmlaq_u32(accb,uw1,vmovl_u16(vand_u16(ha,m8)));
+        accb=vmlaq_u32(accb,uw2,vmovl_u16(vand_u16(hb,m8)));
+        accb=vmlaq_u32(accb,uw3,vmovl_u16(vand_u16(h3,m8)));
+        uint32x4_t accr=vmulq_u32(uw0,vmovl_u16(vshr_n_u16(h0,8)));
+        accr=vmlaq_u32(accr,uw1,vmovl_u16(vshr_n_u16(ha,8)));
+        accr=vmlaq_u32(accr,uw2,vmovl_u16(vshr_n_u16(hb,8)));
+        accr=vmlaq_u32(accr,uw3,vmovl_u16(vshr_n_u16(h3,8)));
+        uint8x8_t cb8=vqmovn_u16(vcombine_u16(vrshrn_n_u32(accb,8),vdup_n_u16(0)));  /* (acc+128)>>8 */
+        uint8x8_t cr8=vqmovn_u16(vcombine_u16(vrshrn_n_u32(accr,8),vdup_n_u16(0)));
+        vst1_lane_u32((uint32_t *)(OU+x), vreinterpret_u32_u8(cb8), 0);   /* 4 bytes */
+        vst1_lane_u32((uint32_t *)(OV+x), vreinterpret_u32_u8(cr8), 0);
+    }
+#endif
+    tm3d_chroma_scalar(OU, OV, Y0, Y1, U, V, x, cw);   /* tail / non-NEON fallback */
+}
+
 static void tm_apply_chunk(const TMData *td, const AVFrame *S, unsigned ybase, unsigned ch)
 {
     const unsigned W = td->dst->width, cw = W / 2;
@@ -365,13 +482,9 @@ static void tm_apply_chunk(const TMData *td, const AVFrame *S, unsigned ybase, u
             lut1d_apply(OU, U, cw, td->cb64, ff_rpi_tm_cb1d);
             lut1d_apply(OV, V, cw, td->cr64, ff_rpi_tm_cr1d);
         }
-    } else { /* TM_ACCURATE */
-        const int N = RPI_TM_LUT3D_N;
-        /* Q16 fixed-point coordinate scales mapping (block-avg*4, U, V) to grid
-         * position in Q8 (frac*256).  All-integer: no float in the hot path. */
-        const int64_t MY = ((int64_t)(N-1)*64 *65536 + 438) / 876;  /* luma [64,940] */
-        const int64_t MC = ((int64_t)(N-1)*256*65536 + 448) / 896;  /* chroma [64,960] */
-        const int LIMQ = (N-1) << 8;
+    } else { /* TM_ACCURATE — chroma-resolution 3D LUT, tetrahedral (NEON, bit-exact) */
+        static int selfcheck = -1;
+        if (selfcheck < 0) selfcheck = !!getenv("SAND_TM_SELFCHECK");
         for (unsigned cr = 0; cr < ch / 2; cr++) {
             const uint16_t *U  = (const uint16_t *)S->data[1] + (size_t)cr * su;
             const uint16_t *V  = (const uint16_t *)S->data[2] + (size_t)cr * sv;
@@ -379,37 +492,19 @@ static void tm_apply_chunk(const TMData *td, const AVFrame *S, unsigned ybase, u
             const uint16_t *Y1 = (const uint16_t *)S->data[0] + (size_t)(cr*2+1) * sy;
             uint8_t *OU = D->data[1] + (size_t)(ybase/2 + cr) * D->linesize[1];
             uint8_t *OV = D->data[2] + (size_t)(ybase/2 + cr) * D->linesize[2];
-            for (unsigned x = 0; x < cw; x++) {
-                int avgY4 = Y0[2*x] + Y0[2*x+1] + Y1[2*x] + Y1[2*x+1];   /* block sum, 0..4092 */
-                int ybq = (int)(((int64_t)(avgY4 - 256) * MY + 32768) >> 16);
-                int ubq = (int)(((int64_t)((int)(U[x] & 1023) - 64) * MC + 32768) >> 16);
-                int vbq = (int)(((int64_t)((int)(V[x] & 1023) - 64) * MC + 32768) >> 16);
-                ybq = ybq < 0 ? 0 : (ybq > LIMQ ? LIMQ : ybq);
-                ubq = ubq < 0 ? 0 : (ubq > LIMQ ? LIMQ : ubq);
-                vbq = vbq < 0 ? 0 : (vbq > LIMQ ? LIMQ : vbq);
-                int yi = ybq>>8, ui = ubq>>8, vi = vbq>>8;
-                int fy = ybq&255, fu = ubq&255, fv = vbq&255;
-                int yj = yi<N-1?yi+1:yi, uj = ui<N-1?ui+1:ui, vj = vi<N-1?vi+1:vi;
-                /* Tetrahedral: 4 corners along the fractional-ordering path (vs
-                 * trilinear's 8). C000 and C111 are always endpoints; the two
-                 * intermediates depend on which frac dominates.  Weights are Q8
-                 * (sum 256), so the weighted sum >>8 lands in [0,255]. */
-#define C3(iy,iu,iv) (&ff_rpi_tm_lut3d[(((iy)*N+(iu))*N+(iv))*3])
-                const uint8_t *c0 = C3(yi,ui,vi), *c3 = C3(yj,uj,vj), *a, *b;
-                int w0, w1, w2, w3;
-                if (fy >= fu) {
-                    if (fu >= fv)      { a=C3(yj,ui,vi); b=C3(yj,uj,vi); w0=256-fy; w1=fy-fu; w2=fu-fv; w3=fv; }
-                    else if (fy >= fv) { a=C3(yj,ui,vi); b=C3(yj,ui,vj); w0=256-fy; w1=fy-fv; w2=fv-fu; w3=fu; }
-                    else               { a=C3(yi,ui,vj); b=C3(yj,ui,vj); w0=256-fv; w1=fv-fy; w2=fy-fu; w3=fu; }
-                } else {
-                    if (fy >= fv)      { a=C3(yi,uj,vi); b=C3(yj,uj,vi); w0=256-fu; w1=fu-fy; w2=fy-fv; w3=fv; }
-                    else if (fu >= fv) { a=C3(yi,uj,vi); b=C3(yi,uj,vj); w0=256-fu; w1=fu-fv; w2=fv-fy; w3=fy; }
-                    else               { a=C3(yi,ui,vj); b=C3(yi,uj,vj); w0=256-fv; w1=fv-fu; w2=fu-fy; w3=fy; }
+            tm3d_chroma_row(OU, OV, Y0, Y1, U, V, cw);
+            if (selfcheck) {   /* DEBUG: NEON vs scalar on real frames, expect max 0 */
+                uint8_t *ru = av_malloc(cw), *rv = av_malloc(cw);
+                if (ru && rv) {
+                    unsigned mx = 0;
+                    tm3d_chroma_scalar(ru, rv, Y0, Y1, U, V, 0, cw);
+                    for (unsigned x = 0; x < cw; x++) {
+                        unsigned d = OU[x] > ru[x] ? OU[x]-ru[x] : ru[x]-OU[x]; if (d > mx) mx = d;
+                        d = OV[x] > rv[x] ? OV[x]-rv[x] : rv[x]-OV[x]; if (d > mx) mx = d;
+                    }
+                    if (mx) av_log(NULL, AV_LOG_WARNING, "SAND_TM 3D selfcheck row %u: max diff %u\n", cr, mx);
                 }
-#undef C3
-                int iu = (w0*c0[1] + w1*a[1] + w2*b[1] + w3*c3[1] + 128) >> 8;
-                int iv = (w0*c0[2] + w1*a[2] + w2*b[2] + w3*c3[2] + 128) >> 8;
-                OU[x] = iu<0?0:(iu>255?255:iu); OV[x] = iv<0?0:(iv>255?255:iv);
+                av_free(ru); av_free(rv);
             }
         }
     }
