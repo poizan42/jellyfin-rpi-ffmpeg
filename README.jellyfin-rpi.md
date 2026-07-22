@@ -54,16 +54,19 @@ eating ~1.2 CPU cores as swscale. Properly `configure`-integrated
 - Pooled CMA dma-bufs (dma-heap) for the output; DRM_PRIME → zero-copy into the encoder.
 - `SAND_PROF=1` env var: per-phase profiler (map / unpack / flush / unmap μs/frame).
 
-### 3. HDR→SDR tone-mapping  *(in development)*
-HDR10 (PQ/BT.2020) sources currently transcode with a plain 10→8-bit truncation → washed-out.
-Being added as options on the bridge filter, in two tiers, tuned to match FFmpeg's
-`zscale+tonemap=hable` (chosen by eye) and **baked directly from that chain** into embedded LUTs
-(`libavfilter/rpi_tonemap_gen.py` → `rpi_tonemap_tables.h`; re-runnable):
-- `tm=fast` — luma-exact 1D tone curve + separable chroma, folded into the single-pass NEON
-  kernels; real-time, colour approximate.
+### 3. HDR→SDR tone-mapping  (`tm=none|fast|accurate` option on the bridge filter)
+Without it, HDR10 (PQ/BT.2020) sources transcode with a plain 10→8-bit truncation → washed-out.
+Two tiers, both tuned to match FFmpeg's `zscale+tonemap=hable` (chosen by eye) and **baked
+directly from that chain** into embedded LUTs (`libavfilter/rpi_tonemap_gen.py` →
+`rpi_tonemap_tables.h`; re-runnable):
+- `tm=fast` — **real-time** (1.11× at 4K HDR, within 4% of `tm=none`). Luma-exact 1D tone curve
+  **folded into the single-pass SAND30 NEON unpack** (`ff_rpi_sand30_lines_to_planar_y8_lut`:
+  64-entry `tbl` + lerp in place of the `>>2` narrow, no 10-bit intermediate) + separable
+  chroma; colour approximate. Bit-exact vs a scalar oracle (`checkasm --test=rpi_sand`).
 - `tm=accurate` — chroma-resolution 3D LUT (luma-aware), reproduces zscale; ~¼ the cost of a
-  full 4:4:4 LUT for the same quality.
-- `tm=none` (default) — today's truncation, byte-for-byte unchanged.
+  full 4:4:4 LUT for the same quality. Quality tier, **not** real-time (~0.57× at 4K HDR;
+  NEON-vectorising the 3D-LUT apply is in progress).
+- `tm=none` (default) — plain truncation, byte-for-byte unchanged.
 
 Deferred (see `TODO-rpi-tonemap.md`): command-line-tunable peak/operator/saturation, a BT.2390
 operator (`op=bt2390`), non-1000-nit peaks, 32-bit ARM parity for the tone LUTs. Dolby Vision
@@ -105,10 +108,10 @@ ffmpeg -hwaccel drm -hwaccel_output_format drm_prime -i in.mkv \
        -c:v h264_v4l2m2m -b:v 3M out.mp4
 ```
 
-HDR source (once tone-mapping lands): add `tm=fast` or `tm=accurate`:
+HDR10 source — add `tm=fast` (real-time) or `tm=accurate` (quality):
 
 ```sh
-       -vf sand_to_yuv420p_drm=tm=accurate,scale_v4l2m2m=1280:720
+       -vf sand_to_yuv420p_drm=tm=fast,scale_v4l2m2m=1280:720
 ```
 
 ## Performance (Pi 4B, 600-frame steady-state, → 720p)
@@ -117,7 +120,9 @@ HDR source (once tone-mapping lands): add `tm=fast` or `tm=accurate`:
 |---|---:|---|
 | 10-bit HEVC SDR 1080p | ~2.0–2.7× | decode-thread-bound, not CPU-bound |
 | 10-bit HEVC SDR 4K scope (3840×1608) | ~1.42× | slice-thread + prefetch + map-cache + thread-cap |
-| 10-bit HEVC HDR10 4K (3840×2160) | ~1.13× | runs; colour needs the tone-map |
+| 10-bit HEVC HDR10 4K (3840×2160), `tm=none` | ~1.16× | truncation, colour wrong |
+| 10-bit HEVC HDR10 4K (3840×2160), `tm=fast` | ~1.11× | **real-time, correct colour** (single-pass tone-map fold) |
+| 10-bit HEVC HDR10 4K (3840×2160), `tm=accurate` | ~0.57× | quality tier, not real-time (3D-LUT apply still scalar) |
 
 The 4K unpack is **memory-latency-bound** on the scattered SAND reads (same wall that made the
 V3D GPU offload lose). Threading reaches the shared-bus ceiling with ~2–3 cores; the levers above

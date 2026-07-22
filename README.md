@@ -19,14 +19,15 @@ Full design, build instructions and usage: **[README.jellyfin-rpi.md](README.jel
 | 10-bit HEVC **SDR** 1080p | **~2.0–2.7× real-time** — the tuned sweet spot |
 | 10-bit HEVC **SDR** 4K (2160p / scope) | **~1.4× real-time** — proven (slice-threaded NEON unpack + prefetch + map-cache + ISP scale) |
 | 8-bit HEVC SDR | works (same bridge path) |
-| 10-bit HEVC **HDR10** 4K | ~1.1× real-time, but colour is wrong — a straight 10→8-bit truncation with no tone-map (washed-out). **HDR→SDR tone-mapping is in development** (fast + accurate tiers). |
+| 10-bit HEVC **HDR10** 4K | **~1.1× real-time with correct colour** (`tm=fast`) — single-pass NEON HDR→SDR tone-map (PQ/BT.2020→BT.709). A higher-quality `tm=accurate` tier exists (~0.57×, not yet real-time). Without tone-mapping (`tm=none`) it's ~1.16× but washed-out. |
 | Dolby Vision profile 5 | not supported (needs DV RPU processing) |
 | H.264 / VP9 / AV1 sources | outside this pipeline (rpivid decode is HEVC-only) |
 
-**The 10-bit SDR HEVC → 8-bit H.264 downscale pipeline is proven to run above real-time
-through 4K.** HDR sources already decode and transcode at ~real-time; only their colour needs
-work (the tone-map, in progress). Validated on a real library (see the status doc); on a
-1080p transcode the pipeline is limited by the single-threaded rpivid decode thread, not the CPU.
+**The 10-bit HEVC → 8-bit H.264 downscale pipeline is proven to run above real-time through 4K,
+for both SDR and HDR10** — HDR10 gets a single-pass NEON tone-map (`tm=fast`) that keeps it
+real-time with correct colour. A higher-quality tone-map tier (`tm=accurate`) exists but is not
+yet real-time. Validated on a real library (see the status doc); on a 1080p transcode the
+pipeline is limited by the single-threaded rpivid decode thread, not the CPU.
 
 ---
 
