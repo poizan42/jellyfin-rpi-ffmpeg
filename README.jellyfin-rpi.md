@@ -77,7 +77,7 @@ profile 5 is out of scope (needs DV RPU processing).
 ### 4. Build enablement for the HDR reference
 `--enable-libzimg` (`zscale`) gives a correct CPU HDR→SDR reference (`zscale+tonemap`).
 `--enable-libplacebo --enable-vulkan` link a **locally rebuilt** libplacebo 7.360 (Debian
-bookworm ships 4.208, too old for FFmpeg 8.x; its shaderc is also broken) — see the build notes.
+bookworm ships 4.208, too old for FFmpeg 8.x; its shaderc is also broken).
 Note: the libplacebo *filter* does not run on the Pi's V3DV (missing renderable formats), so the
 usable HDR reference here is the CPU `zscale+tonemap` chain.
 
@@ -96,7 +96,7 @@ make -j4
 - `--enable-libzimg`/`--enable-libplacebo`/`--enable-vulkan` are only needed for the HDR
   *reference* (not for `tm=fast`/`accurate`, which are self-contained NEON + embedded LUTs).
 - libplacebo/glslang were rebuilt from Debian *forky* sources against bookworm; the extra Vulkan
-  1.4 headers are needed by libplacebo 7.360. See the local build notes for the exact recipe.
+  1.4 headers are needed by libplacebo 7.360.
 
 Bit-exact + microbench of the SAND kernels: `tests/checkasm/checkasm --test=rpi_sand [--bench]`.
 
@@ -129,10 +129,3 @@ HDR10 source — add `tm=fast` (real-time) or `tm=accurate` (quality):
 The 4K unpack is **memory-latency-bound** on the scattered SAND reads (same wall that made the
 V3D GPU offload lose). Threading reaches the shared-bus ceiling with ~2–3 cores; the levers above
 free the rest of the machine for decode/encode.
-
-## Related
-
-- Research + experiment write-ups (V3D GPGPU, ISP bridge, measurements):
-  `poizan42/rpi-mp4-hacking` (the `isp-experiments/`, `v3d-experiments/` dirs).
-- Local build notes (libplacebo/glslang from source, the shaderc-broken-on-bookworm issue):
-  `~/rpi-local-notes/`.
