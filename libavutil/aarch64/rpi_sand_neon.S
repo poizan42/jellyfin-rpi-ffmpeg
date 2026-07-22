@@ -460,12 +460,16 @@ function ff_rpi_sand30_lines_to_planar_c8, export=1
                 sub             w3,  w3,  w8
                 lsl             w7,  w7,  #7                    // Add y to src
                 add             x4,  x4,  w7,  UXTW
+                // SW prefetch ~3 SAND stripes ahead (see y8) to hide read latency.
+                add             x11, x6,  x6
+                add             x11, x11, x6
 10:
                 mov             x5,  x4
                 mov             w9,  w8
 1:
                 ld1             {v0.4s-v3.4s}, [x5], #64
                 ld1             {v4.4s-v7.4s}, [x5], x6
+                prfm            pldl1strm, [x5, x11]
                 subs            w9,  w9,  #48
 
                 USAND10         v17, v16, v18, v0, v1
@@ -726,12 +730,19 @@ function ff_rpi_sand30_lines_to_planar_y8, export=1
                 add             x8,  x2,  x6, lsl #7
                 ldr             w6,  [sp, #0]
 
+                // SW prefetch: reads jump one 128-byte SAND stripe (~x4, up to
+                // hundreds of KB at 4K) per iteration — a stride the HW prefetcher
+                // can't follow. x9 = ~3 stripes ahead to hide the DRAM latency.
+                add             x9,  x4,  x4
+                add             x9,  x9,  x4
+
 10:
                 mov             x2,  x8
                 mov             w5,  w7
 1:
                 ld1             {v0.4s, v1.4s, v2.4s, v3.4s}, [x2], #64
                 ld1             {v4.4s, v5.4s, v6.4s, v7.4s}, [x2], x4
+                prfm            pldl1strm, [x2, x9]
 
                 subs            w5,  w5,  #96
 
