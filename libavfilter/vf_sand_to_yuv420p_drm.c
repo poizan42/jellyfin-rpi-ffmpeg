@@ -268,15 +268,72 @@ static int frame_is_hdr(const AVFrame *in)
            in->color_trc == AVCOL_TRC_ARIB_STD_B67;
 }
 
-/* Tone-map apply: 10-bit YUV420P intermediate -> 8-bit YU12, slice-threaded.
- * Luma via the 1D curve (both tiers). Chroma: fast = separable 1D LUTs;
- * accurate = chroma-resolution 3D LUT (trilinear) using the 2x2 block-avg luma. */
+/* Tone-map apply, slice-threaded + cache-tiled: within each band, unpack a small
+ * chunk of rows SAND30 -> 10-bit into an L2-resident scratch (no full-frame 10-bit
+ * DRAM round-trip), then LUT it -> 8-bit YU12. Luma via the 1D curve (both tiers);
+ * chroma: fast = separable 1D LUTs; accurate = chroma-res 3D LUT (trilinear, 2x2
+ * block-avg luma). DRAM traffic ~ single-pass. */
+#define TM_CHUNK 16   /* rows per tile; scratch (10-bit) stays in L2 */
 typedef struct TMData {
-    AVFrame       *dst;    /* 8-bit YU12 (dma-buf)   */
-    const AVFrame *src10;  /* YUV420P10 intermediate */
-    unsigned       H;      /* luma height            */
+    AVFrame       *dst;   /* 8-bit YU12 (dma-buf) */
+    const AVFrame *src;   /* SAND mapped frame    */
+    unsigned       H;     /* luma height          */
     int            tm;
 } TMData;
+
+static void tm_apply_chunk(const TMData *td, const AVFrame *S, unsigned ybase, unsigned ch)
+{
+    const unsigned W = td->dst->width, cw = W / 2;
+    AVFrame *D = td->dst;
+    const int sy = S->linesize[0] / 2, su = S->linesize[1] / 2, sv = S->linesize[2] / 2;
+    for (unsigned r = 0; r < ch; r++) {
+        const uint16_t *Y = (const uint16_t *)S->data[0] + (size_t)r * sy;
+        uint8_t *O = D->data[0] + (size_t)(ybase + r) * D->linesize[0];
+        for (unsigned x = 0; x < W; x++)
+            O[x] = ff_rpi_tm_luma1d[Y[x] & 1023];
+    }
+    if (td->tm == TM_FAST) {
+        for (unsigned cr = 0; cr < ch / 2; cr++) {
+            const uint16_t *U = (const uint16_t *)S->data[1] + (size_t)cr * su;
+            const uint16_t *V = (const uint16_t *)S->data[2] + (size_t)cr * sv;
+            uint8_t *OU = D->data[1] + (size_t)(ybase/2 + cr) * D->linesize[1];
+            uint8_t *OV = D->data[2] + (size_t)(ybase/2 + cr) * D->linesize[2];
+            for (unsigned x = 0; x < cw; x++) {
+                OU[x] = ff_rpi_tm_cb1d[U[x] & 1023];
+                OV[x] = ff_rpi_tm_cr1d[V[x] & 1023];
+            }
+        }
+    } else { /* TM_ACCURATE */
+        const int N = RPI_TM_LUT3D_N;
+        const float qy = (N-1) / (940.0f-64.0f), qc = (N-1) / (960.0f-64.0f);
+        for (unsigned cr = 0; cr < ch / 2; cr++) {
+            const uint16_t *U  = (const uint16_t *)S->data[1] + (size_t)cr * su;
+            const uint16_t *V  = (const uint16_t *)S->data[2] + (size_t)cr * sv;
+            const uint16_t *Y0 = (const uint16_t *)S->data[0] + (size_t)(cr*2)   * sy;
+            const uint16_t *Y1 = (const uint16_t *)S->data[0] + (size_t)(cr*2+1) * sy;
+            uint8_t *OU = D->data[1] + (size_t)(ybase/2 + cr) * D->linesize[1];
+            uint8_t *OV = D->data[2] + (size_t)(ybase/2 + cr) * D->linesize[2];
+            for (unsigned x = 0; x < cw; x++) {
+                float yb = ((Y0[2*x]+Y0[2*x+1]+Y1[2*x]+Y1[2*x+1]) * 0.25f - 64.0f) * qy;
+                float ub = ((int)(U[x] & 1023) - 64) * qc, vb = ((int)(V[x] & 1023) - 64) * qc;
+                yb = yb < 0 ? 0 : (yb > N-1 ? N-1 : yb);
+                ub = ub < 0 ? 0 : (ub > N-1 ? N-1 : ub);
+                vb = vb < 0 ? 0 : (vb > N-1 ? N-1 : vb);
+                int yi = (int)yb, ui = (int)ub, vi = (int)vb;
+                int yj = yi<N-1?yi+1:yi, uj = ui<N-1?ui+1:ui, vj = vi<N-1?vi+1:vi;
+                float fy = yb-yi, fu = ub-ui, fv = vb-vi, ou = 0, ov = 0;
+#define TL(iy,iu,iv,w) do { const uint8_t *e = &ff_rpi_tm_lut3d[(((iy)*N+(iu))*N+(iv))*3]; ou += (w)*e[1]; ov += (w)*e[2]; } while (0)
+                TL(yi,ui,vi,(1-fy)*(1-fu)*(1-fv)); TL(yi,ui,vj,(1-fy)*(1-fu)*fv);
+                TL(yi,uj,vi,(1-fy)*fu*(1-fv));     TL(yi,uj,vj,(1-fy)*fu*fv);
+                TL(yj,ui,vi,fy*(1-fu)*(1-fv));     TL(yj,ui,vj,fy*(1-fu)*fv);
+                TL(yj,uj,vi,fy*fu*(1-fv));         TL(yj,uj,vj,fy*fu*fv);
+#undef TL
+                int iu = (int)(ou+0.5f), iv = (int)(ov+0.5f);
+                OU[x] = iu<0?0:(iu>255?255:iu); OV[x] = iv<0?0:(iv>255?255:iv);
+            }
+        }
+    }
+}
 
 static int tm_slice(AVFilterContext *avctx, void *arg, int jobnr, int nb_jobs)
 {
@@ -286,63 +343,28 @@ static int tm_slice(AVFilterContext *avctx, void *arg, int jobnr, int nb_jobs)
     unsigned y1 = (jobnr == nb_jobs - 1) ? H : (((uint64_t)H * (jobnr + 1) / nb_jobs) & ~1u);
     if (y1 <= y0)
         return 0;
-    const AVFrame *S = td->src10;
-    AVFrame *D = td->dst;
-    const int sy = S->linesize[0] / 2, su = S->linesize[1] / 2, sv = S->linesize[2] / 2;
-
-    for (unsigned y = y0; y < y1; y++) {
-        const uint16_t *Y = (const uint16_t *)S->data[0] + (size_t)y * sy;
-        uint8_t *O = D->data[0] + (size_t)y * D->linesize[0];
-        for (unsigned x = 0; x < W; x++)
-            O[x] = ff_rpi_tm_luma1d[Y[x] & 1023];
+    /* L2-resident 10-bit scratch for TM_CHUNK rows */
+    uint16_t *sy = av_malloc((size_t)TM_CHUNK * W * 2);
+    uint16_t *su = av_malloc((size_t)(TM_CHUNK/2) * cw * 2);
+    uint16_t *sv = av_malloc((size_t)(TM_CHUNK/2) * cw * 2);
+    if (!sy || !su || !sv) { av_free(sy); av_free(su); av_free(sv); return AVERROR(ENOMEM); }
+    AVFrame s10 = { 0 };
+    s10.format = AV_PIX_FMT_YUV420P10; s10.width = W;
+    s10.data[0] = (uint8_t *)sy; s10.linesize[0] = W * 2;
+    s10.data[1] = (uint8_t *)su; s10.linesize[1] = cw * 2;
+    s10.data[2] = (uint8_t *)sv; s10.linesize[2] = cw * 2;
+    int rv = 0;
+    for (unsigned y = y0; y < y1 && !rv; y += TM_CHUNK) {
+        unsigned ch = FFMIN((unsigned)TM_CHUNK, y1 - y);
+        s10.height = ch;
+        AVFrame src = *td->src;                    /* SAND view cropped to this chunk */
+        src.crop_top    = td->src->crop_top + y;
+        src.crop_bottom = td->src->height - (td->src->crop_top + y + ch);
+        rv = av_rpi_sand_to_planar_frame(&s10, &src);   /* SAND30 -> 10-bit scratch */
+        if (!rv) tm_apply_chunk(td, &s10, y, ch);       /* 10-bit -> 8-bit YU12       */
     }
-
-    const unsigned cy0 = y0 / 2, cy1 = y1 / 2;
-    if (td->tm == TM_FAST) {
-        for (unsigned cy = cy0; cy < cy1; cy++) {
-            const uint16_t *U = (const uint16_t *)S->data[1] + (size_t)cy * su;
-            const uint16_t *V = (const uint16_t *)S->data[2] + (size_t)cy * sv;
-            uint8_t *OU = D->data[1] + (size_t)cy * D->linesize[1];
-            uint8_t *OV = D->data[2] + (size_t)cy * D->linesize[2];
-            for (unsigned x = 0; x < cw; x++) {
-                OU[x] = ff_rpi_tm_cb1d[U[x] & 1023];
-                OV[x] = ff_rpi_tm_cr1d[V[x] & 1023];
-            }
-        }
-    } else { /* TM_ACCURATE */
-        const int N = RPI_TM_LUT3D_N;
-        const float qy = (N - 1) / (940.0f - 64.0f), qc = (N - 1) / (960.0f - 64.0f);
-        for (unsigned cy = cy0; cy < cy1; cy++) {
-            const uint16_t *U  = (const uint16_t *)S->data[1] + (size_t)cy * su;
-            const uint16_t *V  = (const uint16_t *)S->data[2] + (size_t)cy * sv;
-            const uint16_t *Y0 = (const uint16_t *)S->data[0] + (size_t)(cy * 2)     * sy;
-            const uint16_t *Y1 = (const uint16_t *)S->data[0] + (size_t)(cy * 2 + 1) * sy;
-            uint8_t *OU = D->data[1] + (size_t)cy * D->linesize[1];
-            uint8_t *OV = D->data[2] + (size_t)cy * D->linesize[2];
-            for (unsigned x = 0; x < cw; x++) {
-                float yb = ((Y0[2*x] + Y0[2*x+1] + Y1[2*x] + Y1[2*x+1]) * 0.25f - 64.0f) * qy;
-                float ub = ((int)(U[x] & 1023) - 64) * qc;
-                float vb = ((int)(V[x] & 1023) - 64) * qc;
-                yb = yb < 0 ? 0 : (yb > N-1 ? N-1 : yb);
-                ub = ub < 0 ? 0 : (ub > N-1 ? N-1 : ub);
-                vb = vb < 0 ? 0 : (vb > N-1 ? N-1 : vb);
-                int yi = (int)yb, ui = (int)ub, vi = (int)vb;
-                int yj = yi < N-1 ? yi+1 : yi, uj = ui < N-1 ? ui+1 : ui, vj = vi < N-1 ? vi+1 : vi;
-                float fy = yb-yi, fu = ub-ui, fv = vb-vi;
-                float ou = 0, ov = 0;
-#define TL(iy,iu,iv,w) do { const uint8_t *e = &ff_rpi_tm_lut3d[(((iy)*N+(iu))*N+(iv))*3]; ou += (w)*e[1]; ov += (w)*e[2]; } while (0)
-                TL(yi,ui,vi,(1-fy)*(1-fu)*(1-fv)); TL(yi,ui,vj,(1-fy)*(1-fu)*fv);
-                TL(yi,uj,vi,(1-fy)*fu*(1-fv));     TL(yi,uj,vj,(1-fy)*fu*fv);
-                TL(yj,ui,vi,fy*(1-fu)*(1-fv));     TL(yj,ui,vj,fy*(1-fu)*fv);
-                TL(yj,uj,vi,fy*fu*(1-fv));         TL(yj,uj,vj,fy*fu*fv);
-#undef TL
-                int iu = (int)(ou+0.5f), iv = (int)(ov+0.5f);
-                OU[x] = iu < 0 ? 0 : (iu > 255 ? 255 : iu);
-                OV[x] = iv < 0 ? 0 : (iv > 255 ? 255 : iv);
-            }
-        }
-    }
-    return 0;
+    av_free(sy); av_free(su); av_free(sv);
+    return rv;
 }
 
 static int filter_frame(AVFilterLink *inlink, AVFrame *in)
@@ -418,24 +440,19 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
                 rv = AVERROR(EINVAL); goto fail_release;
             }
     } else {
-        /* HDR tone-map: unpack SAND -> 10-bit planar, then LUT -> 8-bit YU12. */
-        AVFrame *t10 = av_frame_alloc();
-        if (!t10) { rv = AVERROR(ENOMEM); goto fail_release; }
-        t10->format = AV_PIX_FMT_YUV420P10; t10->width = w; t10->height = h;
-        if ((rv = av_frame_get_buffer(t10, 0)) < 0) { av_frame_free(&t10); goto fail_release; }
-        ThreadData td10 = { .dst = t10, .src = mapped, .H = h };
-        ff_filter_execute(avctx, unpack_slice, &td10, rets, nb);
-        for (int i = 0; i < nb; i++)
-            if (rets[i] != 0) { av_frame_free(&t10);
-                av_log(avctx, AV_LOG_ERROR, "sand->planar10 failed (fmt %d)\n", mapped->format);
-                rv = AVERROR(EINVAL); goto fail_release; }
-        PROF(1);
-        TMData tdm = { .dst = tmp, .src10 = t10, .H = h, .tm = s->tm };
+        /* HDR tone-map: cache-tiled SAND -> 10-bit scratch -> LUT -> 8-bit YU12
+         * (single-pass DRAM traffic; scratch stays L2-resident). */
+        TMData tdm = { .dst = tmp, .src = mapped, .H = h, .tm = s->tm };
         dmabuf_sync(fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE);
-        ff_filter_execute(avctx, tm_slice, &tdm, NULL, nb);
+        ff_filter_execute(avctx, tm_slice, &tdm, rets, nb);
+        PROF(1);
         dmabuf_sync(fd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
-        av_frame_free(&t10);
         PROF(2);
+        for (int i = 0; i < nb; i++)
+            if (rets[i] != 0) {
+                av_log(avctx, AV_LOG_ERROR, "tone-map failed (fmt %d)\n", mapped->format);
+                rv = AVERROR(EINVAL); goto fail_release;
+            }
     }
 
     if (!(b = av_mallocz(sizeof(*b)))) { rv = AVERROR(ENOMEM); goto fail_release; }
