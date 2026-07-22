@@ -388,9 +388,48 @@ static void tm3d_chroma_scalar(uint8_t *OU, uint8_t *OV,
     }
 }
 
-/* NEON port of tm3d_chroma_scalar: 4 chroma samples/iter, bit-identical to the scalar
- * (int32 coord map — products < 2^31; branchless tetrahedron select via argmax/argmin
- * masks; software gather of the 4 corners, Cb|Cr adjacent so one u16 load each). */
+#if defined(__aarch64__)
+/* Per-4-lane coordinate map + branchless tetrahedron select. Emits the 4 corner byte
+ * offsets into ff_rpi_tm_lut3d and the 4 Q8 weights. int32 math is bit-exact vs the
+ * int64 scalar (products < 2^31). av_always_inline so the constants fold. */
+static av_always_inline void tm3d_calc4(int32x4_t Y, int32x4_t Uu, int32x4_t Vv,
+    int32_t MY, int32_t MC, int32x4_t v256, int32x4_t v64, int32x4_t v32768, int32x4_t vLIMQ,
+    int32x4_t vzero, int32x4_t vNm1, int32x4_t vone, int32x4_t v255, int32x4_t vN, int32x4_t vST,
+    int32x4_t *po0, int32x4_t *poa, int32x4_t *pob, int32x4_t *po3,
+    int32x4_t *pw0, int32x4_t *pw1, int32x4_t *pw2, int32x4_t *pw3)
+{
+    int32x4_t ybq=vshrq_n_s32(vaddq_s32(vmulq_s32(vsubq_s32(Y ,v256),vdupq_n_s32(MY)),v32768),16);
+    int32x4_t ubq=vshrq_n_s32(vaddq_s32(vmulq_s32(vsubq_s32(Uu,v64 ),vdupq_n_s32(MC)),v32768),16);
+    int32x4_t vbq=vshrq_n_s32(vaddq_s32(vmulq_s32(vsubq_s32(Vv,v64 ),vdupq_n_s32(MC)),v32768),16);
+    ybq=vminq_s32(vmaxq_s32(ybq,vzero),vLIMQ);
+    ubq=vminq_s32(vmaxq_s32(ubq,vzero),vLIMQ);
+    vbq=vminq_s32(vmaxq_s32(vbq,vzero),vLIMQ);
+    int32x4_t yi=vshrq_n_s32(ybq,8), ui=vshrq_n_s32(ubq,8), vi=vshrq_n_s32(vbq,8);
+    int32x4_t fy=vandq_s32(ybq,v255), fu=vandq_s32(ubq,v255), fv=vandq_s32(vbq,v255);
+    int32x4_t incy=vandq_s32(vreinterpretq_s32_u32(vcltq_s32(yi,vNm1)),vone);
+    int32x4_t incu=vandq_s32(vreinterpretq_s32_u32(vcltq_s32(ui,vNm1)),vone);
+    int32x4_t incv=vandq_s32(vreinterpretq_s32_u32(vcltq_s32(vi,vNm1)),vone);
+    int32x4_t base=vmulq_s32(vaddq_s32(vmulq_s32(vaddq_s32(vmulq_s32(yi,vN),ui),vN),vi),vST); /* byte offset */
+    int32x4_t dY=vmulq_s32(incy,vdupq_n_s32(RPI_TM_LUT3D_N*RPI_TM_LUT3D_N*3));
+    int32x4_t dU=vmulq_s32(incu,vdupq_n_s32(RPI_TM_LUT3D_N*3));
+    int32x4_t dV=vmulq_s32(incv,vST);
+    int32x4_t allo=vaddq_s32(vaddq_s32(vaddq_s32(base,dY),dU),dV);
+    int32x4_t fmax=vmaxq_s32(vmaxq_s32(fy,fu),fv);
+    int32x4_t fmin=vminq_s32(vminq_s32(fy,fu),fv);
+    int32x4_t fmid=vsubq_s32(vsubq_s32(vaddq_s32(vaddq_s32(fy,fu),fv),fmax),fmin);
+    *pw0=vsubq_s32(v256,fmax); *pw1=vsubq_s32(fmax,fmid); *pw2=vsubq_s32(fmid,fmin); *pw3=fmin;
+    uint32x4_t c_yu=vcgeq_s32(fy,fu), c_uv=vcgeq_s32(fu,fv), c_yv=vcgeq_s32(fy,fv);
+    uint32x4_t ymax=vandq_u32(c_yu,c_yv), umax=vandq_u32(vmvnq_u32(c_yu),c_uv);
+    int32x4_t dmax=vbslq_s32(ymax,dY,vbslq_s32(umax,dU,dV));
+    uint32x4_t vmn=vandq_u32(c_uv,c_yv), umn=vandq_u32(c_yu,vmvnq_u32(c_uv));
+    int32x4_t dmin=vbslq_s32(vmn,dV,vbslq_s32(umn,dU,dY));
+    *po0=base; *poa=vaddq_s32(base,dmax); *pob=vsubq_s32(allo,dmin); *po3=allo;
+}
+#endif
+
+/* NEON port of tm3d_chroma_scalar: 8 chroma samples/iter, bit-identical to the scalar.
+ * Two tm3d_calc4() halves, a batched 8-lane software gather (Cb|Cr adjacent -> one u16
+ * load per corner), then the Q8 weighted sum in u32. */
 static void tm3d_chroma_row(uint8_t *OU, uint8_t *OV,
                             const uint16_t *Y0, const uint16_t *Y1,
                             const uint16_t *U, const uint16_t *V, unsigned cw)
@@ -403,62 +442,45 @@ static void tm3d_chroma_row(uint8_t *OU, uint8_t *OV,
     const int32x4_t v256=vdupq_n_s32(256), v64=vdupq_n_s32(64), v32768=vdupq_n_s32(32768);
     const int32x4_t vLIMQ=vdupq_n_s32((N-1)<<8), vzero=vdupq_n_s32(0), vNm1=vdupq_n_s32(N-1);
     const int32x4_t vone=vdupq_n_s32(1), v255=vdupq_n_s32(255), vN=vdupq_n_s32(N), vST=vdupq_n_s32(3);
-    const uint16x4_t m1023=vdup_n_u16(1023), m8=vdup_n_u16(0xff);
-    for (; x + 4 <= cw; x += 4) {
-        uint16x8_t y0=vld1q_u16(Y0+2*x), y1=vld1q_u16(Y1+2*x);
-        uint16x4_t s0=vpadd_u16(vget_low_u16(y0),vget_high_u16(y0));   /* col sums Y0[2x]+Y0[2x+1]... */
-        uint16x4_t s1=vpadd_u16(vget_low_u16(y1),vget_high_u16(y1));
-        int32x4_t Y =vreinterpretq_s32_u32(vmovl_u16(vadd_u16(s0,s1)));/* avgY4, 0..4092 */
-        int32x4_t Uu=vreinterpretq_s32_u32(vmovl_u16(vand_u16(vld1_u16(U+x),m1023)));
-        int32x4_t Vv=vreinterpretq_s32_u32(vmovl_u16(vand_u16(vld1_u16(V+x),m1023)));
-        int32x4_t ybq=vshrq_n_s32(vaddq_s32(vmulq_s32(vsubq_s32(Y ,v256),vdupq_n_s32(MY)),v32768),16);
-        int32x4_t ubq=vshrq_n_s32(vaddq_s32(vmulq_s32(vsubq_s32(Uu,v64 ),vdupq_n_s32(MC)),v32768),16);
-        int32x4_t vbq=vshrq_n_s32(vaddq_s32(vmulq_s32(vsubq_s32(Vv,v64 ),vdupq_n_s32(MC)),v32768),16);
-        ybq=vminq_s32(vmaxq_s32(ybq,vzero),vLIMQ);
-        ubq=vminq_s32(vmaxq_s32(ubq,vzero),vLIMQ);
-        vbq=vminq_s32(vmaxq_s32(vbq,vzero),vLIMQ);
-        int32x4_t yi=vshrq_n_s32(ybq,8), ui=vshrq_n_s32(ubq,8), vi=vshrq_n_s32(vbq,8);
-        int32x4_t fy=vandq_s32(ybq,v255), fu=vandq_s32(ubq,v255), fv=vandq_s32(vbq,v255);
-        int32x4_t incy=vandq_s32(vreinterpretq_s32_u32(vcltq_s32(yi,vNm1)),vone);
-        int32x4_t incu=vandq_s32(vreinterpretq_s32_u32(vcltq_s32(ui,vNm1)),vone);
-        int32x4_t incv=vandq_s32(vreinterpretq_s32_u32(vcltq_s32(vi,vNm1)),vone);
-        int32x4_t base=vmulq_s32(vaddq_s32(vmulq_s32(vaddq_s32(vmulq_s32(yi,vN),ui),vN),vi),vST); /* byte offset */
-        int32x4_t dY=vmulq_s32(incy,vdupq_n_s32(N*N*3));
-        int32x4_t dU=vmulq_s32(incu,vdupq_n_s32(N*3));
-        int32x4_t dV=vmulq_s32(incv,vST);
-        int32x4_t allo=vaddq_s32(vaddq_s32(vaddq_s32(base,dY),dU),dV);
-        int32x4_t fmax=vmaxq_s32(vmaxq_s32(fy,fu),fv);
-        int32x4_t fmin=vminq_s32(vminq_s32(fy,fu),fv);
-        int32x4_t fmid=vsubq_s32(vsubq_s32(vaddq_s32(vaddq_s32(fy,fu),fv),fmax),fmin);
-        int32x4_t w0=vsubq_s32(v256,fmax), w1=vsubq_s32(fmax,fmid), w2=vsubq_s32(fmid,fmin), w3=fmin;
-        uint32x4_t c_yu=vcgeq_s32(fy,fu), c_uv=vcgeq_s32(fu,fv), c_yv=vcgeq_s32(fy,fv);
-        uint32x4_t ymax=vandq_u32(c_yu,c_yv), umax=vandq_u32(vmvnq_u32(c_yu),c_uv);
-        int32x4_t dmax=vbslq_s32(ymax,dY,vbslq_s32(umax,dU,dV));
-        uint32x4_t vmn=vandq_u32(c_uv,c_yv), umn=vandq_u32(c_yu,vmvnq_u32(c_uv));
-        int32x4_t dmin=vbslq_s32(vmn,dV,vbslq_s32(umn,dU,dY));
-        int32_t o0[4],oa[4],ob[4],o3[4]; uint16_t g0[4],ga[4],gb[4],g3[4];
-        vst1q_s32(o0,base); vst1q_s32(oa,vaddq_s32(base,dmax));
-        vst1q_s32(ob,vsubq_s32(allo,dmin)); vst1q_s32(o3,allo);
-        for (int i=0;i<4;i++) {   /* software gather: one u16 (Cb|Cr) per corner per lane */
+    const uint16x8_t m1023q=vdupq_n_u16(1023), m8q=vdupq_n_u16(0xff);
+#define CALC4(Yv,Uv,Vv,o0,oa,ob,o3,w0,w1,w2,w3) \
+    tm3d_calc4(Yv,Uv,Vv,MY,MC,v256,v64,v32768,vLIMQ,vzero,vNm1,vone,v255,vN,vST, \
+               &o0,&oa,&ob,&o3,&w0,&w1,&w2,&w3)
+    for (; x + 8 <= cw; x += 8) {
+        uint16x8_t y0a=vld1q_u16(Y0+2*x), y0b=vld1q_u16(Y0+2*x+8);
+        uint16x8_t y1a=vld1q_u16(Y1+2*x), y1b=vld1q_u16(Y1+2*x+8);
+        uint16x8_t avg=vaddq_u16(vpaddq_u16(y0a,y0b), vpaddq_u16(y1a,y1b));   /* 8 avgY4 */
+        uint16x8_t U8=vandq_u16(vld1q_u16(U+x),m1023q), V8=vandq_u16(vld1q_u16(V+x),m1023q);
+        int32x4_t Ylo=vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(avg))), Yhi=vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(avg)));
+        int32x4_t Ulo=vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(U8))),  Uhi=vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(U8)));
+        int32x4_t Vlo=vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(V8))),  Vhi=vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(V8)));
+        int32x4_t o0l,oal,obl,o3l,w0l,w1l,w2l,w3l, o0h,oah,obh,o3h,w0h,w1h,w2h,w3h;
+        CALC4(Ylo,Ulo,Vlo, o0l,oal,obl,o3l, w0l,w1l,w2l,w3l);
+        CALC4(Yhi,Uhi,Vhi, o0h,oah,obh,o3h, w0h,w1h,w2h,w3h);
+        int32_t o0[8],oa[8],ob[8],o3[8]; uint16_t g0[8],ga[8],gb[8],g3[8];
+        vst1q_s32(o0,o0l); vst1q_s32(o0+4,o0h); vst1q_s32(oa,oal); vst1q_s32(oa+4,oah);
+        vst1q_s32(ob,obl); vst1q_s32(ob+4,obh); vst1q_s32(o3,o3l); vst1q_s32(o3+4,o3h);
+        for (int i=0;i<8;i++) {   /* software gather: one u16 (Cb|Cr) per corner per lane */
             memcpy(&g0[i], ff_rpi_tm_lut3d+o0[i]+1, 2); memcpy(&ga[i], ff_rpi_tm_lut3d+oa[i]+1, 2);
             memcpy(&gb[i], ff_rpi_tm_lut3d+ob[i]+1, 2); memcpy(&g3[i], ff_rpi_tm_lut3d+o3[i]+1, 2);
         }
-        uint16x4_t h0=vld1_u16(g0),ha=vld1_u16(ga),hb=vld1_u16(gb),h3=vld1_u16(g3);
-        uint32x4_t uw0=vreinterpretq_u32_s32(w0),uw1=vreinterpretq_u32_s32(w1),
-                   uw2=vreinterpretq_u32_s32(w2),uw3=vreinterpretq_u32_s32(w3);
-        uint32x4_t accb=vmulq_u32(uw0,vmovl_u16(vand_u16(h0,m8)));
-        accb=vmlaq_u32(accb,uw1,vmovl_u16(vand_u16(ha,m8)));
-        accb=vmlaq_u32(accb,uw2,vmovl_u16(vand_u16(hb,m8)));
-        accb=vmlaq_u32(accb,uw3,vmovl_u16(vand_u16(h3,m8)));
-        uint32x4_t accr=vmulq_u32(uw0,vmovl_u16(vshr_n_u16(h0,8)));
-        accr=vmlaq_u32(accr,uw1,vmovl_u16(vshr_n_u16(ha,8)));
-        accr=vmlaq_u32(accr,uw2,vmovl_u16(vshr_n_u16(hb,8)));
-        accr=vmlaq_u32(accr,uw3,vmovl_u16(vshr_n_u16(h3,8)));
-        uint8x8_t cb8=vqmovn_u16(vcombine_u16(vrshrn_n_u32(accb,8),vdup_n_u16(0)));  /* (acc+128)>>8 */
-        uint8x8_t cr8=vqmovn_u16(vcombine_u16(vrshrn_n_u32(accr,8),vdup_n_u16(0)));
-        vst1_lane_u32((uint32_t *)(OU+x), vreinterpret_u32_u8(cb8), 0);   /* 4 bytes */
-        vst1_lane_u32((uint32_t *)(OV+x), vreinterpret_u32_u8(cr8), 0);
+        uint16x8_t h0=vld1q_u16(g0),ha=vld1q_u16(ga),hb=vld1q_u16(gb),h3=vld1q_u16(g3);
+        uint16x8_t cb0=vandq_u16(h0,m8q),cba=vandq_u16(ha,m8q),cbb=vandq_u16(hb,m8q),cb3=vandq_u16(h3,m8q);
+        uint16x8_t cr0=vshrq_n_u16(h0,8),cra=vshrq_n_u16(ha,8),crb=vshrq_n_u16(hb,8),cr3=vshrq_n_u16(h3,8);
+        uint32x4_t uw0l=vreinterpretq_u32_s32(w0l),uw1l=vreinterpretq_u32_s32(w1l),uw2l=vreinterpretq_u32_s32(w2l),uw3l=vreinterpretq_u32_s32(w3l);
+        uint32x4_t uw0h=vreinterpretq_u32_s32(w0h),uw1h=vreinterpretq_u32_s32(w1h),uw2h=vreinterpretq_u32_s32(w2h),uw3h=vreinterpretq_u32_s32(w3h);
+        uint32x4_t bl=vmulq_u32(uw0l,vmovl_u16(vget_low_u16(cb0)));
+        bl=vmlaq_u32(bl,uw1l,vmovl_u16(vget_low_u16(cba))); bl=vmlaq_u32(bl,uw2l,vmovl_u16(vget_low_u16(cbb))); bl=vmlaq_u32(bl,uw3l,vmovl_u16(vget_low_u16(cb3)));
+        uint32x4_t bh=vmulq_u32(uw0h,vmovl_u16(vget_high_u16(cb0)));
+        bh=vmlaq_u32(bh,uw1h,vmovl_u16(vget_high_u16(cba))); bh=vmlaq_u32(bh,uw2h,vmovl_u16(vget_high_u16(cbb))); bh=vmlaq_u32(bh,uw3h,vmovl_u16(vget_high_u16(cb3)));
+        uint32x4_t rl=vmulq_u32(uw0l,vmovl_u16(vget_low_u16(cr0)));
+        rl=vmlaq_u32(rl,uw1l,vmovl_u16(vget_low_u16(cra))); rl=vmlaq_u32(rl,uw2l,vmovl_u16(vget_low_u16(crb))); rl=vmlaq_u32(rl,uw3l,vmovl_u16(vget_low_u16(cr3)));
+        uint32x4_t rh=vmulq_u32(uw0h,vmovl_u16(vget_high_u16(cr0)));
+        rh=vmlaq_u32(rh,uw1h,vmovl_u16(vget_high_u16(cra))); rh=vmlaq_u32(rh,uw2h,vmovl_u16(vget_high_u16(crb))); rh=vmlaq_u32(rh,uw3h,vmovl_u16(vget_high_u16(cr3)));
+        vst1_u8(OU+x, vqmovn_u16(vcombine_u16(vrshrn_n_u32(bl,8),vrshrn_n_u32(bh,8))));  /* (acc+128)>>8 */
+        vst1_u8(OV+x, vqmovn_u16(vcombine_u16(vrshrn_n_u32(rl,8),vrshrn_n_u32(rh,8))));
     }
+#undef CALC4
 #endif
     tm3d_chroma_scalar(OU, OV, Y0, Y1, U, V, x, cw);   /* tail / non-NEON fallback */
 }
