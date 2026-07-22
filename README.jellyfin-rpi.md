@@ -66,8 +66,9 @@ directly from that chain** into embedded LUTs (`libavfilter/rpi_tonemap_gen.py` 
 - `tm=accurate` — chroma-resolution 3D LUT (luma-aware), reproduces zscale; ~¼ the cost of a
   full 4:4:4 LUT for the same quality. Applied with **fixed-point tetrahedral** interpolation
   (4 taps, all-integer — more accurate near saturated corners than trilinear, and faster).
-  Quality tier, **not** real-time by design (~0.65× at 4K HDR; the per-sample 3D-LUT gather
-  doesn't vectorise on A72 NEON).
+  Quality tier, **not** real-time by design (~0.77× at 4K HDR). The apply is NEON (8 chroma
+  samples/iter: branchless tetrahedron select + software gather); it's ultimately gather-latency
+  bound, so it stays below the fast tier.
 - `tm=none` (default) — plain truncation, byte-for-byte unchanged.
 
 Deferred (see `TODO-rpi-tonemap.md`): command-line-tunable peak/operator/saturation, a BT.2390
@@ -124,7 +125,7 @@ HDR10 source — add `tm=fast` (real-time) or `tm=accurate` (quality):
 | 10-bit HEVC SDR 4K scope (3840×1608) | ~1.42× | slice-thread + prefetch + map-cache + thread-cap |
 | 10-bit HEVC HDR10 4K (3840×2160), `tm=none` | ~1.16× | truncation, colour wrong |
 | 10-bit HEVC HDR10 4K (3840×2160), `tm=fast` | ~1.11× | **real-time, correct colour** (single-pass tone-map fold) |
-| 10-bit HEVC HDR10 4K (3840×2160), `tm=accurate` | ~0.65× | quality tier, not real-time (fixed-point tetrahedral 3D-LUT) |
+| 10-bit HEVC HDR10 4K (3840×2160), `tm=accurate` | ~0.77× | quality tier, not real-time (NEON tetrahedral 3D-LUT, gather-bound) |
 
 The 4K unpack is **memory-latency-bound** on the scattered SAND reads (same wall that made the
 V3D GPU offload lose). Threading reaches the shared-bus ceiling with ~2–3 cores; the levers above
