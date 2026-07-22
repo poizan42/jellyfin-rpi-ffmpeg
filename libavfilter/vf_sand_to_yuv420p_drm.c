@@ -16,6 +16,7 @@
 
 #include <fcntl.h>
 #include <unistd.h>
+#include <time.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <linux/dma-buf.h>
@@ -44,6 +45,20 @@ struct dma_heap_allocation_data { __u64 len; __u32 fd; __u32 fd_flags; __u64 hea
 
 #define POOL_N 24   /* >= filtergraph + M2M in-flight depth */
 
+/* Lever-0 instrumentation: run with SAND_PROF=1 to log per-phase serial cost.
+ * Zero-cost when off (one cached getenv). filter_frame is single-threaded. */
+static int     prof_on = -1;
+static int64_t prof_ns[5];
+static unsigned prof_frames;
+static const char *const prof_name[5] = { "map", "setup+unpack", "outflush", "wrap", "unmap" };
+static inline int64_t prof_now(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
+#define PROF(i) do { if (prof_on) { int64_t _n = prof_now(); prof_ns[i] += _n - _t0; _t0 = _n; } } while (0)
+
 typedef struct PoolBuf {
     int    fd;
     void  *map;
@@ -51,12 +66,81 @@ typedef struct PoolBuf {
     int    in_use;
 } PoolBuf;
 
+/* Lever 2: persistent fd-keyed mmap cache for the decoder's input SAND buffers.
+ * The decoder recycles a fixed set of dma-buf fds, so mapping them once (instead
+ * of a fresh mmap+munmap of ~16 MB per frame in av_hwframe_map) removes that
+ * per-frame churn; only the mandatory cache-invalidate stays. filter_frame is
+ * single-threaded, so the cache needs no lock. */
+#define MAP_CACHE_N 32
+typedef struct MapEnt { int fd; void *addr; size_t size; } MapEnt;
+
 typedef struct BridgeContext {
     const AVClass *class;
     int      heap_fd;
     AVMutex  lock;
     PoolBuf  pool[POOL_N];
+    MapEnt   mcache[MAP_CACHE_N];
+    int      mcache_n;
+    unsigned mmap_count;   /* SAND_PROF: distinct input buffers mmap'd (should plateau) */
 } BridgeContext;
+
+/* Return a persistent read-only mapping of (fd,size), or NULL to signal the
+ * caller to fall back to av_hwframe_map (cache full / mmap failed). */
+static void *map_cached(BridgeContext *s, int fd, size_t size)
+{
+    for (int i = 0; i < s->mcache_n; i++)
+        if (s->mcache[i].fd == fd && s->mcache[i].size == size)
+            return s->mcache[i].addr;
+    if (s->mcache_n >= MAP_CACHE_N)
+        return NULL;
+    void *m = mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
+    if (m == MAP_FAILED)
+        return NULL;
+    s->mcache[s->mcache_n++] = (MapEnt){ fd, m, size };
+    s->mmap_count++;
+    return m;
+}
+
+/* Build a SAND `mapped` view of the input DRM_PRIME frame from the cached
+ * mapping (replicates hwcontext_drm.c drm_map_frame's plane + stride rework).
+ * Returns the fd to SYNC(END|READ) after use, or -1 to use the fallback path. */
+static int map_input_cached(BridgeContext *s, const AVFrame *in, AVFrame *mapped)
+{
+    if (in->format != AV_PIX_FMT_DRM_PRIME || !in->hw_frames_ctx)
+        return -1;
+    const AVDRMFrameDescriptor *desc = (const AVDRMFrameDescriptor *)in->data[0];
+    if (!desc || desc->nb_objects != 1)
+        return -1;
+    void *base = map_cached(s, desc->objects[0].fd, desc->objects[0].size);
+    if (!base)
+        return -1;
+
+    mapped->format = ((AVHWFramesContext *)in->hw_frames_ctx->data)->sw_format;
+    mapped->width  = in->width;
+    mapped->height = in->height;
+    int plane = 0;
+    for (int i = 0; i < desc->nb_layers; i++) {
+        const AVDRMLayerDescriptor *layer = &desc->layers[i];
+        for (int p = 0; p < layer->nb_planes; p++) {
+            mapped->data[plane]     = (uint8_t *)base + layer->planes[p].offset;
+            mapped->linesize[plane] = layer->planes[p].pitch;
+            plane++;
+        }
+    }
+    if (av_rpi_is_sand_frame(mapped)) {
+        int mod_stride = fourcc_mod_broadcom_param(desc->objects[0].format_modifier);
+        if (mod_stride == 0) {
+            mapped->linesize[3] = mapped->linesize[0];
+            mapped->linesize[4] = mapped->linesize[1];
+        } else {
+            mapped->linesize[3] = mod_stride;
+            mapped->linesize[4] = mod_stride;
+        }
+        mapped->linesize[0] = 128;
+        mapped->linesize[1] = 128;
+    }
+    return desc->objects[0].fd;
+}
 
 /* Per-output-frame descriptor holder; owned by the frame's buf[0]. The dma-buf
  * itself stays in the pool (reused) — only marked free here. */
@@ -86,6 +170,8 @@ static av_cold void uninit(AVFilterContext *avctx)
         if (s->pool[i].map && s->pool[i].map != MAP_FAILED) munmap(s->pool[i].map, s->pool[i].size);
         if (s->pool[i].fd >= 0) close(s->pool[i].fd);
     }
+    for (int i = 0; i < s->mcache_n; i++)
+        munmap(s->mcache[i].addr, s->mcache[i].size);
     ff_mutex_destroy(&s->lock);
     if (s->heap_fd >= 0) close(s->heap_fd);
 }
@@ -179,17 +265,30 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     AVFrame *mapped = NULL, *tmp = NULL, *out = NULL;
     OutBuf *b = NULL;
     int idx = -1, fd = -1;
+    int sync_fd = -1;
     void *map = NULL;
     int rv;
+    int64_t _t0;
+
+    if (prof_on < 0) prof_on = !!getenv("SAND_PROF");
+    _t0 = prof_on ? prof_now() : 0;
 
     if (!(mapped = av_frame_alloc())) { rv = AVERROR(ENOMEM); goto fail; }
-    mapped->format = AV_PIX_FMT_NONE;
-    if ((rv = av_hwframe_map(mapped, in, AV_HWFRAME_MAP_READ)) < 0) {
-        av_log(avctx, AV_LOG_ERROR, "hwframe_map(READ) failed: %s\n", av_err2str(rv));
-        goto fail;
+    sync_fd = map_input_cached(s, in, mapped);
+    if (sync_fd >= 0) {
+        /* cached fast path: persistent mmap, invalidate for this frame's read */
+        dmabuf_sync(sync_fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ);
+    } else {
+        /* fail-safe: fresh per-frame map (mmap + invalidate + munmap on free) */
+        mapped->format = AV_PIX_FMT_NONE;
+        if ((rv = av_hwframe_map(mapped, in, AV_HWFRAME_MAP_READ)) < 0) {
+            av_log(avctx, AV_LOG_ERROR, "hwframe_map(READ) failed: %s\n", av_err2str(rv));
+            goto fail;
+        }
     }
     mapped->crop_top = in->crop_top;   mapped->crop_bottom = in->crop_bottom;
     mapped->crop_left = in->crop_left;  mapped->crop_right = in->crop_right;
+    PROF(0);
 
     const unsigned w = av_frame_cropped_width(mapped);
     const unsigned h = av_frame_cropped_height(mapped);
@@ -207,14 +306,21 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     tmp->data[1] = (uint8_t *)map + ysz;       tmp->linesize[1] = bpl / 2;
     tmp->data[2] = (uint8_t *)map + ysz + csz; tmp->linesize[2] = bpl / 2;
 
-    int nb = FFMIN(ff_filter_get_nb_threads(avctx), (int)(h / 2));
+    /* Leave one core for the (parallel) decode/encode threads: on the 4-core
+     * Pi, using all cores for the unpack oversubscribes and slows the whole
+     * pipeline (~5%). The unpack is memory-latency-bound, so it reaches the
+     * shared-bus ceiling below core count anyway. */
+    int pool = ff_filter_get_nb_threads(avctx);
+    int nb = FFMIN(pool > 1 ? pool - 1 : 1, (int)(h / 2));
     nb = av_clip(nb, 1, 64);
     ThreadData td = { .dst = tmp, .src = mapped, .H = h };
     int rets[64] = { 0 };
 
     dmabuf_sync(fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE);
     ff_filter_execute(avctx, unpack_slice, &td, rets, nb);
+    PROF(1);
     dmabuf_sync(fd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
+    PROF(2);
     for (int i = 0; i < nb; i++)
         if (rets[i] != 0) {
             av_log(avctx, AV_LOG_ERROR, "sand->planar failed (fmt %d)\n", mapped->format);
@@ -251,10 +357,22 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     out->crop_top = out->crop_left = out->crop_bottom = out->crop_right = 0;
     if (in->hw_frames_ctx)
         out->hw_frames_ctx = av_buffer_ref(in->hw_frames_ctx);
+    PROF(3);
 
-    av_frame_free(&mapped);
+    if (sync_fd >= 0) dmabuf_sync(sync_fd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ);
+    av_frame_free(&mapped);   /* cached: frees struct only (no buf); fallback: unmaps */
+    PROF(4);
     av_frame_free(&tmp);
     av_frame_free(&in);
+
+    if (prof_on && ++prof_frames % 100 == 0) {
+        av_log(avctx, AV_LOG_INFO, "SAND_PROF us/frame:");
+        for (int i = 0; i < 5; i++) {
+            av_log(avctx, AV_LOG_INFO, " %s=%.0f", prof_name[i], prof_ns[i] / 100.0 / 1000.0);
+            prof_ns[i] = 0;
+        }
+        av_log(avctx, AV_LOG_INFO, " [mmaps=%u]\n", s->mmap_count);
+    }
     return ff_filter_frame(outlink, out);
 
 fail_release:
