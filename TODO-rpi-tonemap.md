@@ -53,5 +53,22 @@ Also related: `frame_is_hdr()` treats HLG (`ARIB_STD_B67`) as HDR but the LUTs a
 genuine HLG (incl. DV P8.4) is currently mis-tone-mapped (wrong transfer) — bake an HLG curve or
 gate it out.
 
+## Accurate-tier perf — where it stands, and a dead end (don't re-try)
+The accurate chroma 3D-LUT apply is NEON (8 chroma samples/iter: branchless tetrahedron select +
+software gather; `tm3d_chroma_row` in `vf_sand_to_yuv420p_drm.c`), bit-exact to the scalar path.
+4K HDR: 0.65× (scalar) → **0.765× (+18%)**. It is **gather-latency bound** — the scattered 4-corner
+lookup into the 108 KB LUT is the wall (same wall that beat every V3D offload). Measured ceilings:
+a chroma-only 72 KB table repack gave nothing (it's the access *pattern*, not L2 footprint); the
+arithmetic-only ceiling (gather stubbed) is ~0.83×.
+
+**Dead end — do not re-attempt:** fusing the luma tone-map into the SAND unpack (a `y16`+`y8lut`
+two-output `.S` kernel, so luma skips the separate `lut1d` pass). Built and validated bit-exact,
+it gave **~0% (0.765→0.774×, within run noise)**. Reason: the "15% luma-output" cost is almost
+entirely the *mandatory* 8-bit output write; the `lut1d` re-read it removed was already L2-hot/cheap.
+The 2-read variant (single-pass luma + separate `y16`) was *slower* (0.718×) — the extra scattered
+SAND read costs more than the pass it saves. Bottom line: the accurate tier is memory/gather bound;
+further CPU-side vectorisation won't move it. (A GPU 3D-LUT would suit the gather but libplacebo
+doesn't run on the Pi's V3DV, and the DRAM round-trip loses on unified memory — see the fork README.)
+
 ## Other
 - 32-bit `arm/rpi_sand_neon.S` parity for the fast-tier tone LUT (aarch64 done first; Pi 4 is 64-bit).
