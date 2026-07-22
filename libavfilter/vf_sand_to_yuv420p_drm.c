@@ -91,6 +91,7 @@ typedef struct BridgeContext {
     unsigned mmap_count;   /* SAND_PROF: distinct input buffers mmap'd (should plateau) */
     int      tm;           /* TM_NONE / TM_FAST / TM_ACCURATE (option) */
     uint8_t  l64[64], cb64[64], cr64[64];  /* 64-entry tbl LUTs (subsampled at init) */
+    uint8_t  l64_next[64];                 /* l64_next[i]=curve((i+1)*16); for the single-pass .S kernel */
 } BridgeContext;
 
 /* Return a persistent read-only mapping of (fd,size), or NULL to signal the
@@ -164,7 +165,8 @@ static av_cold int init(AVFilterContext *avctx)
     BridgeContext *s = avctx->priv;
     for (int i = 0; i < POOL_N; i++) s->pool[i].fd = -1;
     for (int i = 0; i < 64; i++) {   /* subsample the 1024-entry curves at code = i*16 */
-        s->l64[i]  = ff_rpi_tm_luma1d[i * 16];
+        s->l64[i]      = ff_rpi_tm_luma1d[i * 16];
+        s->l64_next[i] = ff_rpi_tm_luma1d[FFMIN((i + 1) * 16, 1023)];
         s->cb64[i] = ff_rpi_tm_cb1d[i * 16];
         s->cr64[i] = ff_rpi_tm_cr1d[i * 16];
     }
@@ -289,6 +291,7 @@ typedef struct TMData {
     unsigned       H;     /* luma height          */
     int            tm;
     const uint8_t *l64, *cb64, *cr64;  /* 64-entry tbl LUTs (fast NEON path) */
+    const uint8_t *l64_next;           /* pairs with l64 for the single-pass .S kernel */
 } TMData;
 
 /* Apply a smooth 1024->8 tone curve to n contiguous 10-bit samples using a
@@ -376,6 +379,38 @@ static int tm_slice(AVFilterContext *avctx, void *arg, int jobnr, int nb_jobs)
     unsigned y1 = (jobnr == nb_jobs - 1) ? H : (((uint64_t)H * (jobnr + 1) / nb_jobs) & ~1u);
     if (y1 <= y0)
         return 0;
+
+    if (td->tm == TM_FAST) {
+        /* Fast tier: luma is a single-pass SAND30 -> tone-mapped 8-bit (the .S
+         * kernel folds the 1D curve into the unpack — no 10-bit intermediate).
+         * Chroma still needs a small L2-resident 10-bit scratch for the
+         * separable Cb/Cr LUTs (1/3 of the samples, so cheap). */
+        const AVFrame *src = td->src;
+        const unsigned stride1 = av_rpi_sand_frame_stride1(src);
+        av_rpi_sand30_to_planar_y8_lut(
+            td->dst->data[0] + (size_t)y0 * td->dst->linesize[0], td->dst->linesize[0],
+            src->data[0], stride1, av_rpi_sand_frame_stride2_y(src),
+            src->crop_left, src->crop_top + y0, W, y1 - y0, td->l64, td->l64_next);
+
+        uint16_t *su = av_malloc((size_t)(TM_CHUNK/2) * cw * 2);
+        uint16_t *sv = av_malloc((size_t)(TM_CHUNK/2) * cw * 2);
+        if (!su || !sv) { av_free(su); av_free(sv); return AVERROR(ENOMEM); }
+        for (unsigned y = y0; y < y1; y += TM_CHUNK) {
+            unsigned ch = FFMIN((unsigned)TM_CHUNK, y1 - y);
+            av_rpi_sand30_to_planar_c16((uint8_t *)su, cw * 2, (uint8_t *)sv, cw * 2,
+                src->data[1], stride1, av_rpi_sand_frame_stride2_c(src),
+                src->crop_left / 2, (src->crop_top + y) / 2, cw, ch / 2);
+            for (unsigned r = 0; r < ch / 2; r++) {
+                uint8_t *OU = td->dst->data[1] + (size_t)(y/2 + r) * td->dst->linesize[1];
+                uint8_t *OV = td->dst->data[2] + (size_t)(y/2 + r) * td->dst->linesize[2];
+                lut1d_apply(OU, su + (size_t)r * cw, cw, td->cb64, ff_rpi_tm_cb1d);
+                lut1d_apply(OV, sv + (size_t)r * cw, cw, td->cr64, ff_rpi_tm_cr1d);
+            }
+        }
+        av_free(su); av_free(sv);
+        return 0;
+    }
+
     /* L2-resident 10-bit scratch for TM_CHUNK rows */
     uint16_t *sy = av_malloc((size_t)TM_CHUNK * W * 2);
     uint16_t *su = av_malloc((size_t)(TM_CHUNK/2) * cw * 2);
@@ -476,7 +511,8 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
         /* HDR tone-map: cache-tiled SAND -> 10-bit scratch -> LUT -> 8-bit YU12
          * (single-pass DRAM traffic; scratch stays L2-resident). */
         TMData tdm = { .dst = tmp, .src = mapped, .H = h, .tm = s->tm,
-                       .l64 = s->l64, .cb64 = s->cb64, .cr64 = s->cr64 };
+                       .l64 = s->l64, .cb64 = s->cb64, .cr64 = s->cr64,
+                       .l64_next = s->l64_next };
         dmabuf_sync(fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE);
         ff_filter_execute(avctx, tm_slice, &tdm, rets, nb);
         PROF(1);

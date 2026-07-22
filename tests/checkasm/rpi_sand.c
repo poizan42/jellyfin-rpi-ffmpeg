@@ -131,6 +131,53 @@ void checkasm_check_rpi_sand(void)
         bench_new(ybuf1, (w + 32), sbuf1, stride1, stride2, 0, 0, w, h);
     }
 
+#if ARCH_AARCH64
+    // Tone-mapping single-pass kernel: validated against a real oracle (the
+    // trusted 10-bit y16 unpack + a scalar 64-entry lerp), not func-vs-itself.
+    if (have_neon(av_get_cpu_flags()) &&
+        check_func(ff_rpi_sand30_lines_to_planar_y8_lut, "rpi_sand30_to_planar_y8_lut")) {
+        declare_func(void, uint8_t * dst, unsigned int dst_stride,
+                     const uint8_t * src, unsigned int stride1, unsigned int stride2,
+                     unsigned int _x, unsigned int y, unsigned int _w, unsigned int h,
+                     const uint8_t * lut, const uint8_t * lut_next);
+        uint8_t lut[64], lut_next[64];
+        unsigned int r, c;
+
+        for (i = 0; i < 64; i++)
+            lut[i] = av_clip_uint8(i * 4 + 1);       // monotone test curve
+        for (i = 0; i < 64; i++)
+            lut_next[i] = lut[i + 1 < 64 ? i + 1 : 63];
+
+        // Reference: trusted y16 unpack into ybuf0 (as uint16) + scalar lerp -> vframe0
+        memset(ybuf0, 0xbb, ysize);
+        av_rpi_sand30_to_planar_y16(yframe0, (w + 32) * 2, sbuf0, stride1, stride2, 0, 0, w, h);
+        for (r = 0; r < h; r++) {
+            const uint16_t * s10 = (const uint16_t *)(yframe0 + r * (w + 32) * 2);
+            uint8_t * d = vframe0 + r * (w + 32);
+            for (c = 0; c < w; c++) {
+                unsigned int code = s10[c] & 0x3ff;
+                unsigned int idx = code >> 4, frac = code & 15;
+                int a = lut[idx], b = lut_next[idx];
+                d[c] = av_clip_uint8(a + (((b - a) * (int)frac + 8) >> 4));
+            }
+        }
+
+        // NEON single-pass -> yframe1
+        memset(ybuf1, 0xbb, ysize);
+        call_new(yframe1, (w + 32), sbuf1, stride1, stride2, 0, 0, w, h, lut, lut_next);
+
+        if (memcmp(sbuf0, sbuf1, ssize))
+            fail();
+        for (r = 0; r < h; r++)
+            if (memcmp(vframe0 + r * (w + 32), yframe1 + r * (w + 32), w)) {
+                fail();
+                break;
+            }
+
+        bench_new(yframe1, (w + 32), sbuf1, stride1, stride2, 0, 0, w, h, lut, lut_next);
+    }
+#endif
+
     if (check_func(have_neon(av_get_cpu_flags()) ? ff_rpi_sand30_lines_to_planar_c8 : av_rpi_sand30_to_planar_c8, "rpi_sand30_to_planar_c8")) {
         declare_func(void, uint8_t * u_dst, const unsigned int u_stride,
                      uint8_t * v_dst, const unsigned int v_stride,

@@ -290,6 +290,33 @@ endfunc
                 bic             \d1\().8h, #0xfc,     lsl #8
 .endm
 
+// Tone-map 8x 10-bit (in.8h) -> 8x 8-bit via a 64-entry LUT + linear interp:
+//   idx = code>>4 (0..63); lerp between T[idx] (v8-v11) and Tnext[idx] (v12-v15).
+// Tnext[i]=T[i+1] (clamped) so no idx+1/clamp is needed. TMLUT writes the low
+// 8 bytes of d; TMLUT2 writes the high 8 (sqxtun2), for building a .16b.
+// Scratch: ridx, rfrac, rlo, rhi (4 caller-saved v-regs, e.g. v0-v3).
+.macro TMLUT_ d, in, ridx, rfrac, rlo, rhi, narrow
+                ushr            \rfrac\().8h, \in\().8h, #4
+                xtn             \ridx\().8b,  \rfrac\().8h
+                shl             \rfrac\().8h, \in\().8h,   #12
+                ushr            \rfrac\().8h, \rfrac\().8h, #12
+                tbl             \rlo\().8b, {v8.16b, v9.16b, v10.16b, v11.16b}, \ridx\().8b
+                tbl             \rhi\().8b, {v12.16b, v13.16b, v14.16b, v15.16b}, \ridx\().8b
+                uxtl            \rlo\().8h, \rlo\().8b
+                uxtl            \rhi\().8h, \rhi\().8b
+                sub             \rhi\().8h, \rhi\().8h, \rlo\().8h
+                mul             \rhi\().8h, \rhi\().8h, \rfrac\().8h
+                srshr           \rhi\().8h, \rhi\().8h, #4
+                add             \rlo\().8h, \rlo\().8h, \rhi\().8h
+                \narrow         \d, \rlo\().8h
+.endm
+.macro TMLUT  d, in, ridx, rfrac, rlo, rhi
+                TMLUT_ \d\().8b,  \in, \ridx, \rfrac, \rlo, \rhi, sqxtun
+.endm
+.macro TMLUT2 d, in, ridx, rfrac, rlo, rhi
+                TMLUT_ \d\().16b, \in, \ridx, \rfrac, \rlo, \rhi, sqxtun2
+.endm
+
 // SAND30 -> 8bit
 .macro USAND8 d0, d1, d2, a0, a1, a2, a3, t0, t1, t2
                 shrn            \d1\().4h,  \a0\().4s,  #12
@@ -605,6 +632,149 @@ endfunc
 //
 // Assumes that we are starting on a stripe boundary and that overreading
 // within the stripe is OK. However it does respect the dest size for wri
+
+// void ff_rpi_sand30_lines_to_planar_y8_lut(
+//   uint8_t * dest,            : x0
+//   unsigned int dst_stride,   : w1
+//   const uint8_t * src,       : x2
+//   unsigned int src_stride1,  : w3, always 128
+//   unsigned int src_stride2,  : w4
+//   unsigned int _x,           : w5
+//   unsigned int y,            : w6
+//   unsigned int _w,           : w7
+//   unsigned int h,            : [sp, #0]
+//   const uint8_t *lut,        : [sp, #8]   (64-entry)
+//   const uint8_t *lut_next);  : [sp, #16]  (64-entry, [i]=lut[i+1])
+//
+// As ff_rpi_sand30_lines_to_planar_y8 but tone-maps 10->8 via a 64-entry LUT
+// (idx=code>>4) + linear interp, instead of the >>2 narrow. Single pass.
+function ff_rpi_sand30_lines_to_planar_y8_lut, export=1
+                ldr             x12, [sp, #8]           // lut
+                ldr             x13, [sp, #16]          // lut_next
+                ldr             w14, [sp, #0]           // h
+                stp             d8,  d9,  [sp, #-64]!
+                stp             d10, d11, [sp, #16]
+                stp             d12, d13, [sp, #32]
+                stp             d14, d15, [sp, #48]
+                ld1             {v8.16b,  v9.16b,  v10.16b, v11.16b}, [x12]
+                ld1             {v12.16b, v13.16b, v14.16b, v15.16b}, [x13]
+
+                lsl             w4,  w4,  #7
+                sub             w4,  w4,  #64
+                uxtw            x4,  w4
+                sub             w1,  w1,  w7
+                uxtw            x6,  w6
+                add             x8,  x2,  x6, lsl #7
+                mov             w6,  w14                // h counter
+                add             x9,  x4,  x4            // prefetch: ~3 stripes ahead
+                add             x9,  x9,  x4
+
+10:
+                mov             x2,  x8
+                mov             w5,  w7
+1:
+                ld1             {v0.4s, v1.4s, v2.4s, v3.4s}, [x2], #64
+                ld1             {v4.4s, v5.4s, v6.4s, v7.4s}, [x2], x4
+                prfm            pldl1strm, [x2, x9]
+
+                subs            w5,  w5,  #96
+
+                USAND10         v16, v17, v18, v0, v1   // A: s0,s1,s2 (8 each)
+                USAND10         v19, v20, v21, v2, v3   // B
+                USAND10         v22, v23, v24, v4, v5   // C
+                USAND10         v25, v26, v27, v6, v7   // D
+
+                // Tone-map + pack to .16b matching the y8 (USAND8) layout:
+                //   v16=[A.s0,B.s0] v17=[A.s1,B.s1] v18=[A.s2,B.s2]
+                //   v19=[C.s0,D.s0] v20=[C.s1,D.s1] v21=[C.s2,D.s2]
+                TMLUT           v16, v16, v0, v1, v2, v3
+                TMLUT2          v16, v19, v0, v1, v2, v3
+                TMLUT           v17, v17, v0, v1, v2, v3
+                TMLUT2          v17, v20, v0, v1, v2, v3
+                TMLUT           v18, v18, v0, v1, v2, v3
+                TMLUT2          v18, v21, v0, v1, v2, v3
+                TMLUT           v19, v22, v0, v1, v2, v3
+                TMLUT2          v19, v25, v0, v1, v2, v3
+                TMLUT           v20, v23, v0, v1, v2, v3
+                TMLUT2          v20, v26, v0, v1, v2, v3
+                TMLUT           v21, v24, v0, v1, v2, v3
+                TMLUT2          v21, v27, v0, v1, v2, v3
+
+                blt             2f
+
+                st3             {v16.16b, v17.16b, v18.16b}, [x0], #48
+                st3             {v19.16b, v20.16b, v21.16b}, [x0], #48
+
+                bne             1b
+
+11:
+                subs            w6,  w6,  #1
+                add             x0,  x0,  w1,  uxtw
+                add             x8,  x8,  #128
+                bne             10b
+
+                ldp             d10, d11, [sp, #16]
+                ldp             d12, d13, [sp, #32]
+                ldp             d14, d15, [sp, #48]
+                ldp             d8,  d9,  [sp], #64
+                ret
+
+// Partial final write (only widths not a multiple of 96; v16-v18 lead). Mirrors y8.
+2:
+                cmp             w5,  #48-96
+                blt             1f
+                st3             {v16.16b, v17.16b, v18.16b}, [x0], #48
+                beq             11b
+                mov             v16.16b, v19.16b
+                mov             v17.16b, v20.16b
+                sub             w5,  w5,  #48
+                mov             v18.16b, v21.16b
+1:
+                cmp             w5,  #24-96
+                blt             1f
+                st3             {v16.8b, v17.8b, v18.8b}, [x0], #24
+                beq             11b
+                mov             v16.d[0], v16.d[1]
+                sub             w5,  w5,  #24
+                mov             v17.d[0], v17.d[1]
+                mov             v18.d[0], v18.d[1]
+1:
+                cmp             w5,  #12-96
+                blt             1f
+                st3             {v16.b, v17.b, v18.b}[0], [x0], #3
+                st3             {v16.b, v17.b, v18.b}[1], [x0], #3
+                st3             {v16.b, v17.b, v18.b}[2], [x0], #3
+                st3             {v16.b, v17.b, v18.b}[3], [x0], #3
+                beq             11b
+                mov             v16.s[0], v16.s[1]
+                sub             w5,  w5,  #12
+                mov             v17.s[0], v17.s[1]
+                mov             v18.s[0], v18.s[1]
+1:
+                cmp             w5,  #6-96
+                blt             1f
+                st3             {v16.b, v17.b, v18.b}[0], [x0], #3
+                st3             {v16.b, v17.b, v18.b}[1], [x0], #3
+                beq             11b
+                mov             v16.h[0], v16.h[1]
+                sub             w5,  w5,  #6
+                mov             v17.h[0], v17.h[1]
+1:
+                cmp             w5,  #3-96
+                blt             1f
+                st3             {v16.b, v17.b, v18.b}[0], [x0], #3
+                beq             11b
+                mov             v16.b[0], v16.b[1]
+                sub             w5,  w5,  #3
+1:
+                cmp             w5,  #2-96
+                blt             1f
+                st2             {v16.b, v17.b}[0], [x0], #2
+                b               11b
+1:
+                st1             {v16.b}[0], [x0], #1
+                b               11b
+endfunc
 
 function ff_rpi_sand30_lines_to_planar_y16, export=1
                 lsl             w4,  w4,  #7

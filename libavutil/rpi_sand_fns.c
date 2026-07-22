@@ -385,6 +385,82 @@ void av_rpi_sand30_to_planar_y8(uint8_t * dst, const unsigned int dst_stride,
 
 
 
+// Tone-mapping variant of av_rpi_sand30_to_planar_y8: 10->8 through a 64-entry
+// LUT (idx=code>>4) with linear interp on the low 4 bits, instead of the >>2
+// narrow. lut/lut_next are 64 bytes each, lut_next[i]=lut[i+1] (clamped at 63).
+static inline uint8_t rpi_tmlerp(unsigned int code,
+                                 const uint8_t * lut, const uint8_t * lut_next)
+{
+    const unsigned int idx = code >> 4, frac = code & 15;
+    const int a = lut[idx], b = lut_next[idx];
+    return av_clip_uint8(a + (((b - a) * (int)frac + 8) >> 4));
+}
+
+void av_rpi_sand30_to_planar_y8_lut(uint8_t * dst, const unsigned int dst_stride,
+                             const uint8_t * src,
+                             unsigned int stride1, unsigned int stride2,
+                             unsigned int _x, unsigned int y,
+                             unsigned int _w, unsigned int h,
+                             const uint8_t * lut, const uint8_t * lut_next)
+{
+    const unsigned int x0 = (_x / 3) * 4; // Byte offset of the word
+    const unsigned int xskip0 = _x - (x0 >> 2) * 3;
+    const unsigned int x1 = ((_x + _w) / 3) * 4;
+    const unsigned int xrem1 = _x + _w - (x1 >> 2) * 3;
+    const unsigned int mask = stride1 - 1;
+    const uint8_t * p0 = src + (x0 & mask) + y * stride1 + (x0 & ~mask) * stride2;
+    const unsigned int slice_inc = ((stride2 - 1) * stride1) >> 2;
+
+#if HAVE_SAND_ASM
+    if (_x == 0 && have_neon(av_get_cpu_flags())) {
+        ff_rpi_sand30_lines_to_planar_y8_lut(dst, dst_stride, src, stride1, stride2,
+                                             _x, y, _w, h, lut, lut_next);
+        return;
+    }
+#endif
+
+    if (x0 == x1)
+        return;
+
+    for (unsigned int i = 0; i != h; ++i, dst += dst_stride, p0 += stride1)
+    {
+        unsigned int x = x0;
+        const uint32_t * p = (const uint32_t *)p0;
+        uint8_t * d = dst;
+
+        if (xskip0 != 0) {
+            const uint32_t p3 = *p++;
+
+            if (xskip0 == 1)
+                *d++ = rpi_tmlerp((p3 >> 10) & 0x3ff, lut, lut_next);
+            *d++ = rpi_tmlerp((p3 >> 20) & 0x3ff, lut, lut_next);
+
+            if (((x += 4) & mask) == 0)
+                p += slice_inc;
+        }
+
+        while (x != x1) {
+            const uint32_t p3 = *p++;
+            *d++ = rpi_tmlerp(p3 & 0x3ff, lut, lut_next);
+            *d++ = rpi_tmlerp((p3 >> 10) & 0x3ff, lut, lut_next);
+            *d++ = rpi_tmlerp((p3 >> 20) & 0x3ff, lut, lut_next);
+
+            if (((x += 4) & mask) == 0)
+                p += slice_inc;
+        }
+
+        if (xrem1 != 0) {
+            const uint32_t p3 = *p;
+
+            *d++ = rpi_tmlerp(p3 & 0x3ff, lut, lut_next);
+            if (xrem1 == 2)
+                *d++ = rpi_tmlerp((p3 >> 10) & 0x3ff, lut, lut_next);
+        }
+    }
+}
+
+
+
 // w/h in pixels
 void av_rpi_sand16_to_sand8(uint8_t * dst, const unsigned int dst_stride1, const unsigned int dst_stride2,
                          const uint8_t * src, const unsigned int src_stride1, const unsigned int src_stride2,

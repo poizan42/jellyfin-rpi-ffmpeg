@@ -91,6 +91,14 @@ void av_rpi_sand30_to_planar_y8(uint8_t * dst, const unsigned int dst_stride,
                              unsigned int _x, unsigned int y,
                              unsigned int _w, unsigned int h);
 
+// Tone-mapping variant: 10->8 via a 64-entry LUT + linear interp (lut_next[i]=lut[i+1]).
+void av_rpi_sand30_to_planar_y8_lut(uint8_t * dst, const unsigned int dst_stride,
+                             const uint8_t * src,
+                             unsigned int stride1, unsigned int stride2,
+                             unsigned int _x, unsigned int y,
+                             unsigned int _w, unsigned int h,
+                             const uint8_t * lut, const uint8_t * lut_next);
+
 void av_rpi_sand30_to_planar_c8(uint8_t * dst_u, const unsigned int dst_stride_u,
                              uint8_t * dst_v, const unsigned int dst_stride_v,
                              const uint8_t * src,

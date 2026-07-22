@@ -58,6 +58,14 @@ void ff_rpi_sand30_lines_to_planar_c8(uint8_t * dst_u, unsigned int dst_stride_u
   uint8_t * dst_v, unsigned int dst_stride_v, const uint8_t * src, unsigned int stride1,
   unsigned int stride2, unsigned int _x, unsigned int y, unsigned int _w, unsigned int h);
 
+// Tone-mapping variant of _y8: 10->8 via a 64-entry LUT (idx=code>>4) + linear
+// interp on the low 4 bits, instead of the plain >>2 narrow. lut/lut_next are
+// 64 bytes each, lut_next[i] = lut[i+1] (clamped at 63) so no bounds check.
+void ff_rpi_sand30_lines_to_planar_y8_lut(uint8_t * dest, unsigned int dst_stride,
+  const uint8_t * src, unsigned int src_stride1, unsigned int src_stride2,
+  unsigned int _x, unsigned int y, unsigned int _w, unsigned int h,
+  const uint8_t * lut, const uint8_t * lut_next);
+
 #ifdef __cplusplus
 }
 #endif
