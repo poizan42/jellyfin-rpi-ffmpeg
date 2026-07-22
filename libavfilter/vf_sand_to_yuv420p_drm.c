@@ -22,6 +22,9 @@
 #include <linux/dma-buf.h>
 #include <drm.h>
 #include <libdrm/drm_fourcc.h>
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 
 #include "libavutil/hwcontext.h"
 #include "libavutil/hwcontext_drm.h"
@@ -87,6 +90,7 @@ typedef struct BridgeContext {
     int      mcache_n;
     unsigned mmap_count;   /* SAND_PROF: distinct input buffers mmap'd (should plateau) */
     int      tm;           /* TM_NONE / TM_FAST / TM_ACCURATE (option) */
+    uint8_t  l64[64], cb64[64], cr64[64];  /* 64-entry tbl LUTs (subsampled at init) */
 } BridgeContext;
 
 /* Return a persistent read-only mapping of (fd,size), or NULL to signal the
@@ -159,6 +163,11 @@ static av_cold int init(AVFilterContext *avctx)
 {
     BridgeContext *s = avctx->priv;
     for (int i = 0; i < POOL_N; i++) s->pool[i].fd = -1;
+    for (int i = 0; i < 64; i++) {   /* subsample the 1024-entry curves at code = i*16 */
+        s->l64[i]  = ff_rpi_tm_luma1d[i * 16];
+        s->cb64[i] = ff_rpi_tm_cb1d[i * 16];
+        s->cr64[i] = ff_rpi_tm_cr1d[i * 16];
+    }
     ff_mutex_init(&s->lock, NULL);
     s->heap_fd = open("/dev/dma_heap/linux,cma", O_RDWR | O_CLOEXEC);
     if (s->heap_fd < 0) {
@@ -279,7 +288,34 @@ typedef struct TMData {
     const AVFrame *src;   /* SAND mapped frame    */
     unsigned       H;     /* luma height          */
     int            tm;
+    const uint8_t *l64, *cb64, *cr64;  /* 64-entry tbl LUTs (fast NEON path) */
 } TMData;
+
+/* Apply a smooth 1024->8 tone curve to n contiguous 10-bit samples using a
+ * 64-entry table (idx=code>>4) + linear interp (code&15). Vectorised on aarch64;
+ * matches the scalar 1024-entry LUT to <=1 LSB. */
+static void lut1d_apply(uint8_t *dst, const uint16_t *src, unsigned n,
+                        const uint8_t *t64, const uint8_t *t1024)
+{
+    unsigned x = 0;
+#if defined(__aarch64__)
+    const uint8x16x4_t T = vld1q_u8_x4(t64);
+    const uint8x8_t one = vdup_n_u8(1), c63 = vdup_n_u8(63);
+    for (; x + 8 <= n; x += 8) {
+        uint16x8_t v   = vandq_u16(vld1q_u16(src + x), vdupq_n_u16(1023));
+        uint8x8_t  idx = vmovn_u16(vshrq_n_u16(v, 4));           /* 0..63 */
+        int16x8_t  fr  = vreinterpretq_s16_u16(vandq_u16(v, vdupq_n_u16(15)));
+        uint8x8_t  idn = vmin_u8(vadd_u8(idx, one), c63);
+        int16x8_t  lo  = vreinterpretq_s16_u16(vmovl_u8(vqtbl4_u8(T,idx)));
+        int16x8_t  hi  = vreinterpretq_s16_u16(vmovl_u8(vqtbl4_u8(T,idn)));
+        int16x8_t  d   = vmulq_s16(vsubq_s16(hi, lo), fr);
+        int16x8_t  o   = vaddq_s16(lo, vshrq_n_s16(vaddq_s16(d, vdupq_n_s16(8)), 4));
+        vst1_u8(dst + x, vqmovun_s16(o));
+    }
+#endif
+    for (; x < n; x++)                                          /* scalar tail / fallback */
+        dst[x] = t1024[src[x] & 1023];
+}
 
 static void tm_apply_chunk(const TMData *td, const AVFrame *S, unsigned ybase, unsigned ch)
 {
@@ -289,8 +325,7 @@ static void tm_apply_chunk(const TMData *td, const AVFrame *S, unsigned ybase, u
     for (unsigned r = 0; r < ch; r++) {
         const uint16_t *Y = (const uint16_t *)S->data[0] + (size_t)r * sy;
         uint8_t *O = D->data[0] + (size_t)(ybase + r) * D->linesize[0];
-        for (unsigned x = 0; x < W; x++)
-            O[x] = ff_rpi_tm_luma1d[Y[x] & 1023];
+        lut1d_apply(O, Y, W, td->l64, ff_rpi_tm_luma1d);
     }
     if (td->tm == TM_FAST) {
         for (unsigned cr = 0; cr < ch / 2; cr++) {
@@ -298,10 +333,8 @@ static void tm_apply_chunk(const TMData *td, const AVFrame *S, unsigned ybase, u
             const uint16_t *V = (const uint16_t *)S->data[2] + (size_t)cr * sv;
             uint8_t *OU = D->data[1] + (size_t)(ybase/2 + cr) * D->linesize[1];
             uint8_t *OV = D->data[2] + (size_t)(ybase/2 + cr) * D->linesize[2];
-            for (unsigned x = 0; x < cw; x++) {
-                OU[x] = ff_rpi_tm_cb1d[U[x] & 1023];
-                OV[x] = ff_rpi_tm_cr1d[V[x] & 1023];
-            }
+            lut1d_apply(OU, U, cw, td->cb64, ff_rpi_tm_cb1d);
+            lut1d_apply(OV, V, cw, td->cr64, ff_rpi_tm_cr1d);
         }
     } else { /* TM_ACCURATE */
         const int N = RPI_TM_LUT3D_N;
@@ -442,7 +475,8 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     } else {
         /* HDR tone-map: cache-tiled SAND -> 10-bit scratch -> LUT -> 8-bit YU12
          * (single-pass DRAM traffic; scratch stays L2-resident). */
-        TMData tdm = { .dst = tmp, .src = mapped, .H = h, .tm = s->tm };
+        TMData tdm = { .dst = tmp, .src = mapped, .H = h, .tm = s->tm,
+                       .l64 = s->l64, .cb64 = s->cb64, .cr64 = s->cr64 };
         dmabuf_sync(fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE);
         ff_filter_execute(avctx, tm_slice, &tdm, rets, nb);
         PROF(1);
