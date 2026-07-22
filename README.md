@@ -19,7 +19,7 @@ Full design, build instructions and usage: **[README.jellyfin-rpi.md](README.jel
 | 10-bit HEVC **SDR** 1080p | **~2.0–2.7× real-time** — the tuned sweet spot |
 | 10-bit HEVC **SDR** 4K (2160p / scope) | **~1.4× real-time** — proven (slice-threaded NEON unpack + prefetch + map-cache + ISP scale) |
 | 8-bit HEVC SDR | works (same bridge path) |
-| 10-bit HEVC **HDR10** 4K | **~1.1× real-time with correct colour** (`tm=fast`) — single-pass NEON HDR→SDR tone-map (PQ/BT.2020→BT.709). A higher-quality `tm=accurate` tier exists (~0.57×, not yet real-time). Without tone-mapping (`tm=none`) it's ~1.16× but washed-out. |
+| 10-bit HEVC **HDR10** 4K | **~1.1× real-time with correct colour** (`tm=fast`) — single-pass NEON HDR→SDR tone-map (PQ/BT.2020→BT.709). A higher-quality `tm=accurate` tier exists (~0.65×, not real-time by design). Without tone-mapping (`tm=none`) it's ~1.16× but washed-out. |
 | Dolby Vision profile 5 | not supported (needs DV RPU processing) |
 | H.264 / VP9 / AV1 sources | outside this pipeline (rpivid decode is HEVC-only) |
 

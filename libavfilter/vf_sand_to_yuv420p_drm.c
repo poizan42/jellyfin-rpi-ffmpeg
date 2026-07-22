@@ -341,7 +341,11 @@ static void tm_apply_chunk(const TMData *td, const AVFrame *S, unsigned ybase, u
         }
     } else { /* TM_ACCURATE */
         const int N = RPI_TM_LUT3D_N;
-        const float qy = (N-1) / (940.0f-64.0f), qc = (N-1) / (960.0f-64.0f);
+        /* Q16 fixed-point coordinate scales mapping (block-avg*4, U, V) to grid
+         * position in Q8 (frac*256).  All-integer: no float in the hot path. */
+        const int64_t MY = ((int64_t)(N-1)*64 *65536 + 438) / 876;  /* luma [64,940] */
+        const int64_t MC = ((int64_t)(N-1)*256*65536 + 448) / 896;  /* chroma [64,960] */
+        const int LIMQ = (N-1) << 8;
         for (unsigned cr = 0; cr < ch / 2; cr++) {
             const uint16_t *U  = (const uint16_t *)S->data[1] + (size_t)cr * su;
             const uint16_t *V  = (const uint16_t *)S->data[2] + (size_t)cr * sv;
@@ -350,21 +354,35 @@ static void tm_apply_chunk(const TMData *td, const AVFrame *S, unsigned ybase, u
             uint8_t *OU = D->data[1] + (size_t)(ybase/2 + cr) * D->linesize[1];
             uint8_t *OV = D->data[2] + (size_t)(ybase/2 + cr) * D->linesize[2];
             for (unsigned x = 0; x < cw; x++) {
-                float yb = ((Y0[2*x]+Y0[2*x+1]+Y1[2*x]+Y1[2*x+1]) * 0.25f - 64.0f) * qy;
-                float ub = ((int)(U[x] & 1023) - 64) * qc, vb = ((int)(V[x] & 1023) - 64) * qc;
-                yb = yb < 0 ? 0 : (yb > N-1 ? N-1 : yb);
-                ub = ub < 0 ? 0 : (ub > N-1 ? N-1 : ub);
-                vb = vb < 0 ? 0 : (vb > N-1 ? N-1 : vb);
-                int yi = (int)yb, ui = (int)ub, vi = (int)vb;
+                int avgY4 = Y0[2*x] + Y0[2*x+1] + Y1[2*x] + Y1[2*x+1];   /* block sum, 0..4092 */
+                int ybq = (int)(((int64_t)(avgY4 - 256) * MY + 32768) >> 16);
+                int ubq = (int)(((int64_t)((int)(U[x] & 1023) - 64) * MC + 32768) >> 16);
+                int vbq = (int)(((int64_t)((int)(V[x] & 1023) - 64) * MC + 32768) >> 16);
+                ybq = ybq < 0 ? 0 : (ybq > LIMQ ? LIMQ : ybq);
+                ubq = ubq < 0 ? 0 : (ubq > LIMQ ? LIMQ : ubq);
+                vbq = vbq < 0 ? 0 : (vbq > LIMQ ? LIMQ : vbq);
+                int yi = ybq>>8, ui = ubq>>8, vi = vbq>>8;
+                int fy = ybq&255, fu = ubq&255, fv = vbq&255;
                 int yj = yi<N-1?yi+1:yi, uj = ui<N-1?ui+1:ui, vj = vi<N-1?vi+1:vi;
-                float fy = yb-yi, fu = ub-ui, fv = vb-vi, ou = 0, ov = 0;
-#define TL(iy,iu,iv,w) do { const uint8_t *e = &ff_rpi_tm_lut3d[(((iy)*N+(iu))*N+(iv))*3]; ou += (w)*e[1]; ov += (w)*e[2]; } while (0)
-                TL(yi,ui,vi,(1-fy)*(1-fu)*(1-fv)); TL(yi,ui,vj,(1-fy)*(1-fu)*fv);
-                TL(yi,uj,vi,(1-fy)*fu*(1-fv));     TL(yi,uj,vj,(1-fy)*fu*fv);
-                TL(yj,ui,vi,fy*(1-fu)*(1-fv));     TL(yj,ui,vj,fy*(1-fu)*fv);
-                TL(yj,uj,vi,fy*fu*(1-fv));         TL(yj,uj,vj,fy*fu*fv);
-#undef TL
-                int iu = (int)(ou+0.5f), iv = (int)(ov+0.5f);
+                /* Tetrahedral: 4 corners along the fractional-ordering path (vs
+                 * trilinear's 8). C000 and C111 are always endpoints; the two
+                 * intermediates depend on which frac dominates.  Weights are Q8
+                 * (sum 256), so the weighted sum >>8 lands in [0,255]. */
+#define C3(iy,iu,iv) (&ff_rpi_tm_lut3d[(((iy)*N+(iu))*N+(iv))*3])
+                const uint8_t *c0 = C3(yi,ui,vi), *c3 = C3(yj,uj,vj), *a, *b;
+                int w0, w1, w2, w3;
+                if (fy >= fu) {
+                    if (fu >= fv)      { a=C3(yj,ui,vi); b=C3(yj,uj,vi); w0=256-fy; w1=fy-fu; w2=fu-fv; w3=fv; }
+                    else if (fy >= fv) { a=C3(yj,ui,vi); b=C3(yj,ui,vj); w0=256-fy; w1=fy-fv; w2=fv-fu; w3=fu; }
+                    else               { a=C3(yi,ui,vj); b=C3(yj,ui,vj); w0=256-fv; w1=fv-fy; w2=fy-fu; w3=fu; }
+                } else {
+                    if (fy >= fv)      { a=C3(yi,uj,vi); b=C3(yj,uj,vi); w0=256-fu; w1=fu-fy; w2=fy-fv; w3=fv; }
+                    else if (fu >= fv) { a=C3(yi,uj,vi); b=C3(yi,uj,vj); w0=256-fu; w1=fu-fv; w2=fv-fy; w3=fy; }
+                    else               { a=C3(yi,ui,vj); b=C3(yi,uj,vj); w0=256-fv; w1=fv-fu; w2=fu-fy; w3=fy; }
+                }
+#undef C3
+                int iu = (w0*c0[1] + w1*a[1] + w2*b[1] + w3*c3[1] + 128) >> 8;
+                int iv = (w0*c0[2] + w1*a[2] + w2*b[2] + w3*c3[2] + 128) >> 8;
                 OU[x] = iu<0?0:(iu>255?255:iu); OV[x] = iv<0?0:(iv>255?255:iv);
             }
         }
