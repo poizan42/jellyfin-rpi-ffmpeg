@@ -1,0 +1,131 @@
+# Jellyfin / Raspberry Pi 4 fork — additions
+
+This fork adds a **real-time HEVC→H.264 downscaling transcode path** for the Raspberry Pi 4
+(BCM2711, Cortex-A72, VideoCore VI) on top of Jellyfin FFmpeg 8.1.2. Everything below is
+additive to upstream; the base FFmpeg is unchanged except where noted.
+
+## The pipeline
+
+```
+HEVC (10/8-bit)                         8-bit H.264
+   │                                        ▲
+   ▼                                        │
+rpivid HW decode ──DRM_PRIME──►  NEON unpack  ──DRM_PRIME──►  ISP downscale ──DRM_PRIME──►  bcm2835 H.264 encode
+(/dev/video19, SAND30/SAND)   (vf_sand_to_yuv420p_drm)     (scale_v4l2m2m,               (/dev/video11, 8-bit)
+                               SAND → 8-bit YU12            /dev/video12, YU12 only)
+```
+
+The decoder emits **SAND** — Broadcom's column-tiled format (128-byte stripes; for 10-bit,
+`SAND30`/`AV_PIX_FMT_RPI4_10`: three 10-bit samples per 32-bit word). Neither the ISP scaler
+(8-bit-YUV + DRM_PRIME only) nor the H.264 encoder can ingest it, so the **one** unavoidable
+CPU step is unpacking SAND → planar 8-bit YU12. This fork makes that step fast (NEON, threaded)
+and keeps everything else on fixed-function hardware, zero-copy.
+
+## Hardware map (why each op lands where it does)
+
+| engine | device | role |
+|---|---|---|
+| rpivid (Argon) | `/dev/video19`, `/dev/media*` | HEVC Main/Main10 decode → SAND DRM_PRIME |
+| Cortex-A72 NEON | — | SAND → planar 8-bit unpack (bandwidth/latency-bound; the CPU cost) |
+| bcm2835 ISP | `scale_v4l2m2m`, `/dev/video12` | fixed-function downscale (8-bit YUV, DRM_PRIME in/out only) |
+| bcm2835 codec | `h264_v4l2m2m`, `/dev/video11` | 8-bit H.264 encode |
+| V3D (Vulkan) | `/dev/dri/renderD128` | evaluated for offload — **lost** (scattered-read latency); not used |
+
+## What this fork adds
+
+### 1. NEON SAND30 → planar kernels  (`libavutil/`)
+Direct 10-bit `SAND30` → 8-bit planar conversion, bit-exact (`checkasm --test=rpi_sand`):
+- `av_rpi_sand30_to_planar_y8` / `_c8` — `libavutil/aarch64/rpi_sand_neon.S` (+ 32-bit `arm/`),
+  wrappers/dispatch in `libavutil/rpi_sand_fns.c`, `RPI4_10 → YUV420P` path.
+- `hwcontext_drm.c` offers `YUV420P` for `RPI4_10` downloads.
+- **Software prefetch** of the ~400 KB-stride SAND stripe reads in the sand30 loops
+  (`prfm pldl1strm`) — hides DRAM latency; +8–9% single-thread (inert; checkasm unchanged).
+
+### 2. The NEON→ISP bridge filter  `vf_sand_to_yuv420p_drm`  (`libavfilter/`)
+The core of the pipeline. Takes the decoder's SAND `DRM_PRIME` frame and emits an 8-bit linear
+**YU12 `DRM_PRIME`** frame the ISP scaler accepts — so the resize runs on the ISP instead of
+eating ~1.2 CPU cores as swscale. Properly `configure`-integrated
+(`CONFIG_SAND_TO_YUV420P_DRM_FILTER`, `sand_to_yuv420p_drm_filter_select="sand"`). Details:
+- **Slice-threaded** unpack (per-row-independent bands; `AVFILTER_FLAG_SLICE_THREADS`).
+- **Input mmap-cache** — the decoder recycles a fixed set of SAND dma-buf fds, so map them once
+  instead of `mmap`+invalidate+`munmap` of ~16 MB per frame via `av_hwframe_map`.
+- **Thread cap** (`nb_threads-1`) — leaves a core for the decode/encode threads (the memory-bound
+  unpack over-subscribes the 4-core chip otherwise).
+- Pooled CMA dma-bufs (dma-heap) for the output; DRM_PRIME → zero-copy into the encoder.
+- `SAND_PROF=1` env var: per-phase profiler (map / unpack / flush / unmap μs/frame).
+
+### 3. HDR→SDR tone-mapping  *(in development)*
+HDR10 (PQ/BT.2020) sources currently transcode with a plain 10→8-bit truncation → washed-out.
+Being added as options on the bridge filter, in two tiers, tuned to match FFmpeg's
+`zscale+tonemap=hable` (chosen by eye) and **baked directly from that chain** into embedded LUTs
+(`libavfilter/rpi_tonemap_gen.py` → `rpi_tonemap_tables.h`; re-runnable):
+- `tm=fast` — luma-exact 1D tone curve + separable chroma, folded into the single-pass NEON
+  kernels; real-time, colour approximate.
+- `tm=accurate` — chroma-resolution 3D LUT (luma-aware), reproduces zscale; ~¼ the cost of a
+  full 4:4:4 LUT for the same quality.
+- `tm=none` (default) — today's truncation, byte-for-byte unchanged.
+
+Deferred (see `TODO-rpi-tonemap.md`): command-line-tunable peak/operator/saturation, a BT.2390
+operator (`op=bt2390`), non-1000-nit peaks, 32-bit ARM parity for the tone LUTs. Dolby Vision
+profile 5 is out of scope (needs DV RPU processing).
+
+### 4. Build enablement for the HDR reference
+`--enable-libzimg` (`zscale`) gives a correct CPU HDR→SDR reference (`zscale+tonemap`).
+`--enable-libplacebo --enable-vulkan` link a **locally rebuilt** libplacebo 7.360 (Debian
+bookworm ships 4.208, too old for FFmpeg 8.x; its shaderc is also broken) — see the build notes.
+Note: the libplacebo *filter* does not run on the Pi's V3DV (missing renderable formats), so the
+usable HDR reference here is the CPU `zscale+tonemap` chain.
+
+## Building
+
+Baseline configure used for this fork (Pi 4, aarch64, Debian bookworm):
+
+```sh
+./configure --disable-doc --enable-libdrm --enable-libudev --enable-sand --enable-v4l2-request \
+            --enable-libzimg --enable-libplacebo --enable-vulkan \
+            --extra-cflags="-I<path>/vulkan-1.4-headers/include"
+make -j4
+```
+
+- `--enable-sand` + `--enable-v4l2-request` are required for the SAND filter and rpivid decode.
+- `--enable-libzimg`/`--enable-libplacebo`/`--enable-vulkan` are only needed for the HDR
+  *reference* (not for `tm=fast`/`accurate`, which are self-contained NEON + embedded LUTs).
+- libplacebo/glslang were rebuilt from Debian *forky* sources against bookworm; the extra Vulkan
+  1.4 headers are needed by libplacebo 7.360. See the local build notes for the exact recipe.
+
+Bit-exact + microbench of the SAND kernels: `tests/checkasm/checkasm --test=rpi_sand [--bench]`.
+
+## Usage
+
+Real-time HEVC→H.264 720p transcode (the shipped SDR path):
+
+```sh
+ffmpeg -hwaccel drm -hwaccel_output_format drm_prime -i in.mkv \
+       -vf sand_to_yuv420p_drm,scale_v4l2m2m=1280:720 \
+       -c:v h264_v4l2m2m -b:v 3M out.mp4
+```
+
+HDR source (once tone-mapping lands): add `tm=fast` or `tm=accurate`:
+
+```sh
+       -vf sand_to_yuv420p_drm=tm=accurate,scale_v4l2m2m=1280:720
+```
+
+## Performance (Pi 4B, 600-frame steady-state, → 720p)
+
+| source | speed | notes |
+|---|---:|---|
+| 10-bit HEVC SDR 1080p | ~2.0–2.7× | decode-thread-bound, not CPU-bound |
+| 10-bit HEVC SDR 4K scope (3840×1608) | ~1.42× | slice-thread + prefetch + map-cache + thread-cap |
+| 10-bit HEVC HDR10 4K (3840×2160) | ~1.13× | runs; colour needs the tone-map |
+
+The 4K unpack is **memory-latency-bound** on the scattered SAND reads (same wall that made the
+V3D GPU offload lose). Threading reaches the shared-bus ceiling with ~2–3 cores; the levers above
+free the rest of the machine for decode/encode.
+
+## Related
+
+- Research + experiment write-ups (V3D GPGPU, ISP bridge, measurements):
+  `poizan42/rpi-mp4-hacking` (the `isp-experiments/`, `v3d-experiments/` dirs).
+- Local build notes (libplacebo/glslang from source, the shaderc-broken-on-bookworm issue):
+  `~/rpi-local-notes/`.

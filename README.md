@@ -1,3 +1,37 @@
+# FFmpeg — Jellyfin / Raspberry Pi 4 fork
+
+A fork of Jellyfin's FFmpeg (8.1.2 base) whose purpose is **real-time hardware
+transcoding of various source formats to H.264, with downscaling, on the Raspberry Pi 4**.
+
+The workload it targets: take a high-resolution source (primarily HEVC) and produce a
+lower-resolution **8-bit H.264** stream using the Pi 4's fixed-function silicon end to end —
+**rpivid** HEVC hardware decode → **NEON** pixel-format unpack → **bcm2835 ISP** hardware
+downscale → **bcm2835** H.264 hardware encode — kept **zero-copy (DRM_PRIME)** the whole way,
+so the CPU only touches the one step no hardware block can do (the 10-bit column-tiled
+"SAND" → planar unpack).
+
+Full design, build instructions and usage: **[README.jellyfin-rpi.md](README.jellyfin-rpi.md)**.
+
+## Current status
+
+| source → H.264 720p (Pi 4B) | result |
+|---|---|
+| 10-bit HEVC **SDR** 1080p | **~2.0–2.7× real-time** — the tuned sweet spot |
+| 10-bit HEVC **SDR** 4K (2160p / scope) | **~1.4× real-time** — proven (slice-threaded NEON unpack + prefetch + map-cache + ISP scale) |
+| 8-bit HEVC SDR | works (same bridge path) |
+| 10-bit HEVC **HDR10** 4K | ~1.1× real-time, but colour is wrong — a straight 10→8-bit truncation with no tone-map (washed-out). **HDR→SDR tone-mapping is in development** (fast + accurate tiers). |
+| Dolby Vision profile 5 | not supported (needs DV RPU processing) |
+| H.264 / VP9 / AV1 sources | outside this pipeline (rpivid decode is HEVC-only) |
+
+**The 10-bit SDR HEVC → 8-bit H.264 downscale pipeline is proven to run above real-time
+through 4K.** HDR sources already decode and transcode at ~real-time; only their colour needs
+work (the tone-map, in progress). Validated on a real library (see the status doc); on a
+1080p transcode the pipeline is limited by the single-threaded rpivid decode thread, not the CPU.
+
+---
+
+# Upstream FFmpeg README
+
 FFmpeg README
 =============
 
