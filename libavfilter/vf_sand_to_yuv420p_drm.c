@@ -199,6 +199,32 @@ static int config_output(AVFilterLink *outlink)
     outlink->h = inlink->h;   /* same size; the ISP scaler downstream does the resize */
     outlink->time_base = inlink->time_base;
     outlink->sample_aspect_ratio = inlink->sample_aspect_ratio;
+
+    /* Our output is 8-bit planar YU12 (DRM_PRIME).  Advertise a frames context
+     * that says so: the input's context is RPI4_10 (10-bit SAND), and reusing
+     * it would mislabel the output — a consumer that trusts sw_format (e.g.
+     * hwdownload) would then SAND-unpack the already-planar 8-bit data and read
+     * far past the buffer.  Build a fresh DRM/YUV420P context on the same device. */
+    FilterLink *inl  = ff_filter_link(inlink);
+    FilterLink *outl = ff_filter_link(outlink);
+    av_buffer_unref(&outl->hw_frames_ctx);
+    if (inl->hw_frames_ctx) {
+        AVHWFramesContext *in_fc = (AVHWFramesContext *)inl->hw_frames_ctx->data;
+        AVBufferRef *out_ref = av_hwframe_ctx_alloc(in_fc->device_ref);
+        if (!out_ref)
+            return AVERROR(ENOMEM);
+        AVHWFramesContext *out_fc = (AVHWFramesContext *)out_ref->data;
+        out_fc->format    = AV_PIX_FMT_DRM_PRIME;
+        out_fc->sw_format = AV_PIX_FMT_YUV420P;
+        out_fc->width     = inlink->w;
+        out_fc->height    = inlink->h;
+        int ret = av_hwframe_ctx_init(out_ref);
+        if (ret < 0) {
+            av_buffer_unref(&out_ref);
+            return ret;
+        }
+        outl->hw_frames_ctx = out_ref;
+    }
     return 0;
 }
 
@@ -571,7 +597,12 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     out->width = w; out->height = h;
     av_frame_copy_props(out, in);
     out->crop_top = out->crop_left = out->crop_bottom = out->crop_right = 0;
-    if (in->hw_frames_ctx)
+    /* Use our own YU12 frames context (built in config_output) so the frame's
+     * sw_format matches its actual 8-bit planar contents, not the RPI4_10 input. */
+    FilterLink *outl = ff_filter_link(outlink);
+    if (outl->hw_frames_ctx)
+        out->hw_frames_ctx = av_buffer_ref(outl->hw_frames_ctx);
+    else if (in->hw_frames_ctx)
         out->hw_frames_ctx = av_buffer_ref(in->hw_frames_ctx);
     PROF(3);
 
@@ -628,6 +659,10 @@ FFFilter ff_vf_sand_to_yuv420p_drm = {
     .p.description = NULL_IF_CONFIG_SMALL("Unpack SAND (DRM_PRIME) to YU12 (DRM_PRIME) via NEON, for the ISP scaler"),
     .p.priv_class  = &sand_to_yuv420p_drm_class,
     .p.flags       = AVFILTER_FLAG_SLICE_THREADS,
+    /* We emit a different sw_format (YUV420P) than we consume (RPI4_10), so we
+     * set the output link's hw_frames_ctx ourselves in config_output rather than
+     * letting the framework propagate the input's. That requires this flag. */
+    .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE,
     .priv_size     = sizeof(BridgeContext),
     .init          = init,
     .uninit        = uninit,
