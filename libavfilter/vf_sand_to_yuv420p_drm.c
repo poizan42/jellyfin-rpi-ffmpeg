@@ -34,6 +34,10 @@
 #include "avfilter.h"
 #include "filters.h"
 #include "video.h"
+#include "libavutil/opt.h"
+#include "rpi_tonemap_tables.h"   /* ff_rpi_tm_luma1d/cb1d/cr1d, ff_rpi_tm_lut3d, RPI_TM_LUT3D_N */
+
+enum { TM_NONE = 0, TM_FAST, TM_ACCURATE };
 
 #ifndef O_CLOEXEC
 #define O_CLOEXEC 0
@@ -82,6 +86,7 @@ typedef struct BridgeContext {
     MapEnt   mcache[MAP_CACHE_N];
     int      mcache_n;
     unsigned mmap_count;   /* SAND_PROF: distinct input buffers mmap'd (should plateau) */
+    int      tm;           /* TM_NONE / TM_FAST / TM_ACCURATE (option) */
 } BridgeContext;
 
 /* Return a persistent read-only mapping of (fd,size), or NULL to signal the
@@ -257,6 +262,89 @@ static int unpack_slice(AVFilterContext *avctx, void *arg, int jobnr, int nb_job
     return av_rpi_sand_to_planar_frame(&dst, &src);
 }
 
+static int frame_is_hdr(const AVFrame *in)
+{
+    return in->color_trc == AVCOL_TRC_SMPTE2084 ||
+           in->color_trc == AVCOL_TRC_ARIB_STD_B67;
+}
+
+/* Tone-map apply: 10-bit YUV420P intermediate -> 8-bit YU12, slice-threaded.
+ * Luma via the 1D curve (both tiers). Chroma: fast = separable 1D LUTs;
+ * accurate = chroma-resolution 3D LUT (trilinear) using the 2x2 block-avg luma. */
+typedef struct TMData {
+    AVFrame       *dst;    /* 8-bit YU12 (dma-buf)   */
+    const AVFrame *src10;  /* YUV420P10 intermediate */
+    unsigned       H;      /* luma height            */
+    int            tm;
+} TMData;
+
+static int tm_slice(AVFilterContext *avctx, void *arg, int jobnr, int nb_jobs)
+{
+    const TMData *td = arg;
+    const unsigned H = td->H, W = td->dst->width, cw = W / 2;
+    unsigned y0 = ((uint64_t)H *  jobnr      / nb_jobs) & ~1u;
+    unsigned y1 = (jobnr == nb_jobs - 1) ? H : (((uint64_t)H * (jobnr + 1) / nb_jobs) & ~1u);
+    if (y1 <= y0)
+        return 0;
+    const AVFrame *S = td->src10;
+    AVFrame *D = td->dst;
+    const int sy = S->linesize[0] / 2, su = S->linesize[1] / 2, sv = S->linesize[2] / 2;
+
+    for (unsigned y = y0; y < y1; y++) {
+        const uint16_t *Y = (const uint16_t *)S->data[0] + (size_t)y * sy;
+        uint8_t *O = D->data[0] + (size_t)y * D->linesize[0];
+        for (unsigned x = 0; x < W; x++)
+            O[x] = ff_rpi_tm_luma1d[Y[x] & 1023];
+    }
+
+    const unsigned cy0 = y0 / 2, cy1 = y1 / 2;
+    if (td->tm == TM_FAST) {
+        for (unsigned cy = cy0; cy < cy1; cy++) {
+            const uint16_t *U = (const uint16_t *)S->data[1] + (size_t)cy * su;
+            const uint16_t *V = (const uint16_t *)S->data[2] + (size_t)cy * sv;
+            uint8_t *OU = D->data[1] + (size_t)cy * D->linesize[1];
+            uint8_t *OV = D->data[2] + (size_t)cy * D->linesize[2];
+            for (unsigned x = 0; x < cw; x++) {
+                OU[x] = ff_rpi_tm_cb1d[U[x] & 1023];
+                OV[x] = ff_rpi_tm_cr1d[V[x] & 1023];
+            }
+        }
+    } else { /* TM_ACCURATE */
+        const int N = RPI_TM_LUT3D_N;
+        const float qy = (N - 1) / (940.0f - 64.0f), qc = (N - 1) / (960.0f - 64.0f);
+        for (unsigned cy = cy0; cy < cy1; cy++) {
+            const uint16_t *U  = (const uint16_t *)S->data[1] + (size_t)cy * su;
+            const uint16_t *V  = (const uint16_t *)S->data[2] + (size_t)cy * sv;
+            const uint16_t *Y0 = (const uint16_t *)S->data[0] + (size_t)(cy * 2)     * sy;
+            const uint16_t *Y1 = (const uint16_t *)S->data[0] + (size_t)(cy * 2 + 1) * sy;
+            uint8_t *OU = D->data[1] + (size_t)cy * D->linesize[1];
+            uint8_t *OV = D->data[2] + (size_t)cy * D->linesize[2];
+            for (unsigned x = 0; x < cw; x++) {
+                float yb = ((Y0[2*x] + Y0[2*x+1] + Y1[2*x] + Y1[2*x+1]) * 0.25f - 64.0f) * qy;
+                float ub = ((int)(U[x] & 1023) - 64) * qc;
+                float vb = ((int)(V[x] & 1023) - 64) * qc;
+                yb = yb < 0 ? 0 : (yb > N-1 ? N-1 : yb);
+                ub = ub < 0 ? 0 : (ub > N-1 ? N-1 : ub);
+                vb = vb < 0 ? 0 : (vb > N-1 ? N-1 : vb);
+                int yi = (int)yb, ui = (int)ub, vi = (int)vb;
+                int yj = yi < N-1 ? yi+1 : yi, uj = ui < N-1 ? ui+1 : ui, vj = vi < N-1 ? vi+1 : vi;
+                float fy = yb-yi, fu = ub-ui, fv = vb-vi;
+                float ou = 0, ov = 0;
+#define TL(iy,iu,iv,w) do { const uint8_t *e = &ff_rpi_tm_lut3d[(((iy)*N+(iu))*N+(iv))*3]; ou += (w)*e[1]; ov += (w)*e[2]; } while (0)
+                TL(yi,ui,vi,(1-fy)*(1-fu)*(1-fv)); TL(yi,ui,vj,(1-fy)*(1-fu)*fv);
+                TL(yi,uj,vi,(1-fy)*fu*(1-fv));     TL(yi,uj,vj,(1-fy)*fu*fv);
+                TL(yj,ui,vi,fy*(1-fu)*(1-fv));     TL(yj,ui,vj,fy*(1-fu)*fv);
+                TL(yj,uj,vi,fy*fu*(1-fv));         TL(yj,uj,vj,fy*fu*fv);
+#undef TL
+                int iu = (int)(ou+0.5f), iv = (int)(ov+0.5f);
+                OU[x] = iu < 0 ? 0 : (iu > 255 ? 255 : iu);
+                OV[x] = iv < 0 ? 0 : (iv > 255 ? 255 : iv);
+            }
+        }
+    }
+    return 0;
+}
+
 static int filter_frame(AVFilterLink *inlink, AVFrame *in)
 {
     AVFilterContext *avctx = inlink->dst;
@@ -313,19 +401,42 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     int pool = ff_filter_get_nb_threads(avctx);
     int nb = FFMIN(pool > 1 ? pool - 1 : 1, (int)(h / 2));
     nb = av_clip(nb, 1, 64);
-    ThreadData td = { .dst = tmp, .src = mapped, .H = h };
     int rets[64] = { 0 };
+    const int do_tm = (s->tm != TM_NONE) && frame_is_hdr(in);
 
-    dmabuf_sync(fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE);
-    ff_filter_execute(avctx, unpack_slice, &td, rets, nb);
-    PROF(1);
-    dmabuf_sync(fd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
-    PROF(2);
-    for (int i = 0; i < nb; i++)
-        if (rets[i] != 0) {
-            av_log(avctx, AV_LOG_ERROR, "sand->planar failed (fmt %d)\n", mapped->format);
-            rv = AVERROR(EINVAL); goto fail_release;
-        }
+    if (!do_tm) {
+        /* SDR / tm=none: single-pass SAND -> 8-bit YU12. */
+        ThreadData td = { .dst = tmp, .src = mapped, .H = h };
+        dmabuf_sync(fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE);
+        ff_filter_execute(avctx, unpack_slice, &td, rets, nb);
+        PROF(1);
+        dmabuf_sync(fd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
+        PROF(2);
+        for (int i = 0; i < nb; i++)
+            if (rets[i] != 0) {
+                av_log(avctx, AV_LOG_ERROR, "sand->planar failed (fmt %d)\n", mapped->format);
+                rv = AVERROR(EINVAL); goto fail_release;
+            }
+    } else {
+        /* HDR tone-map: unpack SAND -> 10-bit planar, then LUT -> 8-bit YU12. */
+        AVFrame *t10 = av_frame_alloc();
+        if (!t10) { rv = AVERROR(ENOMEM); goto fail_release; }
+        t10->format = AV_PIX_FMT_YUV420P10; t10->width = w; t10->height = h;
+        if ((rv = av_frame_get_buffer(t10, 0)) < 0) { av_frame_free(&t10); goto fail_release; }
+        ThreadData td10 = { .dst = t10, .src = mapped, .H = h };
+        ff_filter_execute(avctx, unpack_slice, &td10, rets, nb);
+        for (int i = 0; i < nb; i++)
+            if (rets[i] != 0) { av_frame_free(&t10);
+                av_log(avctx, AV_LOG_ERROR, "sand->planar10 failed (fmt %d)\n", mapped->format);
+                rv = AVERROR(EINVAL); goto fail_release; }
+        PROF(1);
+        TMData tdm = { .dst = tmp, .src10 = t10, .H = h, .tm = s->tm };
+        dmabuf_sync(fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE);
+        ff_filter_execute(avctx, tm_slice, &tdm, NULL, nb);
+        dmabuf_sync(fd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
+        av_frame_free(&t10);
+        PROF(2);
+    }
 
     if (!(b = av_mallocz(sizeof(*b)))) { rv = AVERROR(ENOMEM); goto fail_release; }
     b->s = s; b->idx = idx;
@@ -388,7 +499,16 @@ fail:
     return rv;
 }
 
-static const AVOption sand_to_yuv420p_drm_options[] = { { NULL } };
+#define OFFSET(x) offsetof(BridgeContext, x)
+#define FLAGS (AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_FILTERING_PARAM)
+static const AVOption sand_to_yuv420p_drm_options[] = {
+    { "tm", "HDR->SDR tone-map (HDR10 sources only; SDR passes through)", OFFSET(tm),
+      AV_OPT_TYPE_INT, { .i64 = TM_NONE }, TM_NONE, TM_ACCURATE, FLAGS, .unit = "tm" },
+        { "none",     "no tone-map (10->8 truncation)",       0, AV_OPT_TYPE_CONST, { .i64 = TM_NONE },     0, 0, FLAGS, .unit = "tm" },
+        { "fast",     "separable, real-time, colour approx.", 0, AV_OPT_TYPE_CONST, { .i64 = TM_FAST },     0, 0, FLAGS, .unit = "tm" },
+        { "accurate", "3D-LUT, luma-aware (matches zscale)",  0, AV_OPT_TYPE_CONST, { .i64 = TM_ACCURATE }, 0, 0, FLAGS, .unit = "tm" },
+    { NULL }
+};
 AVFILTER_DEFINE_CLASS(sand_to_yuv420p_drm);
 
 static const AVFilterPad inputs[] = {
