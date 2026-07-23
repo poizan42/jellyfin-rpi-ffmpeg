@@ -138,6 +138,27 @@ a ~44% chunk that still projects to **~1.4–1.6× faster 10-bit decode**. CABAC
    So it's a from-scratch `.S` (widen the 8-bit kernels to 16-bit loads / wider intermediates + `hv`
    32-bit intermediate), and since the `h26x` template is shared by HEVC *and* VVC it's genuinely
    contribution-worthy — target upstream FFmpeg, not just this fork.
+
+   **PARTIALLY SHIPPED (2026-07-24) — the two profiled hot kernels, `uni_hv` luma + chroma, all widths.**
+   Added `ff_hevc_put_hevc_qpel_uni_hv_10_neon` (8-tap) + `ff_hevc_put_hevc_epel_uni_hv_10_neon` (4-tap),
+   one width-generic kernel each (the dsp table passes block width as an arg → one pointer per family
+   wired into every size slot), in `aarch64/h26x/qpel_neon.S` / `epel_neon.S`, gated `bit_depth==10`.
+   H fills a 128B-stride int16 scratch in 8-col blocks; V walks the width in 8-col blocks (shared
+   `calc_all`/`calc_all4` ring) + a partial tail for widths 4/6/12; the two-stage C shift fuses to
+   `sqrshrun #10 + umin 1023` (bit-exact for all int32 sums). **checkasm `hevc_pel` bit-exact vs C for
+   every width (4/6/8/12/16/24/32/48/64) at depth 10; full-decoder output md5-identical** to the C path
+   on the 4K 4:2:2 clip. **Measured (4K 4:2:2 10-bit, 200f decode, this A72):**
+
+   | | wall (rtime) | CPU (utime) | that kernel's self% (perf) |
+   |---|---:|---:|---|
+   | C (hv in template) | ~41–48 s | ~142–154 s | luma 26.5% + chroma 17.5% |
+   | NEON hv | **~31–32 s** | **~90–95 s** | luma 14.0% + chroma 10.2% |
+
+   → **~1.35–1.45× wall, ~1.6× less CPU.** The kernels themselves run ~1.9× (the perf shares roughly
+   halve); the wall gain is Amdahl-capped by CABAC, which is now the top cost (`ff_hevc_hls_residual_coding`
+   21.9% + `get_cabac` 12.4% self — the serial floor of §3). **Still C (follow-on):** the single-pass
+   `put_hevc_qpel_uni_v/h_10` (~1% each here — B-frame/weighted content leans on `put`/`bi`/`uni_w`/`bi_w`
+   and the `h`/`v` variants), and 12-bit. Committed to the fork (`jellyfin-rpi`); prep for upstream.
 2. **HEVC intra-prediction NEON** (planar/DC/angular, `hevc/pred_template.c`) — none exists; dominant for
    all-intra clips (`hevc_all_i`, RExt test set). Also likely worth upstreaming.
 3. **SAO 10-bit NEON** — 8-bit only today; small.
