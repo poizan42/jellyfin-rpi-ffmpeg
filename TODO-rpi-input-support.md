@@ -106,6 +106,47 @@ reverse-engineered mechanics.
 
 ---
 
+## 4. Software HEVC decode — profiled NEON gaps (the productive lever for §1/§2)
+
+Unlike the CABAC-offload dead-end (§3), the software HEVC decoder itself has large, straightforward
+NEON gaps — and closing them helps every offline case (all 10-bit). **Profiled** (`perf` on `ffmpeg_g`,
+4K 4:2:2 10-bit, 150 frames; aggregated across frame-threads):
+
+| function | share | status |
+|---|---:|---|
+| `put_uni_luma_hv_10` (`h26x/h2656_inter_template.c`) | **26.5%** | **C — no 10-bit NEON** |
+| `put_uni_chroma_hv_10` | **17.5%** | **C — no 10-bit NEON** |
+| `ff_hevc_hls_residual_coding` | 15.8% | CABAC (scalar; not SIMD-able) |
+| `get_cabac` | 8.7% | CABAC (scalar) |
+| idct / deblock / add_res `*_10_neon` | ~6% | already NEON |
+
+**Root cause:** the H.26x inter-prediction NEON (`aarch64/h26x/qpel_neon.S`, `epel_neon.S`) and the old
+`hevcdsp` MC NEON are **8-bit only** — every symbol is `..._8_neon`, no `_10`. So on 10-bit content
+(all our software-decode cases) motion comp runs entirely in the C template (~44%). HEVC **intra
+prediction has no NEON at any depth** (no `pred_planar/dc/angular` in the aarch64 init; matters for
+all-intra content). SAO NEON is 8-bit-only too.
+
+**NEON payoff scale on this A72** (checkasm `hevc_add_res`, which *has* 10-bit NEON): **8–12× vs C**
+(32×32 10-bit 5279→544 cyc = 9.7×). MC is a 2-pass 8-tap filter so expect a more modest ~3–6×, but on
+a ~44% chunk that still projects to **~1.4–1.6× faster 10-bit decode**. CABAC (~25%) is the hard floor
+— inherently serial, no NEON.
+
+**Ranked opportunities (all software-decode only — the HW 4:2:0 path is unaffected):**
+1. **10-bit H.26x MC NEON** (qpel luma + epel chroma; `h`/`v`/`hv` and `put`/`uni`/`bi`/`*_w`) — the top
+   lever, ~44%+ of decode. **First check FFmpeg master**: aarch64 HEVC/VVC 10-bit MC NEON may already
+   exist upstream (the shared `h26x` template benefits HEVC *and* VVC) → backport rather than write. If
+   not upstream, it's a genuine contribution-worthy `.S` (widen the 8-bit `qpel_neon.S`/`epel_neon.S` to
+   16-bit loads / wider intermediates).
+2. **HEVC intra-prediction NEON** (planar/DC/angular, `hevc/pred_template.c`) — none exists; dominant for
+   all-intra clips (`hevc_all_i`, RExt test set). Also likely worth upstreaming.
+3. **SAO 10-bit NEON** — 8-bit only today; small.
+4. **CABAC** — not SIMD-able; only scalar micro-opt (branch layout), low ceiling. Leave it.
+
+Note this is really **upstream FFmpeg work** (benefits all aarch64 users), so prefer backport/contribute
+over a private fork patch. Tooling on this box: `perf` (paranoid must be ≤1 — `sudo sysctl` it),
+`checkasm --test=hevc_pel --bench` for per-kernel C-vs-NEON, `valgrind --tool=callgrind` for whole-decode
+attribution incl. CABAC. Profile `ffmpeg_g` (unstripped) for symbols.
+
 ## Not in scope (hard limits, for the record)
 - **Non-HEVC codecs** (H.264 / VP9 / AV1) — rpivid is HEVC-only; out of this pipeline entirely.
 - **Output beyond 8-bit 4:2:0 H.264 ≤1080p** — fixed by the bcm2835 encoder (level 4.0, one stream).
