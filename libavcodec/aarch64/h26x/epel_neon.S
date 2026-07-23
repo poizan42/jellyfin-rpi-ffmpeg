@@ -5531,3 +5531,128 @@ function ff_hevc_put_hevc_epel_uni_v_10_neon, export=1
 2:      .purgem calc
 6:      ret
 endfunc
+
+/* ---- 10-bit HEVC chroma epel put (int16 output) h / v / hv --------------
+ * void ff_hevc_put_hevc_epel_{h,v,hv}_10_neon(
+ *      int16_t *dst, const uint8_t *src, ptrdiff_t srcstride,   // x0, x1, x2
+ *      int height, intptr_t mx, intptr_t my, int width);        // w3, x4, x5, w6
+ * 4-tap; dst int16 stride 128 (bi-pred ref0). h/v: FILTER>>2; hv: h>>2 then
+ * v>>6 (sqshrn, non-rounding). CHROMA_EXTRA_BEFORE = 1. Full 8-col blocks.  */
+function ff_hevc_put_hevc_epel_h_10_neon, export=1
+        load_epel_filterh x4, x12               // v0 = h filter (mx)
+        sub             x1, x1, #2              // src -= 1 sample
+        mov             x9, #128                // dst row stride
+        add             w10, w6, #7
+        lsr             w10, w10, #3            // nblocks
+1:      mov             x16, x1
+        mov             x17, x0
+        mov             w11, w10
+2:      ld1             {v16.8h, v17.8h}, [x16]
+        add             x16, x16, #16
+        ext             v18.16b, v16.16b, v17.16b, #2
+        ext             v19.16b, v16.16b, v17.16b, #4
+        ext             v20.16b, v16.16b, v17.16b, #6
+        calc_epelh_10   v1, v16, v18, v19, v20, sqshrn, #2
+        calc_epelh2_10  v1, v2, v16, v18, v19, v20, sqshrn2, #2
+        st1             {v1.8h}, [x17], #16
+        subs            w11, w11, #1
+        b.ne            2b
+        add             x1, x1, x2
+        add             x0, x0, x9
+        subs            w3, w3, #1
+        b.ne            1b
+        ret
+endfunc
+
+function ff_hevc_put_hevc_epel_v_10_neon, export=1
+        load_epel_filterh x5, x12               // v0 = v filter (my)
+        sub             x1, x1, x2              // src -= 1*srcstride
+        mov             x9, #128                // dst row stride
+        mov             w13, w3                 // saved height
+        add             w10, w6, #7
+        lsr             w10, w10, #3            // nblocks
+        mov             x14, x0                 // dst column base
+        mov             x15, x1                 // src column base
+.macro calc src0, src1, src2, src3
+        ld1             {\src3\().8h}, [x16], x2
+        calc_epelh_10   v1, \src0, \src1, \src2, \src3, sqshrn, #2
+        calc_epelh2_10  v1, v2, \src0, \src1, \src2, \src3, sqshrn2, #2
+        subs            w3, w3, #1
+        st1             {v1.8h}, [x0], x9
+.endm
+3:      mov             w3, w13
+        mov             x16, x15
+        mov             x0, x14
+        ld1             {v16.8h}, [x16], x2
+        ld1             {v17.8h}, [x16], x2
+        ld1             {v18.8h}, [x16], x2
+1:      calc_all4
+2:      add             x14, x14, #16
+        add             x15, x15, #16
+        subs            w10, w10, #1
+        b.ne            3b
+.purgem calc
+        ret
+endfunc
+
+function ff_hevc_put_hevc_epel_hv_10_neon, export=1
+        add             w9, w3, #3
+        lsl             w9, w9, #7              // (h+3)*128 scratch
+        mov             x11, sp
+        sub             sp, sp, x9
+        // H pass: src(u16) -> int16 scratch (>>2), stride 128
+        load_epel_filterh x4, x12               // h filter (mx)
+        sub             x1, x1, x2              // src -= 1 row
+        sub             x1, x1, #2              // src -= 1 sample
+        mov             x9, #128
+        add             w10, w6, #7
+        lsr             w10, w10, #3            // nblocks
+        mov             x13, sp
+        add             w14, w3, #3             // rows = h+3
+1:      mov             x16, x1
+        mov             x17, x13
+        mov             w15, w10
+2:      ld1             {v16.8h, v17.8h}, [x16]
+        add             x16, x16, #16
+        ext             v18.16b, v16.16b, v17.16b, #2
+        ext             v19.16b, v16.16b, v17.16b, #4
+        ext             v20.16b, v16.16b, v17.16b, #6
+        calc_epelh_10   v1, v16, v18, v19, v20, sqshrn, #2
+        calc_epelh2_10  v1, v2, v16, v18, v19, v20, sqshrn2, #2
+        st1             {v1.8h}, [x17], #16
+        subs            w15, w15, #1
+        b.ne            2b
+        add             x1, x1, x2
+        add             x13, x13, x9
+        subs            w14, w14, #1
+        b.ne            1b
+        // V pass: scratch -> int16 dst (>>6), stride 128
+        load_epel_filterh x5, x12               // v filter (my)
+        mov             x9, #128
+        mov             w13, w3                 // saved height
+        add             w10, w6, #7
+        lsr             w10, w10, #3            // nblocks
+        mov             x12, sp                 // scratch column base
+        mov             x14, x0                 // dst column base
+.macro calc src0, src1, src2, src3
+        ld1             {\src3\().8h}, [x16], x9
+        calc_epelh_10   v1, \src0, \src1, \src2, \src3, sqshrn, #6
+        calc_epelh2_10  v1, v2, \src0, \src1, \src2, \src3, sqshrn2, #6
+        subs            w3, w3, #1
+        st1             {v1.8h}, [x0], x9
+.endm
+3:      mov             w3, w13
+        mov             x16, x12
+        mov             x0, x14
+        ld1             {v16.8h}, [x16], x9
+        ld1             {v17.8h}, [x16], x9
+        ld1             {v18.8h}, [x16], x9
+1:      calc_all4
+2:      add             x12, x12, #16
+        add             x14, x14, #16
+        subs            w10, w10, #1
+        b.ne            3b
+.purgem calc
+        mov             sp, x11
+        ret
+endfunc
