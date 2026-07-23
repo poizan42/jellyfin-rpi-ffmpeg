@@ -100,10 +100,18 @@ LUT instead: it reuses the validated tetrahedral apply, keeps all DV math scalar
 ## Accurate-tier perf — where it stands, and a dead end (don't re-try)
 The accurate chroma 3D-LUT apply is NEON (8 chroma samples/iter: branchless tetrahedron select +
 software gather; `tm3d_chroma_row` in `vf_sand_to_yuv420p_drm.c`), bit-exact to the scalar path.
-4K HDR: 0.65× (scalar) → **0.765× (+18%)**. It is **gather-latency bound** — the scattered 4-corner
-lookup into the 108 KB LUT is the wall (same wall that beat every V3D offload). Measured ceilings:
-a chroma-only 72 KB table repack gave nothing (it's the access *pattern*, not L2 footprint); the
-arithmetic-only ceiling (gather stubbed) is ~0.83×.
+4K HDR: 0.65× (scalar) → **0.765× (+18%)**. A chroma-only 72 KB table repack gave nothing.
+
+**Profiled breakdown (SAND_PROF, Echo 4K, filter unpack+apply wall time), correcting the earlier
+"gather is the wall" framing** — it isn't. `tm=fast` = 34 ms/frame; `tm=accurate` = 51 ms/frame.
+The +17 ms accurate penalty splits as: **~8 ms = loss of single-pass luma fusion** (the 3D chroma
+needs co-located 10-bit Y+CbCr, forcing a full 10-bit intermediate + a separate luma pass instead
+of the fused SAND→8-bit single pass — ~2.7× luma traffic); **~9 ms = the 3D chroma apply**, which is
+almost entirely *fixed-point arithmetic* (coord map + branchless tetra select + 4-tap weighted sum);
+and only **~1.6 ms = the actual scattered gather into the 108 KB LUT** (measured by stubbing it:
+51→~50 ms). So the big LUT's random access is ~10% of the gap — the real costs are the lost fusion
+(memory traffic) and the apply *compute*. (Consistent with the by-calc dead-end below: on the A72
+the tetrahedral gather is cheap; arithmetic is what's expensive.)
 
 **Dead end — do not re-attempt:** fusing the luma tone-map into the SAND unpack (a `y16`+`y8lut`
 two-output `.S` kernel, so luma skips the separate `lut1d` pass). Built and validated bit-exact,
