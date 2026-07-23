@@ -5500,3 +5500,63 @@ qpel_bi_hv neon_i8mm
 
 DISABLE_I8MM
 #endif // HAVE_I8MM
+
+/* ---- 10-bit HEVC luma qpel uni_hv (prototype: width 8) ------------------
+ * dst=x0 uint16, dststride=x1 bytes, src=x2 uint16, srcstride=x3 bytes,
+ * height=x4, mx=x5, my=x6, width=x7(==8).
+ * C ref (h26x/h2656_inter_template.c put_uni_luma_hv, BIT_DEPTH=10):
+ *   h: tmp[x] = FILTER_h(src) >> 2                    (int16)
+ *   v: val = FILTER_v(tmp) >> 6 ; dst = clip3(0,1023,(val+8)>>4)
+ *   fused v: sqrshrun #10 (=(sum+512)>>10, sat u16) then umin 1023.
+ * Both passes reuse calc_qpelh/calc_qpelh2 (s16->s32 MAC).                   */
+function ff_hevc_put_hevc_qpel_uni_hv8_10_neon, export=1
+        mov             x11, sp                 // save sp
+        add             w10, w4, #7             // h+7 rows
+        lsl             x10, x10, #4            // *16 bytes (8 int16/row, tight)
+        sub             sp, sp, x10             // tmp_array on stack
+        // ---- H pass: (h+7) rows, src base = src - 3*srcstride - 3 samples
+        load_qpel_filterh x5, x12               // v0 = horizontal filter
+        sub             x2, x2, x3, lsl #1
+        sub             x2, x2, x3              // src -= 3*srcstride
+        sub             x2, x2, #6              // src -= 3 samples (6 bytes)
+        mov             x13, sp                 // tmp write ptr
+        add             w14, w4, #7             // row counter
+1:      ld1             {v16.8h, v17.8h}, [x2], x3   // 16 samples for 8 outputs
+        ext             v18.16b, v16.16b, v17.16b, #2
+        ext             v19.16b, v16.16b, v17.16b, #4
+        ext             v20.16b, v16.16b, v17.16b, #6
+        ext             v21.16b, v16.16b, v17.16b, #8
+        ext             v22.16b, v16.16b, v17.16b, #10
+        ext             v23.16b, v16.16b, v17.16b, #12
+        ext             v24.16b, v16.16b, v17.16b, #14
+        calc_qpelh      v1, v16, v18, v19, v20, v21, v22, v23, v24, sqshrn, #2
+        calc_qpelh2     v1, v2, v16, v18, v19, v20, v21, v22, v23, v24, sqshrn2, #2
+        st1             {v1.8h}, [x13], #16
+        subs            w14, w14, #1
+        b.ne            1b
+        // ---- V pass: 8-tap over tmp rows, fused output to 10-bit
+        load_qpel_filterh x6, x12               // v0 = vertical filter
+        mov             w15, #1023
+        dup             v3.8h, w15              // clip max
+        mov             x9, #16                 // tmp row stride
+        mov             x13, sp                 // tmp read base
+        ld1             {v16.8h}, [x13], x9
+        ld1             {v17.8h}, [x13], x9
+        ld1             {v18.8h}, [x13], x9
+        ld1             {v19.8h}, [x13], x9
+        ld1             {v20.8h}, [x13], x9
+        ld1             {v21.8h}, [x13], x9
+        ld1             {v22.8h}, [x13], x9
+.macro calc tmp, src0, src1, src2, src3, src4, src5, src6, src7
+        ld1             {\tmp\().8h}, [x13], x9
+        calc_qpelh      v1, \src0, \src1, \src2, \src3, \src4, \src5, \src6, \src7, sqrshrun, #10
+        calc_qpelh2     v1, v2, \src0, \src1, \src2, \src3, \src4, \src5, \src6, \src7, sqrshrun2, #10
+        umin            v1.8h, v1.8h, v3.8h
+        subs            w4, w4, #1
+        st1             {v1.8h}, [x0], x1
+.endm
+1:      calc_all
+.purgem calc
+2:      mov             sp, x11
+        ret
+endfunc

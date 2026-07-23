@@ -146,6 +146,9 @@ static void hevc_dequant_12_neon(int16_t *coeffs, int16_t log2_size)
     }
 }
 
+void ff_hevc_put_hevc_qpel_uni_hv8_10_neon(uint8_t *dst, ptrdiff_t dststride,
+    const uint8_t *src, ptrdiff_t srcstride, int height, intptr_t mx, intptr_t my, int width);
+
 #define NEON8_FNASSIGN(member, v, h, fn, ext) \
         member[1][v][h] = ff_hevc_put_hevc_##fn##4_8_neon##ext;  \
         member[2][v][h] = ff_hevc_put_hevc_##fn##6_8_neon##ext;  \
@@ -325,6 +328,8 @@ av_cold void ff_hevc_dsp_init_aarch64(HEVCDSPContext *c, const int bit_depth)
         c->idct_dc[2]                  = ff_hevc_idct_16x16_dc_10_neon;
         c->idct_dc[3]                  = ff_hevc_idct_32x32_dc_10_neon;
         c->dequant                     = hevc_dequant_10_neon;
+        /* prototype: 10-bit luma qpel uni_hv (width 8). idx 3 = size 8, [my][mx]=[1][1]=hv. */
+        c->put_hevc_qpel_uni[3][1][1]  = ff_hevc_put_hevc_qpel_uni_hv8_10_neon;
     }
     if (bit_depth == 12) {
         c->hevc_h_loop_filter_luma     = ff_hevc_h_loop_filter_luma_12_neon;
