@@ -62,6 +62,24 @@ kernel is deliberately NOT used for P5 luma — the 3D chroma pass needs the 10-
 co-siting anyway, so single-pass luma would force the slower "2-read" variant (see the dead-end note
 above); reusing the existing scratch + 1D `lut1d_apply` is both simpler and faster.
 
+**Dead end — by-calculation apply (do not re-attempt).** Tested replacing the 3D-LUT gather with
+per-pixel arithmetic: fused DV-decode + `vf_tonemap=hable`/desat + BT.2020→709 gamut + BT.709 OETF +
+RGB→YCbCr709, with PQ EOTF / BT.709 OETF as small L1-resident 1D transfer LUTs instead of `pow`
+(the "trade the scattered 108 KB gather for cache-friendly compute" idea; standalone bench
+`scratchpad/dv_calc_bench.c`). The fusion is valid — the DV decode ends in linear BT.2020 light and
+the tonemap re-linearizes, so the PQ-OETF→YCbCr→RGB→PQ-EOTF round-trip cancels to ×100. But **it
+loses decisively on perf**: scalar 4K, DRAM-resident, vs the shipped 3D tetrahedral gather (1.00×):
+exact-`pow` calc 0.05×, transfer-LUT calc 0.13×, and — the decisive number — **arithmetic-only
+ceiling (transcendentals free) 0.17× (≈6× slower)**. The ~5 3×3 matrix-MACs + hable + desat per
+pixel are inherently far more work than one 4-corner gather + weighted sum; NEON helps the calc's
+arithmetic more than the (poorly-vectorising) gather but cannot flip a 6× deficit that exists before
+the transfer-LUT gathers are even added back. Confirms empirically that the A72 4-corner gather into
+the 108 KB LUT is cheap in absolute terms and precomputation wins. (Correctness of the calc path was
+not fully pinned down — it diverges from the shipped LUT partly by luma *model*: the composed LUT's Y
+is a 1D tone curve on the reconstructed Yh, the calc does full RGB hable — but that's moot given the
+perf loss.) The real pipeline bound remains DRAM bandwidth (whole-frame re-reads), which the calc
+path shares and does not relieve.
+
 ### HLG (ARIB_STD_B67) transfer  ✅ SHIPPED
 Was: `frame_is_hdr()` accepted HLG but the LUTs were PQ-baked, so genuine HLG (incl. DV P8.4) was
 mis-tone-mapped through the PQ curve. Fixed by baking a **second, HLG-input LUT set**
