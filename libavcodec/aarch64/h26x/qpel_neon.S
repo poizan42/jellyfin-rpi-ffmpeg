@@ -5909,3 +5909,342 @@ function ff_hevc_put_hevc_qpel_hv_10_neon, export=1
         mov             sp, x11
         ret
 endfunc
+
+/* ---- 10-bit HEVC luma qpel bi-pred (reads src2) pixels/h/v/hv -----------
+ * void ff_hevc_put_hevc_{qpel_bi_*,pel_bi_pixels}_10_neon(
+ *      uint8_t *dst, ptrdiff_t dststride,          // x0 (u16), x1 bytes
+ *      const uint8_t *src, ptrdiff_t srcstride,    // x2 (u16), x3 bytes
+ *      const int16_t *src2, int height,            // x4 (stride 128), w5
+ *      intptr_t mx, intptr_t my, int width);       // x6, x7, [sp]
+ * C ref: dst = clip3(0,1023,(p + src2[x] + 16) >> 5) where p = FILTER>>2
+ * (h/v), src<<4 (pixels), or v(FILTER(h-tmp))>>6 (hv). shift=15-10=5,
+ * offset=16. Combine is done in s32 (saddl) then sqrshrun #5 (=(sum+16)>>5,
+ * sat u16) + umin 1023 — the s32 add avoids the p+src2 int16 overflow, and
+ * the >32736 / <0 regimes clip identically. src2 row stride = MAX_PB_SIZE.  */
+.macro bi_out10 p                       // p .8h -> v2 .8h ; v4=src2 ; v3=clip
+        saddl           v5.4s, \p\().4h, v4.4h
+        saddl2          v6.4s, \p\().8h, v4.8h
+        sqrshrun        v2.4h, v5.4s, #5
+        sqrshrun2       v2.8h, v6.4s, #5
+        umin            v2.8h, v2.8h, v3.8h
+.endm
+.macro bi_out10_rem4 p                   // low 4 lanes only
+        saddl           v5.4s, \p\().4h, v4.4h
+        sqrshrun        v2.4h, v5.4s, #5
+        umin            v2.4h, v2.4h, v3.4h
+.endm
+
+function ff_hevc_put_hevc_pel_bi_pixels_10_neon, export=1
+        ldr             w9, [sp]                // width
+        mov             w12, #1023
+        dup             v3.8h, w12
+        lsr             w10, w9, #3             // nfull
+        and             w11, w9, #7            // rem
+        mov             x13, #128               // src2 row stride
+1:      mov             x16, x2
+        mov             x17, x0
+        mov             x12, x4
+        mov             w15, w10
+        cbz             w15, 3f
+2:      ld1             {v16.8h}, [x16], #16
+        shl             v1.8h, v16.8h, #4
+        ld1             {v4.8h}, [x12], #16
+        bi_out10        v1
+        st1             {v2.8h}, [x17], #16
+        subs            w15, w15, #1
+        b.ne            2b
+3:      cbz             w11, 4f
+        ld1             {v16.8h}, [x16]
+        shl             v1.8h, v16.8h, #4
+        ld1             {v4.8h}, [x12]
+        cmp             w11, #6
+        b.eq            5f
+        bi_out10_rem4   v1
+        st1             {v2.4h}, [x17]
+        b               4f
+5:      bi_out10        v1
+        st1             {v2.4h}, [x17], #8
+        st1             {v2.s}[2], [x17]
+4:      add             x2, x2, x3
+        add             x0, x0, x1
+        add             x4, x4, x13
+        subs            w5, w5, #1
+        b.ne            1b
+        ret
+endfunc
+
+function ff_hevc_put_hevc_qpel_bi_h_10_neon, export=1
+        ldr             w9, [sp]                // width
+        load_qpel_filterh x6, x12               // v0 = h filter (mx)
+        sub             x2, x2, #6              // src -= 3 samples
+        mov             w12, #1023
+        dup             v3.8h, w12
+        lsr             w10, w9, #3
+        and             w11, w9, #7
+        mov             x13, #128
+1:      mov             x16, x2
+        mov             x17, x0
+        mov             x12, x4
+        mov             w15, w10
+        cbz             w15, 3f
+2:      ld1             {v16.8h, v17.8h}, [x16]
+        add             x16, x16, #16
+        ext             v18.16b, v16.16b, v17.16b, #2
+        ext             v19.16b, v16.16b, v17.16b, #4
+        ext             v20.16b, v16.16b, v17.16b, #6
+        ext             v21.16b, v16.16b, v17.16b, #8
+        ext             v22.16b, v16.16b, v17.16b, #10
+        ext             v23.16b, v16.16b, v17.16b, #12
+        ext             v24.16b, v16.16b, v17.16b, #14
+        calc_qpelh      v1, v16, v18, v19, v20, v21, v22, v23, v24, sqshrn, #2
+        calc_qpelh2     v1, v2, v16, v18, v19, v20, v21, v22, v23, v24, sqshrn2, #2
+        ld1             {v4.8h}, [x12], #16
+        bi_out10        v1
+        st1             {v2.8h}, [x17], #16
+        subs            w15, w15, #1
+        b.ne            2b
+3:      cbz             w11, 4f
+        ld1             {v16.8h, v17.8h}, [x16]
+        ext             v18.16b, v16.16b, v17.16b, #2
+        ext             v19.16b, v16.16b, v17.16b, #4
+        ext             v20.16b, v16.16b, v17.16b, #6
+        ext             v21.16b, v16.16b, v17.16b, #8
+        ext             v22.16b, v16.16b, v17.16b, #10
+        ext             v23.16b, v16.16b, v17.16b, #12
+        ext             v24.16b, v16.16b, v17.16b, #14
+        calc_qpelh      v1, v16, v18, v19, v20, v21, v22, v23, v24, sqshrn, #2
+        ld1             {v4.8h}, [x12]
+        cmp             w11, #6
+        b.eq            5f
+        bi_out10_rem4   v1
+        st1             {v2.4h}, [x17]
+        b               4f
+5:      calc_qpelh2     v1, v2, v16, v18, v19, v20, v21, v22, v23, v24, sqshrn2, #2
+        bi_out10        v1
+        st1             {v2.4h}, [x17], #8
+        st1             {v2.s}[2], [x17]
+4:      add             x2, x2, x3
+        add             x0, x0, x1
+        add             x4, x4, x13
+        subs            w5, w5, #1
+        b.ne            1b
+        ret
+endfunc
+
+function ff_hevc_put_hevc_qpel_bi_v_10_neon, export=1
+        ldr             w9, [sp]                // width
+        stp             x19, x20, [sp, #-32]!
+        stp             x21, x22, [sp, #16]
+        load_qpel_filterh x7, x12               // v0 = v filter (my)
+        sub             x2, x2, x3, lsl #1
+        sub             x2, x2, x3              // src -= 3 rows
+        mov             w12, #1023
+        dup             v3.8h, w12
+        mov             w22, w5                 // saved height
+        lsr             w10, w9, #3
+        and             w11, w9, #7
+        mov             x13, #128
+        mov             x19, x0                 // dst col base
+        mov             x20, x2                 // src col base
+        mov             x21, x4                 // src2 col base
+        cbz             w10, 5f
+.macro calc tmp, src0, src1, src2, src3, src4, src5, src6, src7
+        ld1             {\tmp\().8h}, [x16], x3
+        calc_qpelh      v1, \src0, \src1, \src2, \src3, \src4, \src5, \src6, \src7, sqshrn, #2
+        calc_qpelh2     v1, v2, \src0, \src1, \src2, \src3, \src4, \src5, \src6, \src7, sqshrn2, #2
+        ld1             {v4.8h}, [x12], x13
+        bi_out10        v1
+        subs            w5, w5, #1
+        st1             {v2.8h}, [x0], x1
+.endm
+3:      mov             w5, w22
+        mov             x16, x20
+        mov             x0, x19
+        mov             x12, x21
+        ld1             {v16.8h}, [x16], x3
+        ld1             {v17.8h}, [x16], x3
+        ld1             {v18.8h}, [x16], x3
+        ld1             {v19.8h}, [x16], x3
+        ld1             {v20.8h}, [x16], x3
+        ld1             {v21.8h}, [x16], x3
+        ld1             {v22.8h}, [x16], x3
+1:      calc_all
+2:      add             x19, x19, #16
+        add             x20, x20, #16
+        add             x21, x21, #16
+        subs            w10, w10, #1
+        b.ne            3b
+.purgem calc
+5:      cbz             w11, 6f
+        mov             w5, w22
+        mov             x16, x20
+        mov             x0, x19
+        mov             x12, x21
+        ld1             {v16.8h}, [x16], x3
+        ld1             {v17.8h}, [x16], x3
+        ld1             {v18.8h}, [x16], x3
+        ld1             {v19.8h}, [x16], x3
+        ld1             {v20.8h}, [x16], x3
+        ld1             {v21.8h}, [x16], x3
+        ld1             {v22.8h}, [x16], x3
+        cmp             w11, #6
+        b.eq            7f
+.macro calc tmp, src0, src1, src2, src3, src4, src5, src6, src7
+        ld1             {\tmp\().8h}, [x16], x3
+        calc_qpelh      v1, \src0, \src1, \src2, \src3, \src4, \src5, \src6, \src7, sqshrn, #2
+        ld1             {v4.8h}, [x12], x13
+        bi_out10_rem4   v1
+        subs            w5, w5, #1
+        st1             {v2.4h}, [x0], x1
+.endm
+1:      calc_all
+2:      .purgem calc
+        b               6f
+7:
+.macro calc tmp, src0, src1, src2, src3, src4, src5, src6, src7
+        ld1             {\tmp\().8h}, [x16], x3
+        calc_qpelh      v1, \src0, \src1, \src2, \src3, \src4, \src5, \src6, \src7, sqshrn, #2
+        calc_qpelh2     v1, v2, \src0, \src1, \src2, \src3, \src4, \src5, \src6, \src7, sqshrn2, #2
+        ld1             {v4.8h}, [x12], x13
+        bi_out10        v1
+        st1             {v2.4h}, [x0], #8
+        st1             {v2.s}[2], [x0]
+        subs            w5, w5, #1
+        add             x0, x0, x1
+        sub             x0, x0, #8
+.endm
+1:      calc_all
+2:      .purgem calc
+6:      ldp             x21, x22, [sp, #16]
+        ldp             x19, x20, [sp], #32
+        ret
+endfunc
+
+function ff_hevc_put_hevc_qpel_bi_hv_10_neon, export=1
+        ldr             w9, [sp]                // width
+        stp             x19, x20, [sp, #-48]!
+        stp             x21, x22, [sp, #16]
+        stp             x23, x24, [sp, #32]
+        mov             x19, x0                 // dst base
+        mov             x20, x4                 // src2 base
+        mov             w22, w5                 // saved height
+        add             w12, w5, #7
+        lsl             w12, w12, #7            // (h+7)*128 scratch
+        mov             x21, sp                 // frame anchor
+        sub             sp, sp, x12
+        mov             x23, sp                 // scratch base
+        // ---- H pass: src -> int16 scratch (>>2)
+        load_qpel_filterh x6, x12               // h filter (mx)
+        sub             x2, x2, x3, lsl #1
+        sub             x2, x2, x3
+        sub             x2, x2, #6
+        mov             x13, #128
+        add             w10, w9, #7
+        lsr             w10, w10, #3            // nblocks
+        mov             x24, x23                // scratch row base
+        add             w14, w22, #7            // rows
+1:      mov             x16, x2
+        mov             x17, x24
+        mov             w15, w10
+2:      ld1             {v16.8h, v17.8h}, [x16]
+        add             x16, x16, #16
+        ext             v18.16b, v16.16b, v17.16b, #2
+        ext             v19.16b, v16.16b, v17.16b, #4
+        ext             v20.16b, v16.16b, v17.16b, #6
+        ext             v21.16b, v16.16b, v17.16b, #8
+        ext             v22.16b, v16.16b, v17.16b, #10
+        ext             v23.16b, v16.16b, v17.16b, #12
+        ext             v24.16b, v16.16b, v17.16b, #14
+        calc_qpelh      v1, v16, v18, v19, v20, v21, v22, v23, v24, sqshrn, #2
+        calc_qpelh2     v1, v2, v16, v18, v19, v20, v21, v22, v23, v24, sqshrn2, #2
+        st1             {v1.8h}, [x17], #16
+        subs            w15, w15, #1
+        b.ne            2b
+        add             x2, x2, x3
+        add             x24, x24, x13
+        subs            w14, w14, #1
+        b.ne            1b
+        // ---- V pass: scratch -> dst (>>6) + src2 combine
+        load_qpel_filterh x7, x12               // v filter (my)
+        mov             w12, #1023
+        dup             v3.8h, w12              // clip max
+        mov             x13, #128
+        lsr             w10, w9, #3
+        and             w11, w9, #7
+        mov             x14, x23                // scratch col base
+        mov             x15, x19                // dst col base
+        mov             x17, x20                // src2 col base
+        cbz             w10, 5f
+.macro calc tmp, src0, src1, src2, src3, src4, src5, src6, src7
+        ld1             {\tmp\().8h}, [x16], x13
+        calc_qpelh      v1, \src0, \src1, \src2, \src3, \src4, \src5, \src6, \src7, sqshrn, #6
+        calc_qpelh2     v1, v2, \src0, \src1, \src2, \src3, \src4, \src5, \src6, \src7, sqshrn2, #6
+        ld1             {v4.8h}, [x12], x13
+        bi_out10        v1
+        subs            w5, w5, #1
+        st1             {v2.8h}, [x0], x1
+.endm
+3:      mov             w5, w22
+        mov             x16, x14
+        mov             x0, x15
+        mov             x12, x17
+        ld1             {v16.8h}, [x16], x13
+        ld1             {v17.8h}, [x16], x13
+        ld1             {v18.8h}, [x16], x13
+        ld1             {v19.8h}, [x16], x13
+        ld1             {v20.8h}, [x16], x13
+        ld1             {v21.8h}, [x16], x13
+        ld1             {v22.8h}, [x16], x13
+1:      calc_all
+2:      add             x14, x14, #16
+        add             x15, x15, #16
+        add             x17, x17, #16
+        subs            w10, w10, #1
+        b.ne            3b
+.purgem calc
+5:      cbz             w11, 6f
+        mov             w5, w22
+        mov             x16, x14
+        mov             x0, x15
+        mov             x12, x17
+        ld1             {v16.8h}, [x16], x13
+        ld1             {v17.8h}, [x16], x13
+        ld1             {v18.8h}, [x16], x13
+        ld1             {v19.8h}, [x16], x13
+        ld1             {v20.8h}, [x16], x13
+        ld1             {v21.8h}, [x16], x13
+        ld1             {v22.8h}, [x16], x13
+        cmp             w11, #6
+        b.eq            7f
+.macro calc tmp, src0, src1, src2, src3, src4, src5, src6, src7
+        ld1             {\tmp\().8h}, [x16], x13
+        calc_qpelh      v1, \src0, \src1, \src2, \src3, \src4, \src5, \src6, \src7, sqshrn, #6
+        ld1             {v4.8h}, [x12], x13
+        bi_out10_rem4   v1
+        subs            w5, w5, #1
+        st1             {v2.4h}, [x0], x1
+.endm
+1:      calc_all
+2:      .purgem calc
+        b               6f
+7:
+.macro calc tmp, src0, src1, src2, src3, src4, src5, src6, src7
+        ld1             {\tmp\().8h}, [x16], x13
+        calc_qpelh      v1, \src0, \src1, \src2, \src3, \src4, \src5, \src6, \src7, sqshrn, #6
+        calc_qpelh2     v1, v2, \src0, \src1, \src2, \src3, \src4, \src5, \src6, \src7, sqshrn2, #6
+        ld1             {v4.8h}, [x12], x13
+        bi_out10        v1
+        st1             {v2.4h}, [x0], #8
+        st1             {v2.s}[2], [x0]
+        subs            w5, w5, #1
+        add             x0, x0, x1
+        sub             x0, x0, #8
+.endm
+1:      calc_all
+2:      .purgem calc
+6:      mov             sp, x21
+        ldp             x23, x24, [sp, #32]
+        ldp             x21, x22, [sp, #16]
+        ldp             x19, x20, [sp], #48
+        ret
+endfunc

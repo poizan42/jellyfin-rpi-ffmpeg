@@ -5656,3 +5656,265 @@ function ff_hevc_put_hevc_epel_hv_10_neon, export=1
         mov             sp, x11
         ret
 endfunc
+
+/* ---- 10-bit HEVC chroma epel bi-pred (reads src2) h / v / hv ------------
+ * Same bi ABI/semantics as luma (shift=5, offset=16, s32 combine), 4-tap.
+ * pixels(00) is shared with the luma pel_bi_pixels kernel.                  */
+.macro bi_out10 p
+        saddl           v5.4s, \p\().4h, v4.4h
+        saddl2          v6.4s, \p\().8h, v4.8h
+        sqrshrun        v2.4h, v5.4s, #5
+        sqrshrun2       v2.8h, v6.4s, #5
+        umin            v2.8h, v2.8h, v3.8h
+.endm
+.macro bi_out10_rem4 p
+        saddl           v5.4s, \p\().4h, v4.4h
+        sqrshrun        v2.4h, v5.4s, #5
+        umin            v2.4h, v2.4h, v3.4h
+.endm
+
+function ff_hevc_put_hevc_epel_bi_h_10_neon, export=1
+        ldr             w9, [sp]                // width
+        load_epel_filterh x6, x12               // v0 = h filter (mx)
+        sub             x2, x2, #2              // src -= 1 sample
+        mov             w12, #1023
+        dup             v3.8h, w12
+        lsr             w10, w9, #3
+        and             w11, w9, #7
+        mov             x13, #128
+1:      mov             x16, x2
+        mov             x17, x0
+        mov             x12, x4
+        mov             w15, w10
+        cbz             w15, 3f
+2:      ld1             {v16.8h, v17.8h}, [x16]
+        add             x16, x16, #16
+        ext             v18.16b, v16.16b, v17.16b, #2
+        ext             v19.16b, v16.16b, v17.16b, #4
+        ext             v20.16b, v16.16b, v17.16b, #6
+        calc_epelh_10   v1, v16, v18, v19, v20, sqshrn, #2
+        calc_epelh2_10  v1, v2, v16, v18, v19, v20, sqshrn2, #2
+        ld1             {v4.8h}, [x12], #16
+        bi_out10        v1
+        st1             {v2.8h}, [x17], #16
+        subs            w15, w15, #1
+        b.ne            2b
+3:      cbz             w11, 4f
+        ld1             {v16.8h, v17.8h}, [x16]
+        ext             v18.16b, v16.16b, v17.16b, #2
+        ext             v19.16b, v16.16b, v17.16b, #4
+        ext             v20.16b, v16.16b, v17.16b, #6
+        calc_epelh_10   v1, v16, v18, v19, v20, sqshrn, #2
+        ld1             {v4.8h}, [x12]
+        cmp             w11, #6
+        b.eq            5f
+        bi_out10_rem4   v1
+        st1             {v2.4h}, [x17]
+        b               4f
+5:      calc_epelh2_10  v1, v2, v16, v18, v19, v20, sqshrn2, #2
+        bi_out10        v1
+        st1             {v2.4h}, [x17], #8
+        st1             {v2.s}[2], [x17]
+4:      add             x2, x2, x3
+        add             x0, x0, x1
+        add             x4, x4, x13
+        subs            w5, w5, #1
+        b.ne            1b
+        ret
+endfunc
+
+function ff_hevc_put_hevc_epel_bi_v_10_neon, export=1
+        ldr             w9, [sp]                // width
+        stp             x19, x20, [sp, #-32]!
+        stp             x21, x22, [sp, #16]
+        load_epel_filterh x7, x12               // v0 = v filter (my)
+        sub             x2, x2, x3              // src -= 1 row
+        mov             w12, #1023
+        dup             v3.8h, w12
+        mov             w22, w5
+        lsr             w10, w9, #3
+        and             w11, w9, #7
+        mov             x13, #128
+        mov             x19, x0
+        mov             x20, x2
+        mov             x21, x4
+        cbz             w10, 5f
+.macro calc src0, src1, src2, src3
+        ld1             {\src3\().8h}, [x16], x3
+        calc_epelh_10   v1, \src0, \src1, \src2, \src3, sqshrn, #2
+        calc_epelh2_10  v1, v2, \src0, \src1, \src2, \src3, sqshrn2, #2
+        ld1             {v4.8h}, [x12], x13
+        bi_out10        v1
+        subs            w5, w5, #1
+        st1             {v2.8h}, [x0], x1
+.endm
+3:      mov             w5, w22
+        mov             x16, x20
+        mov             x0, x19
+        mov             x12, x21
+        ld1             {v16.8h}, [x16], x3
+        ld1             {v17.8h}, [x16], x3
+        ld1             {v18.8h}, [x16], x3
+1:      calc_all4
+2:      add             x19, x19, #16
+        add             x20, x20, #16
+        add             x21, x21, #16
+        subs            w10, w10, #1
+        b.ne            3b
+.purgem calc
+5:      cbz             w11, 6f
+        mov             w5, w22
+        mov             x16, x20
+        mov             x0, x19
+        mov             x12, x21
+        ld1             {v16.8h}, [x16], x3
+        ld1             {v17.8h}, [x16], x3
+        ld1             {v18.8h}, [x16], x3
+        cmp             w11, #6
+        b.eq            7f
+.macro calc src0, src1, src2, src3
+        ld1             {\src3\().8h}, [x16], x3
+        calc_epelh_10   v1, \src0, \src1, \src2, \src3, sqshrn, #2
+        ld1             {v4.8h}, [x12], x13
+        bi_out10_rem4   v1
+        subs            w5, w5, #1
+        st1             {v2.4h}, [x0], x1
+.endm
+1:      calc_all4
+2:      .purgem calc
+        b               6f
+7:
+.macro calc src0, src1, src2, src3
+        ld1             {\src3\().8h}, [x16], x3
+        calc_epelh_10   v1, \src0, \src1, \src2, \src3, sqshrn, #2
+        calc_epelh2_10  v1, v2, \src0, \src1, \src2, \src3, sqshrn2, #2
+        ld1             {v4.8h}, [x12], x13
+        bi_out10        v1
+        st1             {v2.4h}, [x0], #8
+        st1             {v2.s}[2], [x0]
+        subs            w5, w5, #1
+        add             x0, x0, x1
+        sub             x0, x0, #8
+.endm
+1:      calc_all4
+2:      .purgem calc
+6:      ldp             x21, x22, [sp, #16]
+        ldp             x19, x20, [sp], #32
+        ret
+endfunc
+
+function ff_hevc_put_hevc_epel_bi_hv_10_neon, export=1
+        ldr             w9, [sp]                // width
+        stp             x19, x20, [sp, #-48]!
+        stp             x21, x22, [sp, #16]
+        stp             x23, x24, [sp, #32]
+        mov             x19, x0
+        mov             x20, x4
+        mov             w22, w5
+        add             w12, w5, #3
+        lsl             w12, w12, #7            // (h+3)*128 scratch
+        mov             x21, sp
+        sub             sp, sp, x12
+        mov             x23, sp
+        // ---- H pass (4-tap >>2) -> scratch
+        load_epel_filterh x6, x12               // h filter (mx)
+        sub             x2, x2, x3              // src -= 1 row
+        sub             x2, x2, #2              // src -= 1 sample
+        mov             x13, #128
+        add             w10, w9, #7
+        lsr             w10, w10, #3
+        mov             x24, x23
+        add             w14, w22, #3            // rows = h+3
+1:      mov             x16, x2
+        mov             x17, x24
+        mov             w15, w10
+2:      ld1             {v16.8h, v17.8h}, [x16]
+        add             x16, x16, #16
+        ext             v18.16b, v16.16b, v17.16b, #2
+        ext             v19.16b, v16.16b, v17.16b, #4
+        ext             v20.16b, v16.16b, v17.16b, #6
+        calc_epelh_10   v1, v16, v18, v19, v20, sqshrn, #2
+        calc_epelh2_10  v1, v2, v16, v18, v19, v20, sqshrn2, #2
+        st1             {v1.8h}, [x17], #16
+        subs            w15, w15, #1
+        b.ne            2b
+        add             x2, x2, x3
+        add             x24, x24, x13
+        subs            w14, w14, #1
+        b.ne            1b
+        // ---- V pass (4-tap >>6) + src2 combine
+        load_epel_filterh x7, x12               // v filter (my)
+        mov             w12, #1023
+        dup             v3.8h, w12              // clip max
+        mov             x13, #128
+        lsr             w10, w9, #3
+        and             w11, w9, #7
+        mov             x14, x23
+        mov             x15, x19
+        mov             x17, x20
+        cbz             w10, 5f
+.macro calc src0, src1, src2, src3
+        ld1             {\src3\().8h}, [x16], x13
+        calc_epelh_10   v1, \src0, \src1, \src2, \src3, sqshrn, #6
+        calc_epelh2_10  v1, v2, \src0, \src1, \src2, \src3, sqshrn2, #6
+        ld1             {v4.8h}, [x12], x13
+        bi_out10        v1
+        subs            w5, w5, #1
+        st1             {v2.8h}, [x0], x1
+.endm
+3:      mov             w5, w22
+        mov             x16, x14
+        mov             x0, x15
+        mov             x12, x17
+        ld1             {v16.8h}, [x16], x13
+        ld1             {v17.8h}, [x16], x13
+        ld1             {v18.8h}, [x16], x13
+1:      calc_all4
+2:      add             x14, x14, #16
+        add             x15, x15, #16
+        add             x17, x17, #16
+        subs            w10, w10, #1
+        b.ne            3b
+.purgem calc
+5:      cbz             w11, 6f
+        mov             w5, w22
+        mov             x16, x14
+        mov             x0, x15
+        mov             x12, x17
+        ld1             {v16.8h}, [x16], x13
+        ld1             {v17.8h}, [x16], x13
+        ld1             {v18.8h}, [x16], x13
+        cmp             w11, #6
+        b.eq            7f
+.macro calc src0, src1, src2, src3
+        ld1             {\src3\().8h}, [x16], x13
+        calc_epelh_10   v1, \src0, \src1, \src2, \src3, sqshrn, #6
+        ld1             {v4.8h}, [x12], x13
+        bi_out10_rem4   v1
+        subs            w5, w5, #1
+        st1             {v2.4h}, [x0], x1
+.endm
+1:      calc_all4
+2:      .purgem calc
+        b               6f
+7:
+.macro calc src0, src1, src2, src3
+        ld1             {\src3\().8h}, [x16], x13
+        calc_epelh_10   v1, \src0, \src1, \src2, \src3, sqshrn, #6
+        calc_epelh2_10  v1, v2, \src0, \src1, \src2, \src3, sqshrn2, #6
+        ld1             {v4.8h}, [x12], x13
+        bi_out10        v1
+        st1             {v2.4h}, [x0], #8
+        st1             {v2.s}[2], [x0]
+        subs            w5, w5, #1
+        add             x0, x0, x1
+        sub             x0, x0, #8
+.endm
+1:      calc_all4
+2:      .purgem calc
+6:      mov             sp, x21
+        ldp             x23, x24, [sp, #32]
+        ldp             x21, x22, [sp, #16]
+        ldp             x19, x20, [sp], #48
+        ret
+endfunc
