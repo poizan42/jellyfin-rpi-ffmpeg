@@ -56,17 +56,18 @@ eating ~1.2 CPU cores as swscale. Properly `configure`-integrated
 
 ### 3. HDR→SDR tone-mapping  (`tm=none|fast|veryfast|accurate` option on the bridge filter)
 Without it, HDR10 (PQ/BT.2020) sources transcode with a plain 10→8-bit truncation → washed-out.
-Two tiers, both tuned to match FFmpeg's `zscale+tonemap=hable` (chosen by eye) and **baked
+Two HDR10 tiers (`veryfast` adds a third, DV-P5-only tier — see below), both tuned to match
+FFmpeg's `zscale+tonemap=hable` (chosen by eye) and **baked
 directly from that chain** into embedded LUTs (`libavfilter/rpi_tonemap_gen.py` →
 `rpi_tonemap_tables.h`; re-runnable):
-- `tm=fast` — **real-time** (1.11× at 4K HDR, within 4% of `tm=none`). Luma-exact 1D tone curve
+- `tm=fast` — **real-time** (~1.17× at 4K HDR, essentially matching `tm=none`'s ~1.16×). Luma-exact 1D tone curve
   **folded into the single-pass SAND30 NEON unpack** (`ff_rpi_sand30_lines_to_planar_y8_lut`:
   64-entry `tbl` + lerp in place of the `>>2` narrow, no 10-bit intermediate) + separable
   chroma; colour approximate. Bit-exact vs a scalar oracle (`checkasm --test=rpi_sand`).
 - `tm=accurate` — chroma-resolution 3D LUT (luma-aware), reproduces zscale; ~¼ the cost of a
   full 4:4:4 LUT for the same quality. Applied with **fixed-point tetrahedral** interpolation
   (4 taps, all-integer — more accurate near saturated corners than trilinear, and faster).
-  Quality tier, **not** real-time by design (~0.77× at 4K HDR). The apply is NEON (8 chroma
+  Quality tier, near real-time (~0.94× at 4K HDR after `TM_CHUNK`=4 L1-tiling). The apply is NEON (8 chroma
   samples/iter: branchless tetrahedron select + software gather); it's ultimately gather-latency
   bound, so it stays below the fast tier.
 - `tm=none` (default) — plain truncation, byte-for-byte unchanged. **Exception:** a Dolby Vision

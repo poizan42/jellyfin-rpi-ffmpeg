@@ -47,7 +47,9 @@ validated by a standalone unit test vs a literal transcription of libplacebo's G
 
 Perf (full 4K→720p, steady state): scalar **0.145×** → NEON **0.555×** (3.8×). As expected,
 between... well, near the accurate tier (0.765×) but heavier because the luma 3D lookup is
-mandatory. Gather-latency-bound like the accurate tier; further CPU vectorisation won't move it.
+mandatory. **(All figures in this paragraph predate `TM_CHUNK`=4 — see the "Accurate-tier perf"
+section below; that L1-tiling win later raised P5 default 0.555→~0.60× and accurate 0.765→~0.94×.)**
+Gather-latency-bound like the accurate tier; further CPU vectorisation won't move it.
 Faster on letterboxed scope content (fewer luma rows). Offline `dovi_tool` P5→P8.1 remains the
 zero-CPU alternative if a box is CPU-starved.
 
@@ -56,8 +58,9 @@ zero-CPU alternative if a box is CPU-starved.
 (`p5_luma1d`, baked per-RPU alongside the 3D LUT via the same `p5_decode_hdr10`+tone-curve, Cb=Cr=mid)
 applied with `lut1d_apply`, dropping the ~8.3M/frame 3D luma lookups; chroma stays the full 3D path
 (it's genuinely cross-channel). Structurally identical to the HDR10 accurate tier (10-bit scratch +
-1D luma + 3D chroma). **~0.73× at 4K** (vs 0.55×); luma ~45–51 dB vs the 3D path on real content
-(chroma bit-identical). Default P5 output is byte-unchanged (md5). Note: the single-pass `y8_lut`
+1D luma + 3D chroma). **~0.73× at 4K** (vs 0.55×) — since raised to **~1.0× (real-time)** by
+`TM_CHUNK`=4 (see below), and `tm=veryfast` adds ~6% more (nearest chroma); luma ~45–51 dB vs the 3D
+path on real content (chroma bit-identical). Default P5 output is byte-unchanged (md5). Note: the single-pass `y8_lut`
 kernel is deliberately NOT used for P5 luma — the 3D chroma pass needs the 10-bit luma for 2×2
 co-siting anyway, so single-pass luma would force the slower "2-read" variant (see the dead-end note
 above); reusing the existing scratch + 1D `lut1d_apply` is both simpler and faster.
@@ -143,14 +146,16 @@ nearest-chroma middle ground would cost most of the arithmetic back for a fracti
 pursued. The tetrahedral arithmetic remains the floor for the accurate-quality tier.
 
 **Profiled breakdown (SAND_PROF, Echo 4K, filter unpack+apply wall time), correcting the earlier
-"gather is the wall" framing** — it isn't. `tm=fast` = 34 ms/frame; `tm=accurate` = 51 ms/frame.
+"gather is the wall" framing** — it isn't. (Numbers below are the *pre-`TM_CHUNK`=4* wall times that
+motivated the fusion work — `TM_CHUNK`=4 later cut accurate to ~37.5 ms; the *split* still holds.)
+`tm=fast` = 34 ms/frame; `tm=accurate` = 51 ms/frame.
 The +17 ms accurate penalty splits as: **~8 ms = loss of single-pass luma fusion** (the 3D chroma
 needs co-located 10-bit Y+CbCr, forcing a full 10-bit intermediate + a separate luma pass instead
 of the fused SAND→8-bit single pass — ~2.7× luma traffic); **~9 ms = the 3D chroma apply**, which is
 almost entirely *fixed-point arithmetic* (coord map + branchless tetra select + 4-tap weighted sum);
 and only **~1.6 ms = the actual scattered gather into the 108 KB LUT** (measured by stubbing it:
 51→~50 ms). So the big LUT's random access is ~10% of the gap — the real costs are the lost fusion
-(memory traffic) and the apply *compute*. (Consistent with the by-calc dead-end below: on the A72
+(memory traffic) and the apply *compute*. (Consistent with the by-calc dead-end above: on the A72
 the tetrahedral gather is cheap; arithmetic is what's expensive.)
 
 **Dead end — do not re-attempt:** fusing the luma tone-map into the SAND unpack (a `y16`+`y8lut`

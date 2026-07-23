@@ -19,15 +19,17 @@ Full design, build instructions and usage: **[README.jellyfin-rpi.md](README.jel
 | 10-bit HEVC **SDR** 1080p | **~2.0–2.7× real-time** — the tuned sweet spot |
 | 10-bit HEVC **SDR** 4K (2160p / scope) | **~1.4× real-time** — proven (slice-threaded NEON unpack + prefetch + map-cache + ISP scale) |
 | 8-bit HEVC SDR | works (same bridge path) |
-| 10-bit HEVC **HDR10** 4K | **~1.1× real-time with correct colour** (`tm=fast`) — single-pass NEON HDR→SDR tone-map (PQ/BT.2020→BT.709). A higher-quality `tm=accurate` tier exists (~0.65×, not real-time by design). Without tone-mapping (`tm=none`) it's ~1.16× but washed-out. |
-| Dolby Vision profile 5 | not supported (needs DV RPU processing) |
+| 10-bit HEVC **HDR10** 4K | **~1.17× real-time with correct colour** (`tm=fast`) — single-pass NEON HDR→SDR tone-map (PQ/BT.2020→BT.709). A higher-quality `tm=accurate` tier (3D-LUT, matches zscale) runs ~0.94× (near real-time). Without tone-mapping (`tm=none`) it's ~1.16× but washed-out. HLG sources handled too. |
+| Dolby Vision **profile 5** 4K | **supported** — reconstructed from the per-frame RPU to HDR10, then tone-mapped (`AV_FRAME_DATA_DOVI_METADATA` → per-scene 3D-LUT + NEON tetrahedral). `tm=fast` **~1.0× (real-time)**, `tm=veryfast` ~1.02–1.05× (headroom, coarser chroma), default full-3D path ~0.60×. |
 | H.264 / VP9 / AV1 sources | outside this pipeline (rpivid decode is HEVC-only) |
 
 **The 10-bit HEVC → 8-bit H.264 downscale pipeline is proven to run above real-time through 4K,
-for both SDR and HDR10** — HDR10 gets a single-pass NEON tone-map (`tm=fast`) that keeps it
-real-time with correct colour. A higher-quality tone-map tier (`tm=accurate`) exists but is not
-yet real-time. Validated on a real library (see the status doc); on a 1080p transcode the
-pipeline is limited by the single-threaded rpivid decode thread, not the CPU.
+for SDR, HDR10, and Dolby Vision profile 5** — HDR10 and DV P5 get a single-pass NEON tone-map
+(`tm=fast`) that keeps them real-time with correct colour (DV P5 is reconstructed from its RPU
+first). Higher-quality tone-map tiers (`tm=accurate`, and the default full-3D DV path) trade a bit
+of speed for a closer match to the zscale reference (~0.94× / ~0.60×), and `tm=veryfast` gives DV P5
+extra headroom past real-time at coarser chroma. Validated on a real library (see the status doc);
+on a 1080p transcode the pipeline is limited by the single-threaded rpivid decode thread, not the CPU.
 
 ---
 
