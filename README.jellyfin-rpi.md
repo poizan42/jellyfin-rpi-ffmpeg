@@ -49,8 +49,15 @@ so any 4K source is downscaled first (`scale_v4l2m2m`, or `out=half` for exact 2
 **Gate on pixel format, not profile string.** A `Range Extensions`-tagged stream that is actually
 4:2:0 8/10-bit decodes and transcodes fine — only the chroma/bit-depth outside 4:2:0 8/10-bit is the
 real limit. (Empirically confirmed against the ByteDance HEVC demo corpus — 59 clips in
-`samples/ByteDance-HEVC/` with per-clip probe data in `videos.json`: 37 transcode, the 22 that don't
-are exactly the 8K/5.7K set and the RExt 4:2:2/4:4:4/mono/12-bit set.)
+`samples/ByteDance-HEVC/` with per-clip probe data in `videos.json`: 37 transcode on the **hardware**
+path, the 22 that don't are exactly the 8K/5.7K set and the RExt 4:2:2/4:4:4/mono/12-bit set.)
+
+"Not supported" here means **not via this HW path** — those inputs still transcode via stock
+*software* HEVC decode (`ffmpeg -i in -vf scale,format=yuv420p -c:v h264_v4l2m2m`; only the encode is
+HW). That's real-time at ≤1080p but software-decode-bound at 4K (4K 4:2:2 10-bit ≈0.05×, offline
+only). Notably the non-4:2:0/12-bit group needs **no new unpack kernels** — the Pi 4 never
+hardware-decodes them (no SAND frame is produced), so it's purely a wrapper-routing question. See
+`TODO-rpi-input-support.md`.
 
 ## What this fork adds
 
