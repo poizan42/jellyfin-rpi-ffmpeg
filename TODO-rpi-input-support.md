@@ -38,18 +38,25 @@ correct downconvert, which swscale already does; mono → 4:2:0 with neutral chr
 HEVC and select the software path (plain `-i` + swscale + `h264_v4l2m2m`) instead of the SAND hwaccel
 path (which can't apply). No `av_rpi_sand30_*` variant, no `vf_sand_to_yuv420p_drm` change.
 
-**Perf is software-HEVC-decode-bound and resolution-gated:**
-- **≤1080p:** software decode is comfortably real-time → usable live. (Functionally confirmed; the
-  corpus's only low-res non-4:2:0 clips are 1-frame test patterns, so no throughput figure, but
-  720/1080p sw HEVC on the A72 is well within real-time.)
-- **4K:** far below real-time — **4K 4:2:2 10-bit 60p measured ~0.05× (3.3 fps)** end-to-end, with
-  decode-only ~0.063× (3.7 fps): the swscale downconvert+resize+HW-encode add only ~15%; sw HEVC
-  decode is essentially the entire cost. **Nothing our filter/kernel work can move** — this merges
-  into the §2 software-decode/offline track (the only lever is faster sw HEVC decode, i.e. upstream).
+**Perf is software-HEVC-decode-bound — and (measured on real multi-frame clips) below real-time even
+at 1080p:**
+- **1080p 4:4:4 10-bit: ~0.48× (12 fps)** end-to-end; decode-only ~0.63× (15 fps). So even 1080p is
+  NOT live — the swscale downconvert + resize + HW encode add ~20%, but the sw HEVC decode ceiling
+  (15 fps) is already sub-real-time for 10-bit 4:4:4 (2× the chroma of 4:2:0). (`hevc_2K24P_rext_10bit_444_yuv444p10le_1`, 24p.)
+- **4K: ~0.05–0.10×** — 4K 4:2:2 10-bit ~0.05× (≈3 fps, both `…eos_r5c` and `hevc_4k50P`), 4K 12-bit
+  4:4:4 ~0.10× (2.5 fps, `hevc_4K24P_rext_12bit_444_yuv444p12le_1`). Deeply offline.
+- The downconvert/scale/encode are only ~15–20% of the cost; **sw HEVC decode is the wall, so no
+  kernel work reaches real-time** — a *free* downconvert still caps at the ~15 fps decode ceiling
+  at 1080p. The only lever is faster sw HEVC decode (upstream libavcodec / threading), same as §2.
+- Not measured: low-res 8-bit RExt (lighter — may approach real-time) — the corpus's only such clips
+  are 1-frame test patterns, so **don't assume any of these are live**.
 
-**Net: no kernels needed.** Deliverables shrink to (a) wrapper routing for non-4:2:0/>10-bit HEVC →
-software path; (b) treat 4K+ of these as offline-only (with §2). If an HDR non-4:2:0 clip ever appears
-(rare — these are mostly SDR/log camera formats), the software path can chain the CPU `zscale`/tonemap.
+**Net: no kernels needed, and effectively offline/batch on the Pi 4 at real resolutions.** Deliverables
+shrink to (a) wrapper routing for non-4:2:0/>10-bit HEVC → software path (correctness is free there);
+(b) treat the whole group as offline (merge with §2); real-time is not on offer. If an HDR non-4:2:0
+clip appears (e.g. the corpus's `hevc_4k24P_rext_12bit_444_pq`, SMPTE2084 4:4:4 — 4K, so offline
+anyway), the software path must add a CPU tone-map (`zscale`/libplacebo; note the lean production
+build has no `zscale`) or it comes out washed-out like `tm=none`.
 
 ## 2. `FAIL-hwdecode` — >4K resolution (want: optimize eventually; real-time unlikely)
 

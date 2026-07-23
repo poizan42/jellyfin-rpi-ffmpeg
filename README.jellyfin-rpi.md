@@ -54,10 +54,10 @@ path, the 22 that don't are exactly the 8K/5.7K set and the RExt 4:2:2/4:4:4/mon
 
 "Not supported" here means **not via this HW path** — those inputs still transcode via stock
 *software* HEVC decode (`ffmpeg -i in -vf scale,format=yuv420p -c:v h264_v4l2m2m`; only the encode is
-HW). That's real-time at ≤1080p but software-decode-bound at 4K (4K 4:2:2 10-bit ≈0.05×, offline
-only). Notably the non-4:2:0/12-bit group needs **no new unpack kernels** — the Pi 4 never
-hardware-decodes them (no SAND frame is produced), so it's purely a wrapper-routing question. See
-`TODO-rpi-input-support.md`.
+HW), so it's a wrapper-routing question, **not new kernels** (the Pi 4 never hardware-decodes them —
+no SAND frame is produced). But software HEVC decode is the wall and it's **below real-time even at
+1080p** (1080p 4:4:4 10-bit ≈0.48× / 12 fps; 4K 4:2:2/4:4:4 ≈0.05–0.10×), so treat this whole group
+as **offline/batch on the Pi 4**, not live. See `TODO-rpi-input-support.md`.
 
 ## What this fork adds
 
