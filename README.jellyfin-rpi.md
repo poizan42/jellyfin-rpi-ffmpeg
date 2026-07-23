@@ -31,6 +31,27 @@ and keeps everything else on fixed-function hardware, zero-copy.
 | bcm2835 codec | `h264_v4l2m2m`, `/dev/video11` | 8-bit H.264 encode |
 | V3D (Vulkan) | `/dev/dri/renderD128` | evaluated for offload — **lost** (scattered-read latency); not used |
 
+## Supported input
+
+What the pipeline can ingest is fixed by the hardware above: the **rpivid** decoder (HEVC
+Main/Main10, ≤4K) and the **4:2:0-only** SAND→YU12 unpack. The encoder is 8-bit H.264 4:2:0 ≤1080p,
+so any 4K source is downscaled first (`scale_v4l2m2m`, or `out=half` for exact 2:1).
+
+| dimension | supported | not supported |
+|---|---|---|
+| codec | **HEVC** (rpivid) | H.264 / VP9 / AV1 (rpivid is HEVC-only) |
+| chroma + depth | **4:2:0, 8-bit or 10-bit** | 4:2:2, 4:4:4, 4:0:0 (mono), 12-bit |
+| profile | Main, Main 10, **and Range-Extensions *if* the format is 4:2:0 8/10-bit**; Main Still Picture; MV-HEVC (base view) | any profile whose *pixel format* is outside 4:2:0 8/10-bit |
+| resolution | up to 4K (3840×2160) | 5.7K, 8K (decoder rejects the buffer size) |
+| dynamic range | SDR (BT.709), HDR10 (PQ), HLG, **Dolby Vision P5** (RPU→HDR10) and P8.1 (HDR10 base) | — (DV P7 dual-layer expected to decode its HDR10 base only, EL/RPU ignored — untested, no P7 sample) |
+| output | 8-bit H.264 4:2:0, **≤1080p** (downscale 4K first) | 4K H.264 (encoder is 1080p/level-4.0) |
+
+**Gate on pixel format, not profile string.** A `Range Extensions`-tagged stream that is actually
+4:2:0 8/10-bit decodes and transcodes fine — only the chroma/bit-depth outside 4:2:0 8/10-bit is the
+real limit. (Empirically confirmed against the ByteDance HEVC demo corpus — 59 clips in
+`samples/ByteDance-HEVC/` with per-clip probe data in `videos.json`: 37 transcode, the 22 that don't
+are exactly the 8K/5.7K set and the RExt 4:2:2/4:4:4/mono/12-bit set.)
+
 ## What this fork adds
 
 ### 1. NEON SAND30 → planar kernels  (`libavutil/`)
