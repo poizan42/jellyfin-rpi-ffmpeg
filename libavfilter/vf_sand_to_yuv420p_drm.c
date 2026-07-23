@@ -44,9 +44,12 @@
 #include "libavutil/opt.h"
 #include "rpi_tonemap_tables.h"   /* ff_rpi_tm_luma1d/cb1d/cr1d, ff_rpi_tm_lut3d, RPI_TM_LUT3D_N */
 
-enum { TM_NONE = 0, TM_FAST, TM_ACCURATE, TM_P5, TM_P5_FAST };
-/* TM_P5: Dolby Vision profile 5, full 3D luma+chroma. TM_P5_FAST: 1D-luma (neutral-chroma)
- * approximation + 3D chroma — injected when a P5 frame is transcoded with tm=fast. */
+enum { TM_NONE = 0, TM_FAST, TM_VERYFAST, TM_ACCURATE, TM_P5, TM_P5_FAST, TM_P5_VERYFAST };
+/* TM_VERYFAST: HDR10 -> same as TM_FAST (already real-time); DV P5 -> TM_P5_VERYFAST.
+ * TM_P5: Dolby Vision profile 5, full 3D luma+chroma. TM_P5_FAST: 1D-luma (neutral-chroma)
+ * approximation + 3D chroma — injected when a P5 frame is transcoded with tm=fast.
+ * TM_P5_VERYFAST: 1D-luma + *nearest-neighbour* 3D chroma (one gather, no tetra blend) —
+ * injected for P5 with tm=veryfast; ~+6% vs P5-fast, colour-approximate (grid-snapped chroma). */
 
 #ifndef O_CLOEXEC
 #define O_CLOEXEC 0
@@ -825,6 +828,67 @@ static void p5_chroma_row(uint8_t *OU, uint8_t *OV, const uint16_t *Y0, const ui
     p5_chroma_scalar(OU, OV, Y0, Y1, U, V, lut, MY, MC, cw, x);
 }
 
+/* P5 chroma, NEAREST-NEIGHBOUR (tm=veryfast): round (avgY,Cb,Cr) to one grid cell -> a
+ * single gather, no tetra select / weighted sum. ~halves the chroma apply arithmetic;
+ * colour-approximate (snaps across the 33^3 grid ~28-code cells, visible on smooth
+ * gradients). Opt-in speed tier; the tetrahedral p5_chroma_row stays the P5 default. */
+static void p5_chroma_nn_scalar(uint8_t *OU, uint8_t *OV, const uint16_t *Y0, const uint16_t *Y1,
+                                const uint16_t *U, const uint16_t *V, const uint8_t *lut,
+                                int MY, int MC, unsigned cw, unsigned x0)
+{
+    const int N = RPI_TM_LUT3D_N, LIMQ = (N-1)<<8;
+    for (unsigned x=x0; x<cw; x++) {
+        int avgY4 = (Y0[2*x]&1023)+(Y0[2*x+1]&1023)+(Y1[2*x]&1023)+(Y1[2*x+1]&1023);
+        int yq=(int)(((int64_t)avgY4*MY+32768)>>16);
+        int uq=(int)(((int64_t)(U[x]&1023)*MC+32768)>>16);
+        int vq=(int)(((int64_t)(V[x]&1023)*MC+32768)>>16);
+        yq=yq<0?0:(yq>LIMQ?LIMQ:yq); uq=uq<0?0:(uq>LIMQ?LIMQ:uq); vq=vq<0?0:(vq>LIMQ?LIMQ:vq);
+        int yi=(yq+128)>>8, ui=(uq+128)>>8, vi=(vq+128)>>8;   /* round to nearest cell */
+        yi = yi>N-1 ? N-1 : yi;
+        ui = ui>N-1 ? N-1 : ui;
+        vi = vi>N-1 ? N-1 : vi;
+        const uint8_t *c=&lut[((yi*N+ui)*N+vi)*3];
+        OU[x]=c[1]; OV[x]=c[2];
+    }
+}
+static void p5_chroma_nn_row(uint8_t *OU, uint8_t *OV, const uint16_t *Y0, const uint16_t *Y1,
+                             const uint16_t *U, const uint16_t *V, const uint8_t *lut,
+                             int MY, int MC, unsigned cw)
+{
+    unsigned x = 0;
+#if defined(__aarch64__)
+    enum { N = RPI_TM_LUT3D_N };
+    const int32x4_t v32768=vdupq_n_s32(32768), v128=vdupq_n_s32(128), vz=vdupq_n_s32(0);
+    const int32x4_t vLIMQ=vdupq_n_s32((N-1)<<8), vNm1=vdupq_n_s32(N-1);
+    const int32x4_t vMY=vdupq_n_s32(MY), vMC=vdupq_n_s32(MC), vN=vdupq_n_s32(N), vST=vdupq_n_s32(3);
+    const uint16x8_t m1023q=vdupq_n_u16(1023), m8q=vdupq_n_u16(0xff);
+    /* q = clamp((val*M + 32768)>>16, 0, LIMQ); idx = min((q+128)>>8, N-1) */
+#define NNIDX(val,vM) vminq_s32(vshrq_n_s32(vaddq_s32( \
+        vminq_s32(vmaxq_s32(vshrq_n_s32(vaddq_s32(vmulq_s32(val,vM),v32768),16),vz),vLIMQ), v128),8), vNm1)
+#define NNOFF(vy,vu,vv) vmulq_s32(vaddq_s32(vmulq_s32(vaddq_s32(vmulq_s32(vy,vN),vu),vN),vv),vST)
+    for (; x + 8 <= cw; x += 8) {
+        uint16x8_t y0a=vld1q_u16(Y0+2*x), y0b=vld1q_u16(Y0+2*x+8);
+        uint16x8_t y1a=vld1q_u16(Y1+2*x), y1b=vld1q_u16(Y1+2*x+8);
+        uint16x8_t avg=vaddq_u16(vpaddq_u16(y0a,y0b), vpaddq_u16(y1a,y1b));   /* 8 avgY4 */
+        uint16x8_t U8=vandq_u16(vld1q_u16(U+x),m1023q), V8=vandq_u16(vld1q_u16(V+x),m1023q);
+        int32x4_t Ylo=vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(avg))), Yhi=vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(avg)));
+        int32x4_t Ulo=vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(U8))),  Uhi=vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(U8)));
+        int32x4_t Vlo=vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(V8))),  Vhi=vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(V8)));
+        int32x4_t offl=NNOFF(NNIDX(Ylo,vMY),NNIDX(Ulo,vMC),NNIDX(Vlo,vMC));
+        int32x4_t offh=NNOFF(NNIDX(Yhi,vMY),NNIDX(Uhi,vMC),NNIDX(Vhi,vMC));
+        int32_t off[8]; uint16_t g[8];
+        vst1q_s32(off,offl); vst1q_s32(off+4,offh);
+        for (int i=0;i<8;i++) memcpy(&g[i], lut+off[i]+1, 2);   /* one u16 (Cb|Cr) per lane */
+        uint16x8_t h=vld1q_u16(g);
+        vst1_u8(OU+x, vqmovn_u16(vandq_u16(h,m8q)));
+        vst1_u8(OV+x, vqmovn_u16(vshrq_n_u16(h,8)));
+    }
+#undef NNIDX
+#undef NNOFF
+#endif
+    p5_chroma_nn_scalar(OU, OV, Y0, Y1, U, V, lut, MY, MC, cw, x);
+}
+
 /* P5 apply for one chunk: luma (full-res Y + co-sited chroma) + chroma (block-avg Y). */
 static void p5_apply_chunk(const TMData *td, const AVFrame *S, unsigned ybase, unsigned ch)
 {
@@ -837,7 +901,8 @@ static void p5_apply_chunk(const TMData *td, const AVFrame *S, unsigned ybase, u
     if (selfcheck < 0) selfcheck = !!getenv("SAND_TM_SELFCHECK");
     /* luma: TM_P5_FAST -> cheap 1D neutral-chroma curve (skips the full-res 3D lookup);
      * TM_P5 -> full-res 3D lookup with nearest (replicated) chroma. */
-    const int fast = (td->tm == TM_P5_FAST);
+    const int fast = (td->tm == TM_P5_FAST || td->tm == TM_P5_VERYFAST);
+    const int nn   = (td->tm == TM_P5_VERYFAST);   /* nearest-neighbour chroma */
     for (unsigned r=0; r<ch; r++) {
         const uint16_t *Y=(const uint16_t*)S->data[0]+(size_t)r*sy;
         const uint16_t *U=(const uint16_t*)S->data[1]+(size_t)(r/2)*su;
@@ -861,10 +926,12 @@ static void p5_apply_chunk(const TMData *td, const AVFrame *S, unsigned ybase, u
         const uint16_t *V=(const uint16_t*)S->data[2]+(size_t)cr*sv;
         uint8_t *OU=D->data[1]+(size_t)(ybase/2+cr)*D->linesize[1];
         uint8_t *OV=D->data[2]+(size_t)(ybase/2+cr)*D->linesize[2];
-        p5_chroma_row(OU, OV, Y0, Y1, U, V, lut, MYC, MC, cw);
+        if (nn) p5_chroma_nn_row(OU, OV, Y0, Y1, U, V, lut, MYC, MC, cw);
+        else    p5_chroma_row   (OU, OV, Y0, Y1, U, V, lut, MYC, MC, cw);
         if (selfcheck) {
             uint8_t *ru=av_malloc(cw),*rv=av_malloc(cw); unsigned mx=0;
-            if (ru&&rv){ p5_chroma_scalar(ru,rv,Y0,Y1,U,V,lut,MYC,MC,cw,0);
+            if (ru&&rv){ if (nn) p5_chroma_nn_scalar(ru,rv,Y0,Y1,U,V,lut,MYC,MC,cw,0);
+                         else    p5_chroma_scalar   (ru,rv,Y0,Y1,U,V,lut,MYC,MC,cw,0);
                 for (unsigned x=0;x<cw;x++){ unsigned d=OU[x]>ru[x]?OU[x]-ru[x]:ru[x]-OU[x]; if(d>mx)mx=d;
                     d=OV[x]>rv[x]?OV[x]-rv[x]:rv[x]-OV[x]; if(d>mx)mx=d; }
                 if (mx) av_log(NULL,AV_LOG_WARNING,"P5 chroma selfcheck row %u: max %u\n",cr,mx); }
@@ -979,7 +1046,7 @@ static int tm_slice(AVFilterContext *avctx, void *arg, int jobnr, int nb_jobs)
         src.crop_bottom = td->src->height - (td->src->crop_top + y + ch);
         rv = av_rpi_sand_to_planar_frame(&s10, &src);   /* SAND30 -> 10-bit scratch */
         if (!rv) {                                      /* 10-bit -> 8-bit YU12       */
-            if (td->tm == TM_P5 || td->tm == TM_P5_FAST) p5_apply_chunk(td, &s10, y, ch);
+            if (td->tm == TM_P5 || td->tm == TM_P5_FAST || td->tm == TM_P5_VERYFAST) p5_apply_chunk(td, &s10, y, ch);
             else                 tm_apply_chunk(td, &s10, y, ch);
         }
     }
@@ -1083,7 +1150,9 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
         /* HDR tone-map: cache-tiled SAND -> 10-bit scratch -> LUT -> 8-bit YU12
          * (single-pass DRAM traffic; scratch stays L2-resident). */
         TMData tdm = { .dst = tmp, .src = mapped, .H = h,
-                       .tm = is_p5 ? (s->tm == TM_FAST ? TM_P5_FAST : TM_P5) : s->tm,
+                       .tm = is_p5 ? (s->tm == TM_VERYFAST ? TM_P5_VERYFAST :
+                                      s->tm == TM_FAST     ? TM_P5_FAST     : TM_P5)
+                                   : (s->tm == TM_VERYFAST ? TM_FAST : s->tm),
                        .l64      = is_hlg ? s->l64_hlg      : s->l64,
                        .cb64     = is_hlg ? s->cb64_hlg     : s->cb64,
                        .cr64     = is_hlg ? s->cr64_hlg     : s->cr64,
@@ -1179,6 +1248,7 @@ static const AVOption sand_to_yuv420p_drm_options[] = {
       AV_OPT_TYPE_INT, { .i64 = TM_NONE }, TM_NONE, TM_ACCURATE, FLAGS, .unit = "tm" },
         { "none",     "no tone-map (10->8 truncation)",       0, AV_OPT_TYPE_CONST, { .i64 = TM_NONE },     0, 0, FLAGS, .unit = "tm" },
         { "fast",     "separable, real-time, colour approx.", 0, AV_OPT_TYPE_CONST, { .i64 = TM_FAST },     0, 0, FLAGS, .unit = "tm" },
+        { "veryfast", "like fast; DV P5 uses nearest chroma (faster, colour-approx)", 0, AV_OPT_TYPE_CONST, { .i64 = TM_VERYFAST }, 0, 0, FLAGS, .unit = "tm" },
         { "accurate", "3D-LUT, luma-aware (matches zscale)",  0, AV_OPT_TYPE_CONST, { .i64 = TM_ACCURATE }, 0, 0, FLAGS, .unit = "tm" },
     { NULL }
 };

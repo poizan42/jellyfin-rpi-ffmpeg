@@ -54,7 +54,7 @@ eating ~1.2 CPU cores as swscale. Properly `configure`-integrated
 - Pooled CMA dma-bufs (dma-heap) for the output; DRM_PRIME → zero-copy into the encoder.
 - `SAND_PROF=1` env var: per-phase profiler (map / unpack / flush / unmap μs/frame).
 
-### 3. HDR→SDR tone-mapping  (`tm=none|fast|accurate` option on the bridge filter)
+### 3. HDR→SDR tone-mapping  (`tm=none|fast|veryfast|accurate` option on the bridge filter)
 Without it, HDR10 (PQ/BT.2020) sources transcode with a plain 10→8-bit truncation → washed-out.
 Two tiers, both tuned to match FFmpeg's `zscale+tonemap=hable` (chosen by eye) and **baked
 directly from that chain** into embedded LUTs (`libavfilter/rpi_tonemap_gen.py` →
@@ -95,6 +95,13 @@ P5 honours the `tm=` knob: `tm=none`/`accurate` (default) → the full 3D luma+c
 alongside the 3D LUT) while keeping chroma the full 3D path, so it drops the ~8.3M/frame 3D luma
 lookups. **~1.0× at 4K (real-time)**; luma within ~45–51 dB of the 3D path on real frames
 (chroma bit-identical). Colour-approximate but correct-hued — the accurate path stays the default.
+**`tm=veryfast`** → like fast, but the 3D chroma tetrahedral apply is replaced by a **nearest grid
+cell** lookup (one gather, no 4-tap blend): **~1.02–1.05× at 4K** (+~6% over fast, for real headroom
+past real-time so background load doesn't stutter playback). Colour is coarser — chroma snaps across
+the 33³ grid's ~28-code cells, so smooth gradients (skies, water) can show mild blotching (~38 dB vs
+the tetrahedral chroma on the worst HDR content). Opt-in speed tier; fast/accurate stay the defaults.
+On HDR10/HLG sources `tm=veryfast` is identical to `tm=fast` (their chroma is already the cheap
+separable path — only P5's cross-channel 3D chroma has anything to drop).
 
 Deferred (see `TODO-rpi-tonemap.md`): command-line-tunable peak/operator/saturation, a BT.2390
 operator (`op=bt2390`), non-1000-nit peaks, 32-bit ARM parity for the tone LUTs.
@@ -152,6 +159,7 @@ HDR10 source — add `tm=fast` (real-time) or `tm=accurate` (quality):
 | 10-bit HEVC HDR10 4K (3840×2160), `tm=accurate` | ~0.94× | quality tier (NEON tetrahedral 3D-LUT); near real-time |
 | 10-bit HEVC Dolby Vision **profile 5** 4K (3840×2160), default/`tm=accurate` | ~0.60× | correct colour via per-RPU 3D LUT + NEON tetrahedral (luma is a full 3D lookup); scalar was 0.15× |
 | 10-bit HEVC Dolby Vision **profile 5** 4K (3840×2160), `tm=fast` | ~1.0× | **real-time**; 1D neutral-chroma luma approx + full 3D chroma; luma ~45–51 dB vs accurate, chroma identical |
+| 10-bit HEVC Dolby Vision **profile 5** 4K (3840×2160), `tm=veryfast` | ~1.02–1.05× | **real-time + headroom**; fast luma + nearest-cell 3D chroma; +~6% over fast, chroma ~38 dB vs tetrahedral (grid-snapped, mild blotching on smooth gradients) |
 
 The 4K unpack is **memory-latency-bound** on the scattered SAND reads (same wall that made the
 V3D GPU offload lose). Threading reaches the shared-bus ceiling with ~2–3 cores; the levers above
