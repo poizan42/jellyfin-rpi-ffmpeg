@@ -53,7 +53,9 @@ at 1080p:**
 
 **Net: no kernels needed, and effectively offline/batch on the Pi 4 at real resolutions.** Deliverables
 shrink to (a) wrapper routing for non-4:2:0/>10-bit HEVC → software path (correctness is free there);
-(b) treat the whole group as offline (merge with §2); real-time is not on offer. If an HDR non-4:2:0
+(b) treat the whole group as offline (merge with §2); real-time is not on offer. **The routing rule
+(a) is now specified** — see `README.jellyfin-rpi.md` §Path selection + the reference implementation
+`tools/rpi-transcode-path.sh` (validated: routes all 59 corpus clips to the path that actually works). If an HDR non-4:2:0
 clip appears (e.g. the corpus's `hevc_4k24P_rext_12bit_444_pq`, SMPTE2084 4:4:4 — 4K, so offline
 anyway), the software path must add a CPU tone-map (`zscale`/libplacebo; note the lean production
 build has no `zscale`) or it comes out washed-out like `tm=none`.

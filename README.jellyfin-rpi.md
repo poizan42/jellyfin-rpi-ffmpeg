@@ -59,6 +59,35 @@ no SAND frame is produced). But software HEVC decode is the wall and it's **belo
 1080p** (1080p 4:4:4 10-bit ≈0.48× / 12 fps; 4K 4:2:2/4:4:4 ≈0.05–0.10×), so treat this whole group
 as **offline/batch on the Pi 4**, not live. See `TODO-rpi-input-support.md`.
 
+## Path selection
+
+Which route an input takes follows directly from its **pixel format + resolution** (per the matrix
+above) plus the target size. `tools/rpi-transcode-path.sh <input> [WxH]` is the reference
+implementation of this rule (validated below); the production selector lives in the Jellyfin
+transcoding wrapper.
+
+| condition (HEVC input) | route | ffmpeg shape |
+|---|---|---|
+| 4:2:0 8/10-bit, ≤4K | **HW** (rpivid+SAND, real-time) | `-hwaccel drm -hwaccel_output_format drm_prime -i IN -vf sand_to_yuv420p_drm=tm=<tm>[…] -c:v h264_v4l2m2m` |
+| non-4:2:0 / 12-bit, or >4K | **SW** (software decode, offline) | `-i IN -vf [TM,]scale=W:H,format=yuv420p -c:v h264_v4l2m2m` |
+| non-HEVC | out of scope (rpivid is HEVC-only) | — |
+
+On the **HW path** the flags derive as:
+- `tm` = `none` for SDR, `fast` (real-time) for HDR, where **HDR = `color_transfer` ∈ {smpte2084,
+  arib-std-b67} OR Dolby Vision present**. DV must be read from *side data* — a DV P5 stream reports
+  `color_transfer=unknown`, so a transfer-only test misses it (the filter reconstructs P5/P8 regardless,
+  but detecting DV is what selects the fast real-time tier over the slow default). `accurate` is opt-in.
+- downscale: **exact 2:1** (`target == input/2`, dims multiples of 4) → `:out=half` (fused, drops
+  `scale_v4l2m2m`); any other downscale → `,scale_v4l2m2m=W:H`; none → no scale. Target must be ≤1080p
+  (encoder cap).
+
+On the **SW path** (offline — sub-real-time: 1080p 4:4:4 10-bit ≈0.48×, 4K ≈0.05–0.10×) HDR additionally
+needs a CPU tone-map (`zscale=t=linear:npl=100,tonemap=hable,zscale=t=bt709…`; needs a `zscale`-enabled build).
+
+**Validated** against the 59-clip ByteDance corpus (`samples/ByteDance-HEVC/`): the selector routes
+**37→HW / 22→SW** at a 720p target — matching every clip's measured `hw_transcode` verdict (0 mismatches)
+— and emits `out=half` for all 30 4K 4:2:0 clips at a 1080p target.
+
 ## What this fork adds
 
 ### 1. NEON SAND30 → planar kernels  (`libavutil/`)
