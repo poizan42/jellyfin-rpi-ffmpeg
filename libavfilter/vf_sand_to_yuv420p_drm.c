@@ -100,6 +100,7 @@ typedef struct BridgeContext {
     int      mcache_n;
     unsigned mmap_count;   /* SAND_PROF: distinct input buffers mmap'd (should plateau) */
     int      tm;           /* TM_NONE / TM_FAST / TM_ACCURATE (option) */
+    int      out_half;     /* out= option: 0 full, 1 half (emit input/2, drop ISP scale) */
     uint8_t  l64[64], cb64[64], cr64[64];  /* 64-entry tbl LUTs (subsampled at init) */
     uint8_t  l64_next[64];                 /* l64_next[i]=curve((i+1)*16); for the single-pass .S kernel */
     uint8_t  l64_hlg[64], cb64_hlg[64], cr64_hlg[64], l64_next_hlg[64];  /* HLG variants */
@@ -217,8 +218,17 @@ static av_cold void uninit(AVFilterContext *avctx)
 static int config_output(AVFilterLink *outlink)
 {
     AVFilterLink *inlink = outlink->src->inputs[0];
-    outlink->w = inlink->w;
-    outlink->h = inlink->h;   /* same size; the ISP scaler downstream does the resize */
+    BridgeContext *s = outlink->src->priv;
+    /* out=half: emit input/2 directly (fused 2x2 downscale in the apply), dropping the
+     * downstream ISP scale. Only for exact 2:1 (w,h multiple of 4 so luma 2x2 + chroma
+     * 4x4 tile cleanly); otherwise fall back to full and let the ISP resize. */
+    const int half = s->out_half && (inlink->w % 4 == 0) && (inlink->h % 4 == 0);
+    if (s->out_half && !half)
+        av_log(outlink->src, AV_LOG_WARNING,
+               "out=half ignored: input %dx%d not a multiple of 4; emitting full size\n",
+               inlink->w, inlink->h);
+    outlink->w = half ? inlink->w / 2 : inlink->w;
+    outlink->h = half ? inlink->h / 2 : inlink->h;   /* full: ISP scaler downstream resizes */
     outlink->time_base = inlink->time_base;
     outlink->sample_aspect_ratio = inlink->sample_aspect_ratio;
 
@@ -238,8 +248,8 @@ static int config_output(AVFilterLink *outlink)
         AVHWFramesContext *out_fc = (AVHWFramesContext *)out_ref->data;
         out_fc->format    = AV_PIX_FMT_DRM_PRIME;
         out_fc->sw_format = AV_PIX_FMT_YUV420P;
-        out_fc->width     = inlink->w;
-        out_fc->height    = inlink->h;
+        out_fc->width     = outlink->w;
+        out_fc->height    = outlink->h;
         int ret = av_hwframe_ctx_init(out_ref);
         if (ret < 0) {
             av_buffer_unref(&out_ref);
@@ -338,8 +348,9 @@ static int frame_is_hdr(const AVFrame *in)
 typedef struct TMData {
     AVFrame       *dst;   /* 8-bit YU12 (dma-buf) */
     const AVFrame *src;   /* SAND mapped frame    */
-    unsigned       H;     /* luma height          */
+    unsigned       H;     /* luma height (input)  */
     int            tm;
+    int            half;  /* out=half: 2x2-downscale + apply at input/2, emit 1080p directly */
     const uint8_t *l64, *cb64, *cr64;  /* 64-entry tbl LUTs (fast NEON path) */
     const uint8_t *l64_next;           /* pairs with l64 for the single-pass .S kernel */
     /* Active full-res tables for this frame's transfer (PQ or HLG). */
@@ -1015,9 +1026,100 @@ static void tm_apply_chunk(const TMData *td, const AVFrame *S, unsigned ybase, u
     }
 }
 
+/* out=half: box-average a 2x2 of a 10-bit plane into one output row of width dw
+ * ((a+b+c+d+2)>>2). s0,s1 are the two source rows (uint16). Scalar ref + NEON. */
+static void box2x2_row_scalar(uint16_t *d, const uint16_t *s0, const uint16_t *s1, unsigned dw, unsigned x0)
+{
+    for (unsigned x = x0; x < dw; x++)
+        d[x] = (uint16_t)((s0[2*x] + s0[2*x+1] + s1[2*x] + s1[2*x+1] + 2) >> 2);
+}
+static void box2x2_row(uint16_t *d, const uint16_t *s0, const uint16_t *s1, unsigned dw)
+{
+    unsigned x = 0;
+#if defined(__aarch64__)
+    for (; x + 8 <= dw; x += 8) {
+        uint16x8_t a0 = vld1q_u16(s0 + 2*x), a1 = vld1q_u16(s0 + 2*x + 8);
+        uint16x8_t b0 = vld1q_u16(s1 + 2*x), b1 = vld1q_u16(s1 + 2*x + 8);
+        uint16x8_t ps0 = vpaddq_u16(a0, a1), ps1 = vpaddq_u16(b0, b1);  /* horiz pairs */
+        vst1q_u16(d + x, vrshrq_n_u16(vaddq_u16(ps0, ps1), 2));         /* (sum+2)>>2 */
+    }
+#endif
+    box2x2_row_scalar(d, s0, s1, dw, x);
+}
+
 static int tm_slice(AVFilterContext *avctx, void *arg, int jobnr, int nb_jobs)
 {
     const TMData *td = arg;
+
+    if (td->half) {
+        /* out=half: unpack each TM_CHUNK band of the 4K source to a full-width 10-bit
+         * scratch, box-average 2x2 -> half-res scratch, then run the EXISTING apply at
+         * input/2 into the half-res dst (emitted 1080p directly, no ISP scale). */
+        const unsigned H = td->H;
+        const unsigned Wo = td->dst->width, cwo = Wo / 2;   /* output (half) dims */
+        const unsigned Ws = Wo * 2, cws = Ws / 2;           /* source (input) dims */
+        unsigned y0 = ((uint64_t)H *  jobnr      / nb_jobs) & ~3u;   /* whole 2x2 blocks */
+        unsigned y1 = (jobnr == nb_jobs - 1) ? H : (((uint64_t)H * (jobnr + 1) / nb_jobs) & ~3u);
+        if (y1 <= y0)
+            return 0;
+        uint16_t *sy = av_malloc((size_t)TM_CHUNK * Ws * 2);
+        uint16_t *su = av_malloc((size_t)(TM_CHUNK/2) * cws * 2);
+        uint16_t *sv = av_malloc((size_t)(TM_CHUNK/2) * cws * 2);
+        uint16_t *hy = av_malloc((size_t)(TM_CHUNK/2) * Wo * 2);
+        uint16_t *hu = av_malloc((size_t)(TM_CHUNK/4 + 1) * cwo * 2);
+        uint16_t *hv = av_malloc((size_t)(TM_CHUNK/4 + 1) * cwo * 2);
+        if (!sy || !su || !sv || !hy || !hu || !hv) {
+            av_free(sy); av_free(su); av_free(sv); av_free(hy); av_free(hu); av_free(hv);
+            return AVERROR(ENOMEM);
+        }
+        AVFrame s10 = { 0 }, s10h = { 0 };
+        s10.format = AV_PIX_FMT_YUV420P10; s10.width = Ws;
+        s10.data[0] = (uint8_t *)sy; s10.linesize[0] = Ws  * 2;
+        s10.data[1] = (uint8_t *)su; s10.linesize[1] = cws * 2;
+        s10.data[2] = (uint8_t *)sv; s10.linesize[2] = cws * 2;
+        s10h.format = AV_PIX_FMT_YUV420P10; s10h.width = Wo;
+        s10h.data[0] = (uint8_t *)hy; s10h.linesize[0] = Wo  * 2;
+        s10h.data[1] = (uint8_t *)hu; s10h.linesize[1] = cwo * 2;
+        s10h.data[2] = (uint8_t *)hv; s10h.linesize[2] = cwo * 2;
+        int rv = 0;
+        for (unsigned y = y0; y < y1 && !rv; y += TM_CHUNK) {
+            unsigned ch = FFMIN((unsigned)TM_CHUNK, y1 - y);   /* multiple of 4 (aligned) */
+            s10.height = ch;
+            AVFrame src = *td->src;
+            src.crop_top    = td->src->crop_top + y;
+            src.crop_bottom = td->src->height - (td->src->crop_top + y + ch);
+            rv = av_rpi_sand_to_planar_frame(&s10, &src);      /* SAND30 -> 10-bit scratch */
+            if (rv) break;
+            const unsigned lh = ch / 2, chr = ch / 4;          /* half luma / chroma rows */
+            for (unsigned oy = 0; oy < lh; oy++)
+                box2x2_row(hy + (size_t)oy*Wo, sy + (size_t)(2*oy)*Ws, sy + (size_t)(2*oy+1)*Ws, Wo);
+            for (unsigned oc = 0; oc < chr; oc++) {
+                box2x2_row(hu + (size_t)oc*cwo, su + (size_t)(2*oc)*cws, su + (size_t)(2*oc+1)*cws, cwo);
+                box2x2_row(hv + (size_t)oc*cwo, sv + (size_t)(2*oc)*cws, sv + (size_t)(2*oc+1)*cws, cwo);
+            }
+            s10h.height = lh;
+            if (td->tm == TM_NONE) {                            /* SDR / passthrough: 10->8 narrow */
+                for (unsigned r = 0; r < lh; r++) {
+                    uint8_t *O = td->dst->data[0] + (size_t)(y/2 + r) * td->dst->linesize[0];
+                    const uint16_t *Y = hy + (size_t)r*Wo;
+                    for (unsigned x = 0; x < Wo; x++) O[x] = Y[x] >> 2;
+                }
+                for (unsigned r = 0; r < chr; r++) {
+                    uint8_t *OU = td->dst->data[1] + (size_t)(y/4 + r) * td->dst->linesize[1];
+                    uint8_t *OV = td->dst->data[2] + (size_t)(y/4 + r) * td->dst->linesize[2];
+                    const uint16_t *U = hu + (size_t)r*cwo, *V = hv + (size_t)r*cwo;
+                    for (unsigned x = 0; x < cwo; x++) { OU[x] = U[x] >> 2; OV[x] = V[x] >> 2; }
+                }
+            } else if (td->tm == TM_P5 || td->tm == TM_P5_FAST || td->tm == TM_P5_VERYFAST) {
+                p5_apply_chunk(td, &s10h, y/2, lh);
+            } else {
+                tm_apply_chunk(td, &s10h, y/2, lh);
+            }
+        }
+        av_free(sy); av_free(su); av_free(sv); av_free(hy); av_free(hu); av_free(hv);
+        return rv;
+    }
+
     const unsigned H = td->H, W = td->dst->width, cw = W / 2;
     unsigned y0 = ((uint64_t)H *  jobnr      / nb_jobs) & ~1u;
     unsigned y1 = (jobnr == nb_jobs - 1) ? H : (((uint64_t)H * (jobnr + 1) / nb_jobs) & ~1u);
@@ -1117,8 +1219,12 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
 
     const unsigned w = av_frame_cropped_width(mapped);
     const unsigned h = av_frame_cropped_height(mapped);
-    const unsigned bpl = w;   /* YU12 pitch == width (ISP derives width from the Y pitch) */
-    const size_t ysz = (size_t)bpl * h, csz = ysz / 4, total = ysz + 2 * csz;
+    /* out=half: emit input/2 (fused 2x2 downscale in the apply), dropping the ISP scale.
+     * Only for exact 2:1 (w,h multiple of 4); else full size + downstream ISP resize. */
+    const int half = s->out_half && (w % 4 == 0) && (h % 4 == 0);
+    const unsigned wo = half ? w / 2 : w, ho = half ? h / 2 : h;
+    const unsigned bpl = wo;  /* YU12 pitch == width (ISP/encoder derive width from Y pitch) */
+    const size_t ysz = (size_t)bpl * ho, csz = ysz / 4, total = ysz + 2 * csz;
 
     if ((idx = pool_acquire(s, total, &fd, &map)) < 0) {
         av_log(avctx, AV_LOG_ERROR, "dma-buf pool exhausted/alloc failed\n");
@@ -1126,7 +1232,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     }
 
     if (!(tmp = av_frame_alloc())) { rv = AVERROR(ENOMEM); goto fail_release; }
-    tmp->format = AV_PIX_FMT_YUV420P; tmp->width = w; tmp->height = h;
+    tmp->format = AV_PIX_FMT_YUV420P; tmp->width = wo; tmp->height = ho;
     tmp->data[0] = (uint8_t *)map;             tmp->linesize[0] = bpl;
     tmp->data[1] = (uint8_t *)map + ysz;       tmp->linesize[1] = bpl / 2;
     tmp->data[2] = (uint8_t *)map + ysz + csz; tmp->linesize[2] = bpl / 2;
@@ -1151,6 +1257,16 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
      * reaches here as HLG — is_p5 requires !frame_is_hdr; and its own path uses p5_lut.) */
     const int is_hlg = in->color_trc == AVCOL_TRC_ARIB_STD_B67;
 
+    /* Effective apply tier for this frame. On the out=half path the nn+dither chroma
+     * bands (the ISP no longer averages it back), so veryfast collapses to the tetra
+     * P5_FAST; SDR/passthrough (only routed through the scratch path when half) is TM_NONE. */
+    int eff_tm;
+    if (!do_tm)      eff_tm = TM_NONE;
+    else if (is_p5)  eff_tm = half ? ((s->tm == TM_FAST || s->tm == TM_VERYFAST) ? TM_P5_FAST : TM_P5)
+                                   : (s->tm == TM_VERYFAST ? TM_P5_VERYFAST :
+                                      s->tm == TM_FAST     ? TM_P5_FAST     : TM_P5);
+    else             eff_tm = (s->tm == TM_VERYFAST) ? TM_FAST : s->tm;
+
     if (is_p5) {
         const AVDOVIMetadata *meta = (const AVDOVIMetadata *)dovi_sd->data;
         uint64_t hash = p5_calc_hash(meta);
@@ -1161,8 +1277,8 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
         }
     }
 
-    if (!do_tm) {
-        /* SDR / tm=none: single-pass SAND -> 8-bit YU12. */
+    if (!do_tm && !half) {
+        /* SDR / tm=none, full size: single-pass SAND -> 8-bit YU12. */
         ThreadData td = { .dst = tmp, .src = mapped, .H = h };
         dmabuf_sync(fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE);
         ff_filter_execute(avctx, unpack_slice, &td, rets, nb);
@@ -1175,12 +1291,10 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
                 rv = AVERROR(EINVAL); goto fail_release;
             }
     } else {
-        /* HDR tone-map: cache-tiled SAND -> 10-bit scratch -> LUT -> 8-bit YU12
-         * (single-pass DRAM traffic; scratch stays L2-resident). */
-        TMData tdm = { .dst = tmp, .src = mapped, .H = h,
-                       .tm = is_p5 ? (s->tm == TM_VERYFAST ? TM_P5_VERYFAST :
-                                      s->tm == TM_FAST     ? TM_P5_FAST     : TM_P5)
-                                   : (s->tm == TM_VERYFAST ? TM_FAST : s->tm),
+        /* Tone-map (or SDR when out=half): cache-tiled SAND -> 10-bit scratch ->
+         * [2x2 box-average when half] -> LUT/narrow -> 8-bit YU12. */
+        TMData tdm = { .dst = tmp, .src = mapped, .H = h, .half = half,
+                       .tm = eff_tm,
                        .l64      = is_hlg ? s->l64_hlg      : s->l64,
                        .cb64     = is_hlg ? s->cb64_hlg     : s->cb64,
                        .cr64     = is_hlg ? s->cr64_hlg     : s->cr64,
@@ -1228,7 +1342,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     b = NULL;   /* ownership -> out->buf[0] */
     out->data[0] = (uint8_t *)&((OutBuf *)out->buf[0]->data)->desc;
     out->format = AV_PIX_FMT_DRM_PRIME;
-    out->width = w; out->height = h;
+    out->width = wo; out->height = ho;
     av_frame_copy_props(out, in);
     out->crop_top = out->crop_left = out->crop_bottom = out->crop_right = 0;
     /* Use our own YU12 frames context (built in config_output) so the frame's
@@ -1278,6 +1392,10 @@ static const AVOption sand_to_yuv420p_drm_options[] = {
         { "fast",     "separable, real-time, colour approx.", 0, AV_OPT_TYPE_CONST, { .i64 = TM_FAST },     0, 0, FLAGS, .unit = "tm" },
         { "veryfast", "like fast; DV P5 uses nearest chroma (faster, colour-approx)", 0, AV_OPT_TYPE_CONST, { .i64 = TM_VERYFAST }, 0, 0, FLAGS, .unit = "tm" },
         { "accurate", "3D-LUT, luma-aware (matches zscale)",  0, AV_OPT_TYPE_CONST, { .i64 = TM_ACCURATE }, 0, 0, FLAGS, .unit = "tm" },
+    { "out", "output size: full, or half (emit input/2 directly, no ISP scale; needs exact 2:1)", OFFSET(out_half),
+      AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 1, FLAGS, .unit = "out" },
+        { "full", "same size as input (downstream ISP does any resize)", 0, AV_OPT_TYPE_CONST, { .i64 = 0 }, 0, 0, FLAGS, .unit = "out" },
+        { "half", "half width+height (fused 2x2 downscale; skip scale_v4l2m2m)", 0, AV_OPT_TYPE_CONST, { .i64 = 1 }, 0, 0, FLAGS, .unit = "out" },
     { NULL }
 };
 AVFILTER_DEFINE_CLASS(sand_to_yuv420p_drm);

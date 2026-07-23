@@ -100,6 +100,26 @@ The first guess was `poly-luma 1D-LUT + gather-free NEON-MMR chroma`. We went wi
 LUT instead: it reuses the validated tetrahedral apply, keeps all DV math scalar/off-hot-path
 (unit-testable), and correctly handles luma's cross-channel dependence (a 1D luma LUT can't).
 
+## `out=half` — fused 2×2 downscale for exact 4K→1080p — SHIPPED (big win)
+For a 2:1 downscale the filter emits 1080p directly (`out=half`): box-average 2×2 right after the SAND
+unpack (`box2x2_row`, NEON `vpaddq_u16`+`vrshrq_n_u16`, bit-exact vs scalar), run the **existing** apply
+at 1920×1080 / 960×540 into a half-res dst, and hand it straight to the encoder — **dropping the
+`scale_v4l2m2m` ISP stage**. Reuses `p5_apply_chunk`/`tm_apply_chunk` verbatim (they're dim-parameterized);
+the only new code is the box-average + a half branch in `tm_slice` + `out` option/plumbing. Co-siting is
+automatic (chroma `avgY4` becomes 2×2 of half-res luma = 4×4 of 4K). All P5 tiers use **tetrahedral chroma
+at half-res** (4× fewer sites → cheaper than the full-res nn path *and* better; `fast`/`veryfast` collapse
+to it, nn/dither unused on this path). **Measured 4K→1080p (single-tenant, 500-frame): DV P5 accurate
+0.66→1.12×, DV P5 fast/veryfast 0.90–0.93→1.19–1.25×, HDR10 accurate 0.89→1.26×** — all cross real-time.
+Two mechanisms, both real: the apply shrinks ~4×, *and* removing the ISP's ~15.5 MB/frame bus traffic
+relieves DRAM contention on the memory-latency-bound unpack (same filter: ~27 ms alone vs ~40 ms
+in-pipeline). Quality: ordering error (down-then-map vs map-then-down) negligible at 57–60 dB / max ~2
+codes (the order libplacebo/mpv use); box 2×2 vs ISP polyphase = slight softening. Deterministic,
+NEON==scalar; `out=full` (default) byte-identical. **So at 4K→1080p even DV P5 `tm=accurate` is real-time —
+the `dovi_tool` P5→P8.1 offline fallback is no longer needed for this ratio.** Note the early SDR NEON-scale
+concern didn't apply: that was a *standalone* pass with a free apply + free ISP; here the average is fused
+into an expensive apply and the ISP was *contending*, not free. Only helps exact 2:1 (the 4K→720p 3:1 case
+stays full-res + ISP, keeping the `veryfast`+dither tier). Follow-up: box→[1,3,3,1] tap if softening matters.
+
 ## Accurate-tier perf — where it stands, and a dead end (don't re-try)
 The accurate chroma 3D-LUT apply is NEON (8 chroma samples/iter: branchless tetrahedron select +
 software gather; `tm3d_chroma_row` in `vf_sand_to_yuv420p_drm.c`), bit-exact to the scalar path.

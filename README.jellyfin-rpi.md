@@ -152,6 +152,14 @@ HDR10 source — add `tm=fast` (real-time) or `tm=accurate` (quality):
        -vf sand_to_yuv420p_drm=tm=fast,scale_v4l2m2m=1280:720
 ```
 
+**Exact 2:1 (4K→1080p): use `out=half` instead of the ISP scaler** — the filter fuses the 2×2
+downscale into the tone-map and emits 1080p directly (no `scale_v4l2m2m`), which makes even DV P5
+`tm=accurate` real-time (see below):
+
+```sh
+       -vf sand_to_yuv420p_drm=tm=accurate:out=half
+```
+
 ## Performance (Pi 4B, 600-frame steady-state, → 720p)
 
 | source | speed | notes |
@@ -171,25 +179,34 @@ free the rest of the machine for decode/encode. The tone-map tiers process the 1
 small **`TM_CHUNK`=4-row L1-resident tiles** — a swept knee (16 rows thrashes L2, ~+14–18% slower);
 this is what brings `tm=accurate`/DV-P5-`fast` up to (near) real-time, bit-identically.
 
-### 4K → 1080p (larger output, same 4K CPU cost)
+### 4K → 1080p — and the `out=half` fused downscale
 
-Measured on true-4K sources (SDR: She-Hulk 2160p bt709; HDR10: Echo 2160p; DV P5: Agatha 2160p),
-500-frame steady state:
+For an exact 2:1 downscale (4K→1080p), the filter can **emit 1080p directly** (`out=half`): it
+box-averages 2×2 right after the SAND unpack, runs the tone-map apply at 1920×1080 / 960×540, and
+hands a 1080p dma-buf straight to the encoder — **dropping the `scale_v4l2m2m` ISP stage entirely**.
+This both shrinks the per-sample apply ~4× *and* removes the ISP's ~15.5 MB/frame of bus traffic,
+which was *contending* with the memory-latency-bound unpack (the identical filter runs ~27 ms/frame
+alone but ~40 ms in-pipeline). Net: it turns the whole 4K→1080p DV/HDR path real-time.
 
-| source | speed | notes |
-|---|---:|---|
-| 10-bit HEVC SDR 4K (3840×2160), `tm=none` | ~1.26× | no tone-map (SDR); unpack + ISP scale + encode |
-| 10-bit HEVC HDR10 4K (3840×2160), `tm=none` | ~1.02× | truncation, colour wrong |
-| 10-bit HEVC HDR10 4K (3840×2160), `tm=fast` | ~1.01× | **real-time, correct colour** |
-| 10-bit HEVC HDR10 4K (3840×2160), `tm=accurate` | ~0.89× | quality tier (NEON tetrahedral 3D-LUT) |
-| 10-bit HEVC Dolby Vision **profile 5** 4K, default/`tm=accurate` | ~0.66× | full 3D luma+chroma |
-| 10-bit HEVC Dolby Vision **profile 5** 4K, `tm=fast` | ~0.90× | 1D luma + full 3D chroma |
-| 10-bit HEVC Dolby Vision **profile 5** 4K, `tm=veryfast` | ~0.93× | + ordered-dithered nearest 3D chroma |
+Measured on true-4K sources (SDR: She-Hulk bt709; HDR10: Echo; DV P5: Agatha), 500-frame single-tenant:
 
-The dominant cost is the **fixed 4K SAND unpack + tone-map apply on the CPU**, so the output
-resolution barely moves it — 1080p is only ~10–15% slower than →720p, and that delta is the
-(hardware, concurrent) ISP scale + H.264 encode of the larger frame, not the CPU path. Practical
-upshot: HDR10 `tm=fast` still lands right at real-time (~1.0×) at 1080p, but **DV P5 slips just
-below real-time even at `tm=veryfast` (~0.93×)** — the larger encode eats the headroom `veryfast`
-buys at 720p. For 4K→1080p DV P5, `dovi_tool` P5→P8.1 (offline, zero-CPU) is the fallback if strict
-real-time is required.
+| source (4K → 1080p) | current (4K apply + ISP scale) | **`out=half`** (fused, no ISP) |
+|---|---:|---:|
+| SDR, `tm=none` | ~1.26× | ~1.3×+ |
+| HDR10, `tm=fast` | ~1.01× | ~1.3× |
+| HDR10, `tm=accurate` | ~0.89× | **~1.26×** |
+| DV **profile 5**, default/`tm=accurate` | ~0.66× | **~1.12×** |
+| DV **profile 5**, `tm=fast`/`veryfast` | ~0.90–0.93× | **~1.19–1.25×** |
+
+`out=half` uses **tetrahedral chroma at half-res for every P5 tier** (4× fewer chroma sites make it
+cheaper than the full-res nearest path *and* higher quality — so `fast`/`veryfast` collapse to the
+tetra path and the nn/dither tier isn't used on this path; it remains for 720p / non-2:1 outputs).
+Quality vs the accurate reference downscaled: ordering error is negligible (Y/Cb/Cr ~57–60 dB, max ~2
+codes — downscale-then-tone-map is the same order libplacebo/mpv use); box 2×2 gives a slight softening
+vs the ISP's polyphase. Output is deterministic and NEON==scalar bit-exact; `out=full` (default) is
+byte-identical to before. **So at 4K→1080p, even DV P5 `tm=accurate` (the quality default) is now
+real-time** — the earlier `dovi_tool` P5→P8.1 offline fallback is no longer needed for this ratio.
+
+The dominant cost of the CPU filter is the **fixed 4K SAND unpack** (memory-latency-bound; unchanged
+by `out=half`, which is why the 4K→720p 3:1 case — non-integer, still full-res + ISP — keeps the
+`veryfast`+dither tier). `out=half` only helps the exact-2:1 path, but there it's decisive.
