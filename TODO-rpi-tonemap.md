@@ -17,41 +17,48 @@ content from the command line, rather than hardcoded:
 Because the LUTs (1D fast, 3D accurate) are built from math at init, these should just re-parameterize
 the table builder — no per-frame cost. Rebuild tables only when a knob or the source peak changes.
 
-## Dolby Vision profile 5 — NEON RPU-reshaping fast path
-Today P5 comes out wrong-coloured: its base layer isn't HDR10, it's Dolby's reshaped IPT-PQ
-signal, so the generic PQ tone-map (and plain 10→8 truncation) can't fix it — the correction
-lives in the RPU metadata, upstream of tone-mapping. A native fast path is **feasible** and maps
-onto the existing machinery; the blocker is correctness effort, not perf or missing inputs.
+## Dolby Vision profile 5 — RPU-reshaping path  ✅ SHIPPED (per-RPU baked 3D LUT + NEON apply)
+P5's base layer isn't HDR10 — it's Dolby's reshaped IPT-PQ signal — so the generic PQ tone-map
+(and plain 10→8 truncation) came out wrong-coloured; the correction lives in the RPU metadata,
+upstream of tone-mapping. **Now handled correctly** in `vf_sand_to_yuv420p_drm.c`.
 
-Building blocks already present: the HEVC decoder runs `ff_dovi_rpu_parse` and attaches
-`AV_FRAME_DATA_DOVI_METADATA`; `AVDOVIDataMapping` exposes the reshaping per frame —
-`curves[3]` (per component), `mapping_idc` (polynomial vs MMR), `poly_coef[piece][3]`,
-`mmr_coef[piece][order][7]`, `num_pivots`. So the coefficients arrive on the CPU for free.
+What we built (differs from the NEON-MMR sketch below, which was the original guess):
+- **Detection:** `AV_FRAME_DATA_DOVI_METADATA` present + base layer NOT HDR10-tagged
+  (`color_trc != SMPTE2084/ARIB`). Engages regardless of `tm=` (even `tm=none`) so a P5 file
+  never passes through wrong-coloured. P8 (keeps SMPTE2084) → existing HDR10 tonemap.
+- **Per-RPU bake (scalar C, `p5_bake`):** a 33³ LUT mapping base-YCbCr(full-range 10-bit) → SDR
+  8-bit, composing the full DV decode (reshape via `AVDOVIDataMapping.curves` poly/MMR →
+  `ycc_to_rgb` → PQ-EOTF → HPE·`rgb_to_lms` → PQ-OETF → BT.2020/PQ HDR10) with the existing
+  zscale/hable tone LUT (`ff_rpi_tm_luma1d` + `ff_rpi_tm_lut3d`). Rebuilt only when an FNV hash
+  over the consumed RPU coeffs changes (scene cut). All the intricate, silently-wrong-prone DV
+  math is confined to ~36K scalar evals off the hot path.
+- **Apply (NEON, `p5_luma_row`/`p5_chroma_row`):** fixed-point tetrahedral into the composed LUT,
+  extending the accurate tier's `tm3d_calc4` (generalised with a full-range offset). P5 SDR luma
+  depends on Cb,Cr (the matrix mixes), so **luma is a full 3D lookup** (full-res Y + nearest
+  chroma, gather channel 0) — unlike the HDR10 tier's 1D luma; chroma is block-avg luma + native
+  Cb,Cr (gather channels 1,2). Scalar fallback + `SAND_TM_SELFCHECK` (NEON==scalar, max 0).
 
-Structure: `poly-luma + MMR-chroma reshape → HDR10 (BT.2020/PQ) → existing tone-map`
-(the reshape half is exactly what `dovi_tool` P5→P8.1 does).
-- **Luma:** piecewise polynomial (≤9 pivots, order ≤2) → bake a 1024-entry LUT **once per RPU
-  update** (RPU changes per scene, not per pixel) and **compose it with the PQ→SDR tone LUT**, so
-  the whole luma path stays a single `tbl`+lerp folded into the single-pass unpack (fast-tier style).
-- **Chroma:** MMR is a multivariate polynomial in (Y,Cb,Cr), up to order 3 / 7 coeffs — *not* a
-  1D LUT (cross-channel, which is why naive P5 chroma is wrong), but **gather-free NEON MACs**
-  (evaluate the monomials × coeffs), vectorised across chroma samples, with co-sited luma at
-  chroma resolution (reuse the accurate tier's 2×2-average). May be *cheaper* than the 3D-LUT
-  (no scattered gather).
-- Detect P5 via `dovi_ctx.cfg.dv_profile`; rebuild the composed LUT + reload MMR coeffs on RPU change.
+Validation (bit-close, float GPU oracle — not the bit-exact standard): **Gate A** live-filter
+decode→HDR10 vs libplacebo `apply_dolbyvision` = Y 65.1/Cb 62.6/Cr 65.6 dB PSNR, max 1–2 codes;
+**Gate B** composed SDR (bake+tetra apply) vs oracle-HDR10→accurate-tonemap = 51–54 dB, max 2–3
+codes; visual on real scenes correct (skin tones, night ambiance, no cast). MMR cross-channel math
+validated by a standalone unit test vs a literal transcription of libplacebo's GLSL reshape
+(the sole local P5 file, Agatha S01E05, is trivial poly-only).
 
-Expected perf: between the fast and accurate tiers (~0.6–0.8× at 4K). **Real cost is correctness:**
-DV reshaping is intricate (pivot handling, DV's fixed-point/scaling conventions, MMR monomial
-ordering, colour-space bookkeeping) — effectively reimplementing part of `libdovi`'s mapping in
-NEON, validated same-frame against `dovi_tool`/libplacebo on CPU. High effort, high risk.
-
-Interim / cheaper options (do these regardless): **detect P5 and warn/skip** so we never silently
-emit wrong colour; and note the **offline `dovi_tool` P5→P8.1** route (converts to HDR10 the
-pipeline already handles correctly and real-time — zero new code, bit-correct).
+Perf (full 4K→720p, steady state): scalar **0.145×** → NEON **0.555×** (3.8×). As expected,
+between... well, near the accurate tier (0.765×) but heavier because the luma 3D lookup is
+mandatory. Gather-latency-bound like the accurate tier; further CPU vectorisation won't move it.
+Faster on letterboxed scope content (fewer luma rows). Offline `dovi_tool` P5→P8.1 remains the
+zero-CPU alternative if a box is CPU-starved.
 
 Also related: `frame_is_hdr()` treats HLG (`ARIB_STD_B67`) as HDR but the LUTs are PQ-baked, so
 genuine HLG (incl. DV P8.4) is currently mis-tone-mapped (wrong transfer) — bake an HLG curve or
 gate it out.
+
+### (original sketch — superseded by the 3D-LUT approach above)
+The first guess was `poly-luma 1D-LUT + gather-free NEON-MMR chroma`. We went with a composed 3D
+LUT instead: it reuses the validated tetrahedral apply, keeps all DV math scalar/off-hot-path
+(unit-testable), and correctly handles luma's cross-channel dependence (a 1D luma LUT can't).
 
 ## Accurate-tier perf — where it stands, and a dead end (don't re-try)
 The accurate chroma 3D-LUT apply is NEON (8 chroma samples/iter: branchless tetrahedron select +

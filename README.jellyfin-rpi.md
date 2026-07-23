@@ -69,11 +69,22 @@ directly from that chain** into embedded LUTs (`libavfilter/rpi_tonemap_gen.py` 
   Quality tier, **not** real-time by design (~0.77× at 4K HDR). The apply is NEON (8 chroma
   samples/iter: branchless tetrahedron select + software gather); it's ultimately gather-latency
   bound, so it stays below the fast tier.
-- `tm=none` (default) — plain truncation, byte-for-byte unchanged.
+- `tm=none` (default) — plain truncation, byte-for-byte unchanged. **Exception:** a Dolby Vision
+  profile 5 source always engages the DV path below (truncating it would corrupt colour).
+
+**Dolby Vision profile 5** is handled automatically (no option): the P5 base layer is Dolby's
+*reshaped* IPT-PQ signal, not HDR10, so it's reconstructed to HDR10 from the per-frame RPU
+metadata (`AV_FRAME_DATA_DOVI_METADATA`) and then tone-mapped. Detected by RPU-present +
+base-not-HDR10-tagged. A 33³ base-YCbCr→SDR LUT is baked once per scene (all the DV colour math —
+poly/MMR reshape, `ycc_to_rgb`, PQ, HPE·`rgb_to_lms` — in scalar C, off the hot path, composed
+with the same zscale/hable tone LUT), then applied with NEON fixed-point tetrahedral (luma is a
+full 3D lookup since P5 luma is cross-channel). Validated bit-close to libplacebo
+(`apply_dolbyvision`): HDR10 decode ≥62 dB PSNR, end-to-end SDR ≥51 dB. Perf ~0.55× at 4K
+(luma 3D lookup is heavier than HDR10's 1D luma; gather-bound). P8 (HDR10-tagged) uses the
+HDR10 tonemap above. See `TODO-rpi-tonemap.md`.
 
 Deferred (see `TODO-rpi-tonemap.md`): command-line-tunable peak/operator/saturation, a BT.2390
-operator (`op=bt2390`), non-1000-nit peaks, 32-bit ARM parity for the tone LUTs. Dolby Vision
-profile 5 is out of scope (needs DV RPU processing).
+operator (`op=bt2390`), non-1000-nit peaks, 32-bit ARM parity for the tone LUTs, an HLG curve.
 
 ### 4. Build enablement for the HDR reference
 `--enable-libzimg` (`zscale`) gives a correct CPU HDR→SDR reference (`zscale+tonemap`).
@@ -126,6 +137,7 @@ HDR10 source — add `tm=fast` (real-time) or `tm=accurate` (quality):
 | 10-bit HEVC HDR10 4K (3840×2160), `tm=none` | ~1.16× | truncation, colour wrong |
 | 10-bit HEVC HDR10 4K (3840×2160), `tm=fast` | ~1.11× | **real-time, correct colour** (single-pass tone-map fold) |
 | 10-bit HEVC HDR10 4K (3840×2160), `tm=accurate` | ~0.77× | quality tier, not real-time (NEON tetrahedral 3D-LUT, gather-bound) |
+| 10-bit HEVC Dolby Vision **profile 5** 4K (3840×2160) | ~0.55× | correct colour via per-RPU 3D LUT + NEON tetrahedral (luma is a full 3D lookup); scalar was 0.15× |
 
 The 4K unpack is **memory-latency-bound** on the scattered SAND reads (same wall that made the
 V3D GPU offload lose). Threading reaches the shared-bus ceiling with ~2–3 cores; the levers above

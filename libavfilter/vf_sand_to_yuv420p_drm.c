@@ -22,12 +22,16 @@
 #include <linux/dma-buf.h>
 #include <drm.h>
 #include <libdrm/drm_fourcc.h>
+#include <math.h>
+#include <inttypes.h>
 #if defined(__aarch64__)
 #include <arm_neon.h>
 #endif
 
 #include "libavutil/hwcontext.h"
 #include "libavutil/hwcontext_drm.h"
+#include "libavutil/dovi_meta.h"
+#include "libavutil/frame.h"
 #include "libavutil/rpi_sand_fns.h"
 #include "libavutil/mem.h"
 #include "libavutil/opt.h"
@@ -40,7 +44,7 @@
 #include "libavutil/opt.h"
 #include "rpi_tonemap_tables.h"   /* ff_rpi_tm_luma1d/cb1d/cr1d, ff_rpi_tm_lut3d, RPI_TM_LUT3D_N */
 
-enum { TM_NONE = 0, TM_FAST, TM_ACCURATE };
+enum { TM_NONE = 0, TM_FAST, TM_ACCURATE, TM_P5 };   /* TM_P5: Dolby Vision profile 5 (RPU reshape) */
 
 #ifndef O_CLOEXEC
 #define O_CLOEXEC 0
@@ -92,6 +96,11 @@ typedef struct BridgeContext {
     int      tm;           /* TM_NONE / TM_FAST / TM_ACCURATE (option) */
     uint8_t  l64[64], cb64[64], cr64[64];  /* 64-entry tbl LUTs (subsampled at init) */
     uint8_t  l64_next[64];                 /* l64_next[i]=curve((i+1)*16); for the single-pass .S kernel */
+    /* Dolby Vision profile 5: per-RPU composed base-YCbCr(full-range) -> SDR 3D LUT */
+    uint8_t *p5_lut;                       /* RPI_TM_LUT3D_N^3 * 3, rebuilt when the RPU changes */
+    uint64_t p5_hash;                      /* hash of the RPU coeffs the bake consumed */
+    int      p5_valid;                     /* p5_lut currently holds a baked LUT */
+    int      p5_maxc;                      /* 2^bl_bit_depth - 1 (full-range grid extent) */
 } BridgeContext;
 
 /* Return a persistent read-only mapping of (fd,size), or NULL to signal the
@@ -190,6 +199,7 @@ static av_cold void uninit(AVFilterContext *avctx)
         munmap(s->mcache[i].addr, s->mcache[i].size);
     ff_mutex_destroy(&s->lock);
     if (s->heap_fd >= 0) close(s->heap_fd);
+    av_freep(&s->p5_lut);
 }
 
 static int config_output(AVFilterLink *outlink)
@@ -318,6 +328,8 @@ typedef struct TMData {
     int            tm;
     const uint8_t *l64, *cb64, *cr64;  /* 64-entry tbl LUTs (fast NEON path) */
     const uint8_t *l64_next;           /* pairs with l64 for the single-pass .S kernel */
+    const uint8_t *p5_lut;             /* DV P5: base-YCbCr -> SDR 3D LUT (TM_P5) */
+    int            p5_maxc;            /* P5 full-range grid extent (2^bl_bit_depth - 1) */
 } TMData;
 
 /* Apply a smooth 1024->8 tone curve to n contiguous 10-bit samples using a
@@ -393,14 +405,16 @@ static void tm3d_chroma_scalar(uint8_t *OU, uint8_t *OV,
  * offsets into ff_rpi_tm_lut3d and the 4 Q8 weights. int32 math is bit-exact vs the
  * int64 scalar (products < 2^31). av_always_inline so the constants fold. */
 static av_always_inline void tm3d_calc4(int32x4_t Y, int32x4_t Uu, int32x4_t Vv,
-    int32_t MY, int32_t MC, int32x4_t v256, int32x4_t v64, int32x4_t v32768, int32x4_t vLIMQ,
+    int32_t MY, int32_t MC, int32x4_t vYoff, int32x4_t vCoff, int32x4_t v256, int32x4_t v32768, int32x4_t vLIMQ,
     int32x4_t vzero, int32x4_t vNm1, int32x4_t vone, int32x4_t v255, int32x4_t vN, int32x4_t vST,
     int32x4_t *po0, int32x4_t *poa, int32x4_t *pob, int32x4_t *po3,
     int32x4_t *pw0, int32x4_t *pw1, int32x4_t *pw2, int32x4_t *pw3)
 {
-    int32x4_t ybq=vshrq_n_s32(vaddq_s32(vmulq_s32(vsubq_s32(Y ,v256),vdupq_n_s32(MY)),v32768),16);
-    int32x4_t ubq=vshrq_n_s32(vaddq_s32(vmulq_s32(vsubq_s32(Uu,v64 ),vdupq_n_s32(MC)),v32768),16);
-    int32x4_t vbq=vshrq_n_s32(vaddq_s32(vmulq_s32(vsubq_s32(Vv,v64 ),vdupq_n_s32(MC)),v32768),16);
+    /* vYoff/vCoff: axis input offset (limited-range 256/64, or 0 for full-range P5).
+     * v256: the Q8 weight base (always 256), independent of the input offset. */
+    int32x4_t ybq=vshrq_n_s32(vaddq_s32(vmulq_s32(vsubq_s32(Y ,vYoff),vdupq_n_s32(MY)),v32768),16);
+    int32x4_t ubq=vshrq_n_s32(vaddq_s32(vmulq_s32(vsubq_s32(Uu,vCoff),vdupq_n_s32(MC)),v32768),16);
+    int32x4_t vbq=vshrq_n_s32(vaddq_s32(vmulq_s32(vsubq_s32(Vv,vCoff),vdupq_n_s32(MC)),v32768),16);
     ybq=vminq_s32(vmaxq_s32(ybq,vzero),vLIMQ);
     ubq=vminq_s32(vmaxq_s32(ubq,vzero),vLIMQ);
     vbq=vminq_s32(vmaxq_s32(vbq,vzero),vLIMQ);
@@ -444,7 +458,7 @@ static void tm3d_chroma_row(uint8_t *OU, uint8_t *OV,
     const int32x4_t vone=vdupq_n_s32(1), v255=vdupq_n_s32(255), vN=vdupq_n_s32(N), vST=vdupq_n_s32(3);
     const uint16x8_t m1023q=vdupq_n_u16(1023), m8q=vdupq_n_u16(0xff);
 #define CALC4(Yv,Uv,Vv,o0,oa,ob,o3,w0,w1,w2,w3) \
-    tm3d_calc4(Yv,Uv,Vv,MY,MC,v256,v64,v32768,vLIMQ,vzero,vNm1,vone,v255,vN,vST, \
+    tm3d_calc4(Yv,Uv,Vv,MY,MC,v256,v64,v256,v32768,vLIMQ,vzero,vNm1,vone,v255,vN,vST, \
                &o0,&oa,&ob,&o3,&w0,&w1,&w2,&w3)
     for (; x + 8 <= cw; x += 8) {
         uint16x8_t y0a=vld1q_u16(Y0+2*x), y0b=vld1q_u16(Y0+2*x+8);
@@ -483,6 +497,353 @@ static void tm3d_chroma_row(uint8_t *OU, uint8_t *OV,
 #undef CALC4
 #endif
     tm3d_chroma_scalar(OU, OV, Y0, Y1, U, V, x, cw);   /* tail / non-NEON fallback */
+}
+
+/* ---- Dolby Vision profile 5: per-RPU bake of base-YCbCr(full-range) -> SDR ----
+ * Validated against libplacebo (Gate A: max 1-2 codes; MMR math: Gate B unit test).
+ * Composes the DV decode (reshape + ycc_to_rgb + PQ/LMS/PQ -> HDR10 BT.2020/PQ) with
+ * the existing zscale/hable tone-map (ff_rpi_tm_luma1d + ff_rpi_tm_lut3d). */
+static const double P5_HPE[9] = {  /* BT.2020 HPE LMS->RGB (from libplacebo colorspace.c) */
+     3.06441879,-2.16597676, 0.10155818, -0.65612108, 1.78554118,-0.12943749,
+     0.01736321,-0.04725154, 1.03004253 };
+#define P5_M1 0.1593017578125
+#define P5_M2 78.84375
+#define P5_C1 0.8359375
+#define P5_C2 18.8515625
+#define P5_C3 18.6875
+static inline double p5_pq_eotf(double x){ x=x<0?0:x; double a=pow(x,1.0/P5_M2), v=a-P5_C1; v=v<0?0:v; v/=(P5_C2-P5_C3*a); return pow(v<0?0:v,1.0/P5_M1); }
+static inline double p5_pq_oetf(double x){ x=x<0?0:x; double v=pow(x,P5_M1); v=(P5_C1+P5_C2*v)/(1.0+P5_C3*v); return pow(v,P5_M2); }
+static inline void p5_m3(const double *M,const double *v,double *o){ for(int i=0;i<3;i++)o[i]=M[3*i]*v[0]+M[3*i+1]*v[1]+M[3*i+2]*v[2]; }
+
+/* Reshape one component (poly Horner or MMR cross-channel), inputs normalized [0,1]. */
+static double p5_reshape(const AVDOVIReshapingCurve *cv, const double sig[3], int c,
+                         double cs, double nrm)
+{
+    double s = sig[c];
+    int i, np = cv->num_pivots;
+    for (i = 0; i < np - 2; i++) if (s < cv->pivots[i+1] * nrm) break;
+    double out;
+    if (cv->mapping_idc[i] == AV_DOVI_MAPPING_POLYNOMIAL) {
+        int ord = cv->poly_order[i];
+        out = cv->poly_coef[i][ord] * cs;
+        for (int k = ord - 1; k >= 0; k--) out = out * s + cv->poly_coef[i][k] * cs;
+    } else {  /* MMR: monomials (x,y,z, xy,xz,yz,xyz), coeffs [0..2]=linear,[3..6]=cross */
+        double x=sig[0], y=sig[1], z=sig[2];
+        double lin[3]={x,y,z}, mono[4]={x*y, x*z, y*z, x*y*z};
+        out = cv->mmr_constant[i] * cs;
+        for (int j = 0; j < cv->mmr_order[i]; j++) {
+            for (int t = 0; t < 3; t++) out += cv->mmr_coef[i][j][t]   * cs * pow(lin[t],  j+1);
+            for (int t = 0; t < 4; t++) out += cv->mmr_coef[i][j][3+t] * cs * pow(mono[t], j+1);
+        }
+    }
+    double lo = cv->pivots[0]*nrm, hi = cv->pivots[np-1]*nrm;
+    return out < lo ? lo : (out > hi ? hi : out);
+}
+
+/* Trilinear-sample the existing HDR10->SDR chroma tone-map LUT at limited-range HDR10
+ * codes (Yh,Cbh,Crh); returns SDR Cb,Cr. (Luma uses the 1D curve, as the accurate tier.) */
+static void p5_tm_chroma(double Yh, double Cbh, double Crh, uint8_t *cb, uint8_t *cr)
+{
+    const int N = RPI_TM_LUT3D_N;
+    double gy=(Yh-64)*(N-1)/876.0, gu=(Cbh-64)*(N-1)/896.0, gv=(Crh-64)*(N-1)/896.0;
+    gy=gy<0?0:(gy>N-1?N-1:gy); gu=gu<0?0:(gu>N-1?N-1:gu); gv=gv<0?0:(gv>N-1?N-1:gv);
+    int y0=(int)gy,u0=(int)gu,v0=(int)gv, y1=y0<N-1?y0+1:y0,u1=u0<N-1?u0+1:u0,v1=v0<N-1?v0+1:v0;
+    double fy=gy-y0,fu=gu-u0,fv=gv-v0;
+    double ob=0, orr=0;
+    for (int dy=0;dy<2;dy++)for(int du=0;du<2;du++)for(int dv=0;dv<2;dv++){
+        double w=(dy?fy:1-fy)*(du?fu:1-fu)*(dv?fv:1-fv);
+        const uint8_t *e=&ff_rpi_tm_lut3d[(((dy?y1:y0)*N+(du?u1:u0))*N+(dv?v1:v0))*3];
+        ob+=w*e[1]; orr+=w*e[2];
+    }
+    int b=(int)lround(ob), r=(int)lround(orr);
+    *cb=b<0?0:(b>255?255:b); *cr=r<0?0:(r>255?255:r);
+}
+
+/* Precomputed per-RPU decode context (matrices folded once). */
+typedef struct { const AVDOVIDataMapping *map; double YCC[9], OFF[3], COMB[9], cs, nrm; } P5Ctx;
+
+/* Decode one base-YCbCr sample (codes 0..maxc) -> HDR10 BT.2020/PQ YCbCr codes
+ * (limited-range 10-bit). The exact math validated in scratchpad/dv_decode.c. */
+static void p5_decode_hdr10(const P5Ctx *c, double Yc, double Uc, double Vc,
+                            double *Yh, double *Cbh, double *Crh)
+{
+    double sig[3] = { Yc*c->nrm, Uc*c->nrm, Vc*c->nrm };
+    double r[3] = { p5_reshape(&c->map->curves[0],sig,0,c->cs,c->nrm),
+                    p5_reshape(&c->map->curves[1],sig,1,c->cs,c->nrm),
+                    p5_reshape(&c->map->curves[2],sig,2,c->cs,c->nrm) };
+    double t[3] = { r[0]-c->OFF[0], r[1]-c->OFF[1], r[2]-c->OFF[2] }, rgb[3]; p5_m3(c->YCC,t,rgb);
+    for (int k=0;k<3;k++) rgb[k]=p5_pq_eotf(rgb[k]);
+    double l[3]; p5_m3(c->COMB,rgb,l); for (int k=0;k<3;k++) l[k]=p5_pq_oetf(l[k]);
+    double R=l[0],G=l[1],B=l[2], yy=0.2627*R+0.6780*G+0.0593*B;
+    double cb=(B-yy)/1.8814, cr=(R-yy)/1.4746;
+    *Yh=yy*876.0+64.0; *Cbh=cb*896.0+512.0; *Crh=cr*896.0+512.0;
+}
+
+/* GATE-A hook: replay the *live* decode over the validated base crop and dump the
+ * HDR10 intermediate (yuv444p10le), so it can be diffed vs the libplacebo oracle.
+ * Env: SAND_P5_HDRDUMP="in444:out444:W:H". Runs once, on the first bake. */
+static void p5_gate_a(const P5Ctx *c)
+{
+    const char *spec = getenv("SAND_P5_HDRDUMP");
+    if (!spec) return;
+    char in[512], out[512]; int W=0,H=0;
+    if (sscanf(spec, "%511[^:]:%511[^:]:%d:%d", in, out, &W, &H) != 4 || W<=0 || H<=0) return;
+    FILE *fi = fopen(in,"rb"); if (!fi) { av_log(NULL,AV_LOG_ERROR,"P5 gate-A: open %s\n",in); return; }
+    size_t n=(size_t)W*H; uint16_t *Y=av_malloc(n*2),*U=av_malloc(n*2),*V=av_malloc(n*2);
+    uint16_t *oY=av_malloc(n*2),*oU=av_malloc(n*2),*oV=av_malloc(n*2);
+    if (!Y||!U||!V||!oY||!oU||!oV) goto done;
+    if (fread(Y,2,n,fi)!=n||fread(U,2,n,fi)!=n||fread(V,2,n,fi)!=n){av_log(NULL,AV_LOG_ERROR,"P5 gate-A: short read\n");goto done;}
+    for (size_t i=0;i<n;i++){ double yh,cbh,crh;
+        p5_decode_hdr10(c,(Y[i]&1023),(U[i]&1023),(V[i]&1023),&yh,&cbh,&crh);
+        int a=(int)lround(yh),b=(int)lround(cbh),d=(int)lround(crh);
+        oY[i]=a<0?0:(a>1023?1023:a); oU[i]=b<0?0:(b>1023?1023:b); oV[i]=d<0?0:(d>1023?1023:d); }
+    FILE *fo=fopen(out,"wb");
+    if (fo){ fwrite(oY,2,n,fo);fwrite(oU,2,n,fo);fwrite(oV,2,n,fo);fclose(fo);
+             av_log(NULL,AV_LOG_INFO,"P5 gate-A: wrote HDR10 dump %s (%dx%d)\n",out,W,H); }
+done:
+    av_free(Y);av_free(U);av_free(V);av_free(oY);av_free(oU);av_free(oV); fclose(fi);
+}
+
+/* Build the composed base->SDR 3D LUT for the current RPU. Once per scene. */
+static int p5_bake(BridgeContext *s, const AVDOVIMetadata *meta)
+{
+    const AVDOVIRpuDataHeader   *hdr = av_dovi_get_header(meta);
+    const AVDOVIColorMetadata   *col = av_dovi_get_color(meta);
+    const int N = RPI_TM_LUT3D_N;
+    if (!s->p5_lut && !(s->p5_lut = av_malloc((size_t)N*N*N*3))) return AVERROR(ENOMEM);
+    const int maxc = (1 << hdr->bl_bit_depth) - 1;
+    P5Ctx c = { .map = av_dovi_get_mapping(meta),
+                .cs = 1.0 / (double)(1ULL << hdr->coef_log2_denom), .nrm = 1.0 / maxc };
+    s->p5_maxc = maxc;
+    double LMSm[9];
+    for (int i=0;i<9;i++){ c.YCC[i]=av_q2d(col->ycc_to_rgb_matrix[i]); LMSm[i]=av_q2d(col->rgb_to_lms_matrix[i]); }
+    for (int i=0;i<3;i++) c.OFF[i]=av_q2d(col->ycc_to_rgb_offset[i]);
+    for (int i=0;i<3;i++)for(int j=0;j<3;j++){ double a=0; for(int k=0;k<3;k++)a+=P5_HPE[3*i+k]*LMSm[3*k+j]; c.COMB[3*i+j]=a; }
+    for (int iy=0; iy<N; iy++) for (int iu=0; iu<N; iu++) for (int iv=0; iv<N; iv++) {
+        double Yh,Cbh,Crh;
+        p5_decode_hdr10(&c, iy*(double)maxc/(N-1), iu*(double)maxc/(N-1), iv*(double)maxc/(N-1),
+                        &Yh, &Cbh, &Crh);
+        int Yhi=(int)lround(Yh); Yhi=Yhi<0?0:(Yhi>1023?1023:Yhi);
+        uint8_t *e = &s->p5_lut[(((size_t)iy*N+iu)*N+iv)*3];
+        e[0] = ff_rpi_tm_luma1d[Yhi];                 /* SDR Y  (1D tone curve) */
+        p5_tm_chroma(Yh, Cbh, Crh, &e[1], &e[2]);     /* SDR Cb,Cr (3D tone LUT) */
+    }
+    p5_gate_a(&c);
+    s->p5_valid = 1;
+    return 0;
+}
+
+/* FNV-1a over exactly the coeffs the bake consumes -> rebuild trigger. */
+static uint64_t p5_calc_hash(const AVDOVIMetadata *meta)
+{
+    const AVDOVIRpuDataHeader *hdr = av_dovi_get_header(meta);
+    const AVDOVIDataMapping   *map = av_dovi_get_mapping(meta);
+    const AVDOVIColorMetadata *col = av_dovi_get_color(meta);
+    uint64_t h = 1469598103934665603ULL;
+    #define HB(p,n) do{ const uint8_t*_b=(const uint8_t*)(p); for(size_t _i=0;_i<(n);_i++){h^=_b[_i];h*=1099511628211ULL;} }while(0)
+    HB(&hdr->coef_log2_denom,1); HB(&hdr->bl_bit_depth,1); HB(&hdr->bl_video_full_range_flag,1);
+    HB(map, sizeof(*map));
+    HB(col->ycc_to_rgb_matrix, sizeof(col->ycc_to_rgb_matrix));
+    HB(col->ycc_to_rgb_offset, sizeof(col->ycc_to_rgb_offset));
+    HB(col->rgb_to_lms_matrix, sizeof(col->rgb_to_lms_matrix));
+    #undef HB
+    return h;
+}
+
+/* Full-range Q16 axis multipliers (code -> Q8 grid coord, offset 0). MC: single full-res
+ * sample; MYC: 2x2-summed luma (co-sited chroma). Round-to-nearest, matching the
+ * accurate tier's constant form but with full-range extent `maxc` and zero offset. */
+#define P5_MC(maxc)  ((int32_t)(((int64_t)(RPI_TM_LUT3D_N-1)*256*65536 + (maxc)/2) / (maxc)))
+#define P5_MYC(maxc) ((int32_t)(((int64_t)(RPI_TM_LUT3D_N-1)*64 *65536 + (maxc)/2) / (maxc)))
+
+/* Scalar per-sample coord map + branchless tetrahedron select (mirrors tm3d_calc4,
+ * offset 0). Emits 4 corner byte offsets into the stride-3 LUT + 4 Q8 weights. */
+static av_always_inline void p5_calc1(int Y, int U, int V, int MY, int MC,
+    int *po0, int *poa, int *pob, int *po3, int *pw0, int *pw1, int *pw2, int *pw3)
+{
+    const int N = RPI_TM_LUT3D_N, LIMQ = (N-1)<<8;
+    int ybq = (int)(((int64_t)Y*MY + 32768) >> 16);
+    int ubq = (int)(((int64_t)U*MC + 32768) >> 16);
+    int vbq = (int)(((int64_t)V*MC + 32768) >> 16);
+    ybq = ybq<0?0:(ybq>LIMQ?LIMQ:ybq); ubq = ubq<0?0:(ubq>LIMQ?LIMQ:ubq); vbq = vbq<0?0:(vbq>LIMQ?LIMQ:vbq);
+    int yi=ybq>>8, ui=ubq>>8, vi=vbq>>8, fy=ybq&255, fu=ubq&255, fv=vbq&255;
+    int base = ((yi*N+ui)*N+vi)*3;
+    int dY = (yi<N-1?1:0)*N*N*3, dU = (ui<N-1?1:0)*N*3, dV = (vi<N-1?1:0)*3;
+    int allo = base+dY+dU+dV;
+    int fmax=FFMAX3(fy,fu,fv), fmin=FFMIN3(fy,fu,fv), fmid=fy+fu+fv-fmax-fmin;
+    *pw0=256-fmax; *pw1=fmax-fmid; *pw2=fmid-fmin; *pw3=fmin;
+    int c_yu=fy>=fu, c_uv=fu>=fv, c_yv=fy>=fv;
+    int dmax = (c_yu&&c_yv)?dY : ((!c_yu&&c_uv)?dU:dV);
+    int dmin = (c_uv&&c_yv)?dV : ((c_yu&&!c_uv)?dU:dY);
+    *po0=base; *poa=base+dmax; *pob=allo-dmin; *po3=allo;
+}
+/* Weighted sum of one LUT channel at 4 corners -> 8-bit, (acc+128)>>8. */
+static av_always_inline uint8_t p5_wsum(const uint8_t *lut, int o0,int oa,int ob,int o3,
+                                        int w0,int w1,int w2,int w3, int chan)
+{
+    int a = w0*lut[o0+chan]+w1*lut[oa+chan]+w2*lut[ob+chan]+w3*lut[o3+chan];
+    int q = (a+128)>>8; return q<0?0:(q>255?255:q);
+}
+/* Pure-scalar rows (NEON tail + fallback + selfcheck oracle). */
+static void p5_luma_scalar(uint8_t *O, const uint16_t *Y, const uint16_t *U, const uint16_t *V,
+                           const uint8_t *lut, int MC, unsigned W, unsigned x0)
+{
+    for (unsigned x=x0; x<W; x++) {
+        int o0,oa,ob,o3,w0,w1,w2,w3;
+        p5_calc1(Y[x]&1023, U[x>>1]&1023, V[x>>1]&1023, MC, MC, &o0,&oa,&ob,&o3,&w0,&w1,&w2,&w3);
+        O[x] = p5_wsum(lut,o0,oa,ob,o3,w0,w1,w2,w3,0);
+    }
+}
+static void p5_chroma_scalar(uint8_t *OU, uint8_t *OV, const uint16_t *Y0, const uint16_t *Y1,
+                             const uint16_t *U, const uint16_t *V, const uint8_t *lut,
+                             int MY, int MC, unsigned cw, unsigned x0)
+{
+    for (unsigned x=x0; x<cw; x++) {
+        int avgY4 = (Y0[2*x]&1023)+(Y0[2*x+1]&1023)+(Y1[2*x]&1023)+(Y1[2*x+1]&1023);
+        int o0,oa,ob,o3,w0,w1,w2,w3;
+        p5_calc1(avgY4, U[x]&1023, V[x]&1023, MY, MC, &o0,&oa,&ob,&o3,&w0,&w1,&w2,&w3);
+        OU[x] = p5_wsum(lut,o0,oa,ob,o3,w0,w1,w2,w3,1);
+        OV[x] = p5_wsum(lut,o0,oa,ob,o3,w0,w1,w2,w3,2);
+    }
+}
+
+#if defined(__aarch64__)
+/* Common NEON prelude constants for the P5 tetrahedral (full-range, offset 0). */
+#define P5_NEON_CONSTS \
+    enum { N = RPI_TM_LUT3D_N }; \
+    const int32x4_t vz=vdupq_n_s32(0), v256=vdupq_n_s32(256), v32768=vdupq_n_s32(32768); \
+    const int32x4_t vLIMQ=vdupq_n_s32((N-1)<<8), vNm1=vdupq_n_s32(N-1), vone=vdupq_n_s32(1); \
+    const int32x4_t v255=vdupq_n_s32(255), vN=vdupq_n_s32(N), vST=vdupq_n_s32(3); \
+    const uint16x8_t m1023q=vdupq_n_u16(1023)
+#define P5_CALC4(Yv,Uv,Vv,MY,MC,o0,oa,ob,o3,w0,w1,w2,w3) \
+    tm3d_calc4(Yv,Uv,Vv,MY,MC,vz,vz,v256,v32768,vLIMQ,vz,vNm1,vone,v255,vN,vST, \
+               &o0,&oa,&ob,&o3,&w0,&w1,&w2,&w3)
+#define P5_WIDEN(v8) int32x4_t v8##lo=vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(v8))), \
+                               v8##hi=vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(v8)))
+#endif
+
+/* P5 luma row: full-res Y + nearest (replicated) chroma, gather LUT channel 0. */
+static void p5_luma_row(uint8_t *O, const uint16_t *Y, const uint16_t *U, const uint16_t *V,
+                        const uint8_t *lut, int MC, unsigned W)
+{
+    unsigned x = 0;
+#if defined(__aarch64__)
+    P5_NEON_CONSTS;
+    const uint16x4_t m1023h=vdup_n_u16(1023);
+    for (; x + 8 <= W; x += 8) {
+        uint16x8_t Yv=vandq_u16(vld1q_u16(Y+x),m1023q);
+        uint16x4_t U4=vand_u16(vld1_u16(U+(x>>1)),m1023h), V4=vand_u16(vld1_u16(V+(x>>1)),m1023h);
+        uint16x8_t Uv=vcombine_u16(vzip1_u16(U4,U4),vzip2_u16(U4,U4));   /* c,c,c+1,c+1,... */
+        uint16x8_t Vv=vcombine_u16(vzip1_u16(V4,V4),vzip2_u16(V4,V4));
+        P5_WIDEN(Yv); P5_WIDEN(Uv); P5_WIDEN(Vv);
+        int32x4_t o0l,oal,obl,o3l,w0l,w1l,w2l,w3l, o0h,oah,obh,o3h,w0h,w1h,w2h,w3h;
+        P5_CALC4(Yvlo,Uvlo,Vvlo,MC,MC, o0l,oal,obl,o3l, w0l,w1l,w2l,w3l);
+        P5_CALC4(Yvhi,Uvhi,Vvhi,MC,MC, o0h,oah,obh,o3h, w0h,w1h,w2h,w3h);
+        int32_t o0[8],oa[8],ob[8],o3[8]; uint8_t g0[8],ga[8],gb[8],g3[8];
+        vst1q_s32(o0,o0l); vst1q_s32(o0+4,o0h); vst1q_s32(oa,oal); vst1q_s32(oa+4,oah);
+        vst1q_s32(ob,obl); vst1q_s32(ob+4,obh); vst1q_s32(o3,o3l); vst1q_s32(o3+4,o3h);
+        for (int i=0;i<8;i++){ g0[i]=lut[o0[i]]; ga[i]=lut[oa[i]]; gb[i]=lut[ob[i]]; g3[i]=lut[o3[i]]; }
+        uint16x8_t h0=vmovl_u8(vld1_u8(g0)),ha=vmovl_u8(vld1_u8(ga)),hb=vmovl_u8(vld1_u8(gb)),h3=vmovl_u8(vld1_u8(g3));
+        uint32x4_t yl=vmulq_u32(vreinterpretq_u32_s32(w0l),vmovl_u16(vget_low_u16(h0)));
+        yl=vmlaq_u32(yl,vreinterpretq_u32_s32(w1l),vmovl_u16(vget_low_u16(ha)));
+        yl=vmlaq_u32(yl,vreinterpretq_u32_s32(w2l),vmovl_u16(vget_low_u16(hb)));
+        yl=vmlaq_u32(yl,vreinterpretq_u32_s32(w3l),vmovl_u16(vget_low_u16(h3)));
+        uint32x4_t yh=vmulq_u32(vreinterpretq_u32_s32(w0h),vmovl_u16(vget_high_u16(h0)));
+        yh=vmlaq_u32(yh,vreinterpretq_u32_s32(w1h),vmovl_u16(vget_high_u16(ha)));
+        yh=vmlaq_u32(yh,vreinterpretq_u32_s32(w2h),vmovl_u16(vget_high_u16(hb)));
+        yh=vmlaq_u32(yh,vreinterpretq_u32_s32(w3h),vmovl_u16(vget_high_u16(h3)));
+        vst1_u8(O+x, vqmovn_u16(vcombine_u16(vrshrn_n_u32(yl,8),vrshrn_n_u32(yh,8))));
+    }
+#endif
+    p5_luma_scalar(O, Y, U, V, lut, MC, W, x);
+}
+
+/* P5 chroma row: block-avg luma + native Cb,Cr, gather LUT channels 1,2 (Cb|Cr = one u16). */
+static void p5_chroma_row(uint8_t *OU, uint8_t *OV, const uint16_t *Y0, const uint16_t *Y1,
+                          const uint16_t *U, const uint16_t *V, const uint8_t *lut,
+                          int MY, int MC, unsigned cw)
+{
+    unsigned x = 0;
+#if defined(__aarch64__)
+    P5_NEON_CONSTS;
+    const uint16x8_t m8q=vdupq_n_u16(0xff);
+    for (; x + 8 <= cw; x += 8) {
+        uint16x8_t y0a=vld1q_u16(Y0+2*x), y0b=vld1q_u16(Y0+2*x+8);
+        uint16x8_t y1a=vld1q_u16(Y1+2*x), y1b=vld1q_u16(Y1+2*x+8);
+        uint16x8_t avg=vaddq_u16(vpaddq_u16(y0a,y0b), vpaddq_u16(y1a,y1b));   /* 8 avgY4 */
+        uint16x8_t U8=vandq_u16(vld1q_u16(U+x),m1023q), V8=vandq_u16(vld1q_u16(V+x),m1023q);
+        P5_WIDEN(avg); P5_WIDEN(U8); P5_WIDEN(V8);
+        int32x4_t o0l,oal,obl,o3l,w0l,w1l,w2l,w3l, o0h,oah,obh,o3h,w0h,w1h,w2h,w3h;
+        P5_CALC4(avglo,U8lo,V8lo,MY,MC, o0l,oal,obl,o3l, w0l,w1l,w2l,w3l);
+        P5_CALC4(avghi,U8hi,V8hi,MY,MC, o0h,oah,obh,o3h, w0h,w1h,w2h,w3h);
+        int32_t o0[8],oa[8],ob[8],o3[8]; uint16_t g0[8],ga[8],gb[8],g3[8];
+        vst1q_s32(o0,o0l); vst1q_s32(o0+4,o0h); vst1q_s32(oa,oal); vst1q_s32(oa+4,oah);
+        vst1q_s32(ob,obl); vst1q_s32(ob+4,obh); vst1q_s32(o3,o3l); vst1q_s32(o3+4,o3h);
+        for (int i=0;i<8;i++){ memcpy(&g0[i],lut+o0[i]+1,2); memcpy(&ga[i],lut+oa[i]+1,2);
+                               memcpy(&gb[i],lut+ob[i]+1,2); memcpy(&g3[i],lut+o3[i]+1,2); }
+        uint16x8_t h0=vld1q_u16(g0),ha=vld1q_u16(ga),hb=vld1q_u16(gb),h3=vld1q_u16(g3);
+        uint16x8_t cb0=vandq_u16(h0,m8q),cba=vandq_u16(ha,m8q),cbb=vandq_u16(hb,m8q),cb3=vandq_u16(h3,m8q);
+        uint16x8_t cr0=vshrq_n_u16(h0,8),cra=vshrq_n_u16(ha,8),crb=vshrq_n_u16(hb,8),cr3=vshrq_n_u16(h3,8);
+        uint32x4_t uw0l=vreinterpretq_u32_s32(w0l),uw1l=vreinterpretq_u32_s32(w1l),uw2l=vreinterpretq_u32_s32(w2l),uw3l=vreinterpretq_u32_s32(w3l);
+        uint32x4_t uw0h=vreinterpretq_u32_s32(w0h),uw1h=vreinterpretq_u32_s32(w1h),uw2h=vreinterpretq_u32_s32(w2h),uw3h=vreinterpretq_u32_s32(w3h);
+        uint32x4_t bl=vmulq_u32(uw0l,vmovl_u16(vget_low_u16(cb0)));
+        bl=vmlaq_u32(bl,uw1l,vmovl_u16(vget_low_u16(cba))); bl=vmlaq_u32(bl,uw2l,vmovl_u16(vget_low_u16(cbb))); bl=vmlaq_u32(bl,uw3l,vmovl_u16(vget_low_u16(cb3)));
+        uint32x4_t bh=vmulq_u32(uw0h,vmovl_u16(vget_high_u16(cb0)));
+        bh=vmlaq_u32(bh,uw1h,vmovl_u16(vget_high_u16(cba))); bh=vmlaq_u32(bh,uw2h,vmovl_u16(vget_high_u16(cbb))); bh=vmlaq_u32(bh,uw3h,vmovl_u16(vget_high_u16(cb3)));
+        uint32x4_t rl=vmulq_u32(uw0l,vmovl_u16(vget_low_u16(cr0)));
+        rl=vmlaq_u32(rl,uw1l,vmovl_u16(vget_low_u16(cra))); rl=vmlaq_u32(rl,uw2l,vmovl_u16(vget_low_u16(crb))); rl=vmlaq_u32(rl,uw3l,vmovl_u16(vget_low_u16(cr3)));
+        uint32x4_t rh=vmulq_u32(uw0h,vmovl_u16(vget_high_u16(cr0)));
+        rh=vmlaq_u32(rh,uw1h,vmovl_u16(vget_high_u16(cra))); rh=vmlaq_u32(rh,uw2h,vmovl_u16(vget_high_u16(crb))); rh=vmlaq_u32(rh,uw3h,vmovl_u16(vget_high_u16(cr3)));
+        vst1_u8(OU+x, vqmovn_u16(vcombine_u16(vrshrn_n_u32(bl,8),vrshrn_n_u32(bh,8))));
+        vst1_u8(OV+x, vqmovn_u16(vcombine_u16(vrshrn_n_u32(rl,8),vrshrn_n_u32(rh,8))));
+    }
+#endif
+    p5_chroma_scalar(OU, OV, Y0, Y1, U, V, lut, MY, MC, cw, x);
+}
+
+/* P5 apply for one chunk: luma (full-res Y + co-sited chroma) + chroma (block-avg Y). */
+static void p5_apply_chunk(const TMData *td, const AVFrame *S, unsigned ybase, unsigned ch)
+{
+    const unsigned W = td->dst->width, cw = W/2;
+    AVFrame *D = td->dst;
+    const int sy=S->linesize[0]/2, su=S->linesize[1]/2, sv=S->linesize[2]/2;
+    const uint8_t *lut = td->p5_lut;
+    const int MC = P5_MC(td->p5_maxc), MYC = P5_MYC(td->p5_maxc);
+    static int selfcheck = -1;
+    if (selfcheck < 0) selfcheck = !!getenv("SAND_TM_SELFCHECK");
+    /* luma: full-res Y + nearest (replicated) chroma */
+    for (unsigned r=0; r<ch; r++) {
+        const uint16_t *Y=(const uint16_t*)S->data[0]+(size_t)r*sy;
+        const uint16_t *U=(const uint16_t*)S->data[1]+(size_t)(r/2)*su;
+        const uint16_t *V=(const uint16_t*)S->data[2]+(size_t)(r/2)*sv;
+        uint8_t *O=D->data[0]+(size_t)(ybase+r)*D->linesize[0];
+        p5_luma_row(O, Y, U, V, lut, MC, W);
+        if (selfcheck) {
+            uint8_t *ref=av_malloc(W); unsigned mx=0;
+            if (ref){ p5_luma_scalar(ref,Y,U,V,lut,MC,W,0);
+                for (unsigned x=0;x<W;x++){ unsigned d=O[x]>ref[x]?O[x]-ref[x]:ref[x]-O[x]; if(d>mx)mx=d; }
+                if (mx) av_log(NULL,AV_LOG_WARNING,"P5 luma selfcheck row %u: max %u\n",r,mx);
+                av_free(ref); }
+        }
+    }
+    /* chroma: block-avg luma + native Cb,Cr */
+    for (unsigned cr=0; cr<ch/2; cr++) {
+        const uint16_t *Y0=(const uint16_t*)S->data[0]+(size_t)(cr*2)*sy;
+        const uint16_t *Y1=(const uint16_t*)S->data[0]+(size_t)(cr*2+1)*sy;
+        const uint16_t *U=(const uint16_t*)S->data[1]+(size_t)cr*su;
+        const uint16_t *V=(const uint16_t*)S->data[2]+(size_t)cr*sv;
+        uint8_t *OU=D->data[1]+(size_t)(ybase/2+cr)*D->linesize[1];
+        uint8_t *OV=D->data[2]+(size_t)(ybase/2+cr)*D->linesize[2];
+        p5_chroma_row(OU, OV, Y0, Y1, U, V, lut, MYC, MC, cw);
+        if (selfcheck) {
+            uint8_t *ru=av_malloc(cw),*rv=av_malloc(cw); unsigned mx=0;
+            if (ru&&rv){ p5_chroma_scalar(ru,rv,Y0,Y1,U,V,lut,MYC,MC,cw,0);
+                for (unsigned x=0;x<cw;x++){ unsigned d=OU[x]>ru[x]?OU[x]-ru[x]:ru[x]-OU[x]; if(d>mx)mx=d;
+                    d=OV[x]>rv[x]?OV[x]-rv[x]:rv[x]-OV[x]; if(d>mx)mx=d; }
+                if (mx) av_log(NULL,AV_LOG_WARNING,"P5 chroma selfcheck row %u: max %u\n",cr,mx); }
+            av_free(ru); av_free(rv);
+        }
+    }
 }
 
 static void tm_apply_chunk(const TMData *td, const AVFrame *S, unsigned ybase, unsigned ch)
@@ -590,7 +951,10 @@ static int tm_slice(AVFilterContext *avctx, void *arg, int jobnr, int nb_jobs)
         src.crop_top    = td->src->crop_top + y;
         src.crop_bottom = td->src->height - (td->src->crop_top + y + ch);
         rv = av_rpi_sand_to_planar_frame(&s10, &src);   /* SAND30 -> 10-bit scratch */
-        if (!rv) tm_apply_chunk(td, &s10, y, ch);       /* 10-bit -> 8-bit YU12       */
+        if (!rv) {                                      /* 10-bit -> 8-bit YU12       */
+            if (td->tm == TM_P5) p5_apply_chunk(td, &s10, y, ch);
+            else                 tm_apply_chunk(td, &s10, y, ch);
+        }
     }
     av_free(sy); av_free(su); av_free(sv);
     return rv;
@@ -653,7 +1017,23 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     int nb = FFMIN(pool > 1 ? pool - 1 : 1, (int)(h / 2));
     nb = av_clip(nb, 1, 64);
     int rets[64] = { 0 };
-    const int do_tm = (s->tm != TM_NONE) && frame_is_hdr(in);
+    /* Dolby Vision profile 5: RPU present + base layer NOT HDR10-tagged. Its base
+     * is Dolby's reshaped IPT-PQ signal, so it must be reconstructed to HDR10 (via
+     * the per-RPU 3D LUT) before tone-mapping — the generic PQ path corrupts colour.
+     * Engage regardless of `tm` (even tm=none) so P5 never passes through wrong. */
+    const AVFrameSideData *dovi_sd = av_frame_get_side_data(in, AV_FRAME_DATA_DOVI_METADATA);
+    const int is_p5 = dovi_sd && !frame_is_hdr(in);
+    const int do_tm = is_p5 || ((s->tm != TM_NONE) && frame_is_hdr(in));
+
+    if (is_p5) {
+        const AVDOVIMetadata *meta = (const AVDOVIMetadata *)dovi_sd->data;
+        uint64_t hash = p5_calc_hash(meta);
+        if (!s->p5_valid || hash != s->p5_hash) {   /* rebuild on scene/RPU change */
+            if ((rv = p5_bake(s, meta)) < 0) goto fail_release;
+            s->p5_hash = hash;
+            av_log(avctx, AV_LOG_VERBOSE, "DV P5: baked base->SDR 3D LUT (RPU %016"PRIx64")\n", hash);
+        }
+    }
 
     if (!do_tm) {
         /* SDR / tm=none: single-pass SAND -> 8-bit YU12. */
@@ -671,9 +1051,11 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     } else {
         /* HDR tone-map: cache-tiled SAND -> 10-bit scratch -> LUT -> 8-bit YU12
          * (single-pass DRAM traffic; scratch stays L2-resident). */
-        TMData tdm = { .dst = tmp, .src = mapped, .H = h, .tm = s->tm,
+        TMData tdm = { .dst = tmp, .src = mapped, .H = h,
+                       .tm = is_p5 ? TM_P5 : s->tm,
                        .l64 = s->l64, .cb64 = s->cb64, .cr64 = s->cr64,
-                       .l64_next = s->l64_next };
+                       .l64_next = s->l64_next,
+                       .p5_lut = s->p5_lut, .p5_maxc = s->p5_maxc };
         dmabuf_sync(fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE);
         ff_filter_execute(avctx, tm_slice, &tdm, rets, nb);
         PROF(1);
