@@ -83,8 +83,9 @@ On the **HW path** the flags derive as:
 
 On the **SW path** (offline — sub-real-time: 1080p 4:4:4 10-bit ≈0.48×, 4K ≈0.05–0.10× on the pre-MC-NEON
 C decoder) HDR additionally needs a CPU tone-map (`zscale=t=linear:npl=100,tonemap=hable,zscale=t=bt709…`;
-needs a `zscale`-enabled build). The 10-bit software decode is now ~1.4× faster (≈1.6× less CPU) since the
-diagonal motion-comp kernels got NEON — still offline, but less so; see `TODO-rpi-input-support.md` §4.
+needs a `zscale`-enabled build). The 10-bit software decode is now **~1.3× faster** (thermal-fair A/B,
+4K 4:2:2) since the H.26x motion-comp kernels (uni/put/bi, all widths) got NEON — still offline, but less
+so; CABAC is now the wall. See `TODO-rpi-input-support.md` §4.
 
 **Validated** against the 59-clip ByteDance corpus (`samples/ByteDance-HEVC/`): the selector routes
 **37→HW / 22→SW** at a 720p target — matching every clip's measured `hw_transcode` verdict (0 mismatches)

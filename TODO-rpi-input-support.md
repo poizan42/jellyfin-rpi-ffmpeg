@@ -139,26 +139,35 @@ a ~44% chunk that still projects to **~1.4–1.6× faster 10-bit decode**. CABAC
    32-bit intermediate), and since the `h26x` template is shared by HEVC *and* VVC it's genuinely
    contribution-worthy — target upstream FFmpeg, not just this fork.
 
-   **PARTIALLY SHIPPED (2026-07-24) — the two profiled hot kernels, `uni_hv` luma + chroma, all widths.**
-   Added `ff_hevc_put_hevc_qpel_uni_hv_10_neon` (8-tap) + `ff_hevc_put_hevc_epel_uni_hv_10_neon` (4-tap),
-   one width-generic kernel each (the dsp table passes block width as an arg → one pointer per family
-   wired into every size slot), in `aarch64/h26x/qpel_neon.S` / `epel_neon.S`, gated `bit_depth==10`.
-   H fills a 128B-stride int16 scratch in 8-col blocks; V walks the width in 8-col blocks (shared
-   `calc_all`/`calc_all4` ring) + a partial tail for widths 4/6/12; the two-stage C shift fuses to
-   `sqrshrun #10 + umin 1023` (bit-exact for all int32 sums). **checkasm `hevc_pel` bit-exact vs C for
-   every width (4/6/8/12/16/24/32/48/64) at depth 10; full-decoder output md5-identical** to the C path
-   on the 4K 4:2:2 clip. **Measured (4K 4:2:2 10-bit, 200f decode, this A72):**
+   **SHIPPED (2026-07-24) — the full non-weighted 10-bit MC family (uni + put + bi), all widths.**
+   Added width-generic 10-bit kernels in `aarch64/h26x/qpel_neon.S` (luma, 8-tap) / `epel_neon.S`
+   (chroma, 4-tap), gated `bit_depth==10` (the dsp table passes block width as an arg → one pointer per
+   (family, my, mx) covers every size slot 4/6/8/12/16/24/32/48/64):
+   - **uni** `h`/`v`/`hv` → pixel out, fused `sqrshrun #6` (h/v) / `#10` (hv) `+ umin 1023`;
+   - **put** `h`/`v`/`hv` → int16 out (the bi-pred ref0 intermediate), `sqshrn #2`/`#6`;
+   - **bi** `pixels`/`h`/`v`/`hv` → reads src2, combines `clip((p+src2+16)>>5)` via s32 `saddl`+`sqrshrun #5`.
+   All fusions bit-exact to the two-stage C shifts. H fills a 128B-stride int16 scratch in 8-col blocks;
+   V walks the width in 8-col blocks (shared `calc_all`/`calc_all4` ring) + a partial tail for 4/6/12.
+   **checkasm `hevc_pel` bit-exact vs C for every width x {pixels,h,v,hv} x {uni,put,bi} x {luma,chroma}
+   at depth 10 (coverage proven by shift perturbation); full-decoder output md5-identical** to the C path.
 
-   | | wall (rtime) | CPU (utime) | that kernel's self% (perf) |
-   |---|---:|---:|---|
-   | C (hv in template) | ~41–48 s | ~142–154 s | luma 26.5% + chroma 17.5% |
-   | NEON hv | **~31–32 s** | **~90–95 s** | luma 14.0% + chroma 10.2% |
+   **Measured (4K 4:2:2 10-bit, this A72; full C-MC vs full NEON-MC, thermal-fair interleaved A/B —
+   the Pi 4 throttles, so only an interleaved comparison is trustworthy; utime is *not* throttle-independent):**
 
-   → **~1.35–1.45× wall, ~1.6× less CPU.** The kernels themselves run ~1.9× (the perf shares roughly
-   halve); the wall gain is Amdahl-capped by CABAC, which is now the top cost (`ff_hevc_hls_residual_coding`
-   21.9% + `get_cabac` 12.4% self — the serial floor of §3). **Still C (follow-on):** the single-pass
-   `put_hevc_qpel_uni_v/h_10` (~1% each here — B-frame/weighted content leans on `put`/`bi`/`uni_w`/`bi_w`
-   and the `h`/`v` variants), and 12-bit. Committed to the fork (`jellyfin-rpi`); prep for upstream.
+   | metric | full C MC | full NEON MC | ratio |
+   |---|---:|---:|---:|
+   | wall (150f) | ~26–27 s | ~20–22 s | **~1.25–1.3×** |
+   | CPU utime (150f) | ~92–107 s | ~70–79 s | **~1.3×** |
+
+   → **~1.3× faster 10-bit software decode.** Per-kernel, the hv apply roughly halves in the profile
+   (`qpel_uni_hv` 26.5→14.0% self, `epel_uni_hv` 17.5→10.2%, i.e. ~1.9× on the kernel); the end-to-end
+   gain is Amdahl-capped by **CABAC**, now the top cost (`ff_hevc_hls_residual_coding` 21.9% +
+   `get_cabac` 12.4% self — the serial floor of §3). Note: an earlier Phase-C figure of “~1.4× wall /
+   ~1.6× CPU” was from a *non-interleaved* A/B (the C build ran second, warm/throttled) and overstated
+   it; ~1.3× interleaved is the honest number. The RExt corpus is **uni-predicted**, so `put`/`bi` add
+   ~no local speedup here — they are coverage for B-frame content and upstream completeness (validated
+   bit-exact). **Still C (follow-on):** weighted pred `uni_w`/`bi_w` (fades; a large, rarer matrix),
+   and 12-bit. Committed to the fork (`jellyfin-rpi`); clean for upstream submission.
 2. **HEVC intra-prediction NEON** (planar/DC/angular, `hevc/pred_template.c`) — none exists; dominant for
    all-intra clips (`hevc_all_i`, RExt test set). Also likely worth upstreaming.
 3. **SAO 10-bit NEON** — 8-bit only today; small.
