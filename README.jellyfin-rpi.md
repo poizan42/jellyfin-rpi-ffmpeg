@@ -170,3 +170,26 @@ V3D GPU offload lose). Threading reaches the shared-bus ceiling with ~2–3 core
 free the rest of the machine for decode/encode. The tone-map tiers process the 10-bit scratch in
 small **`TM_CHUNK`=4-row L1-resident tiles** — a swept knee (16 rows thrashes L2, ~+14–18% slower);
 this is what brings `tm=accurate`/DV-P5-`fast` up to (near) real-time, bit-identically.
+
+### 4K → 1080p (larger output, same 4K CPU cost)
+
+Measured on true-4K sources (SDR: She-Hulk 2160p bt709; HDR10: Echo 2160p; DV P5: Agatha 2160p),
+500-frame steady state:
+
+| source | speed | notes |
+|---|---:|---|
+| 10-bit HEVC SDR 4K (3840×2160), `tm=none` | ~1.26× | no tone-map (SDR); unpack + ISP scale + encode |
+| 10-bit HEVC HDR10 4K (3840×2160), `tm=none` | ~1.02× | truncation, colour wrong |
+| 10-bit HEVC HDR10 4K (3840×2160), `tm=fast` | ~1.01× | **real-time, correct colour** |
+| 10-bit HEVC HDR10 4K (3840×2160), `tm=accurate` | ~0.89× | quality tier (NEON tetrahedral 3D-LUT) |
+| 10-bit HEVC Dolby Vision **profile 5** 4K, default/`tm=accurate` | ~0.66× | full 3D luma+chroma |
+| 10-bit HEVC Dolby Vision **profile 5** 4K, `tm=fast` | ~0.90× | 1D luma + full 3D chroma |
+| 10-bit HEVC Dolby Vision **profile 5** 4K, `tm=veryfast` | ~0.93× | + ordered-dithered nearest 3D chroma |
+
+The dominant cost is the **fixed 4K SAND unpack + tone-map apply on the CPU**, so the output
+resolution barely moves it — 1080p is only ~10–15% slower than →720p, and that delta is the
+(hardware, concurrent) ISP scale + H.264 encode of the larger frame, not the CPU path. Practical
+upshot: HDR10 `tm=fast` still lands right at real-time (~1.0×) at 1080p, but **DV P5 slips just
+below real-time even at `tm=veryfast` (~0.93×)** — the larger encode eats the headroom `veryfast`
+buys at 720p. For 4K→1080p DV P5, `dovi_tool` P5→P8.1 (offline, zero-CPU) is the fallback if strict
+real-time is required.
