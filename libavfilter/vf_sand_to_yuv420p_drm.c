@@ -328,7 +328,9 @@ static int frame_is_hdr(const AVFrame *in)
  * DRAM round-trip), then LUT it -> 8-bit YU12. Luma via the 1D curve (both tiers);
  * chroma: fast = separable 1D LUTs; accurate = chroma-res 3D LUT (trilinear, 2x2
  * block-avg luma). DRAM traffic ~ single-pass. */
-#define TM_CHUNK 16   /* rows per tile; scratch (10-bit) stays in L2 */
+#define TM_CHUNK 4   /* rows per tile; keeps the 10-bit scratch L1-resident. Swept 2/4/8/16 at 4K:
+                      * 16 thrashes L2 (accurate ~44ms/frame); 4 is the knee (~37.5ms, P5-fast → ~real-time).
+                      * Pure tiling granularity — output is bit-identical to any TM_CHUNK. */
 typedef struct TMData {
     AVFrame       *dst;   /* 8-bit YU12 (dma-buf) */
     const AVFrame *src;   /* SAND mapped frame    */

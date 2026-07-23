@@ -102,6 +102,22 @@ The accurate chroma 3D-LUT apply is NEON (8 chroma samples/iter: branchless tetr
 software gather; `tm3d_chroma_row` in `vf_sand_to_yuv420p_drm.c`), bit-exact to the scalar path.
 4K HDR: 0.65× (scalar) → **0.765× (+18%)**. A chroma-only 72 KB table repack gave nothing.
 
+**`TM_CHUNK`=4 tiling — SHIPPED, big cheap win (bit-exact).** The 10-bit scratch is tiled in
+`TM_CHUNK`-row bands; it was 16, which thrashes L2 at 4K. Swept 2/4/8/16 (SAND_PROF, Echo accurate):
+16 ≈ 44 ms/frame, 8 ≈ 38.6, **4 ≈ 37.5**, 2 ≈ 37.5 — 4 is the knee (L1-resident, past which loop
+overhead offsets the smaller footprint). End-to-end +13–18% across all scratch tiers, **bit-identical
+output** (pure tiling granularity): HDR10 fast 1.11→**1.17×**, HDR10 accurate 0.77→**~0.94×**, DV-P5
+default 0.55→**0.60×**, **DV-P5 `tm=fast` 0.73→~1.0× (real-time)**. This recovered ~6–7 ms of the
+~8 ms "lost-fusion" cost below, cheaply — reframing the register-fused kernel (next para) as marginal.
+
+**Register-fused SAND→apply kernel — now LOW VALUE (deferred).** The plan to fuse the SAND unpack +
+1D-luma + 3D-chroma into one register-only pass (never writing the 10-bit plane) targeted the ~8 ms
+lost-fusion cost. After `TM_CHUNK`=4 the L1-resident intermediate already costs little: the residual
+vs the fast tier's no-intermediate luma is only ~3.5 ms/frame (~37.5 vs ~34), i.e. the fuse would buy
+~5% more end-to-end for a large, intricate, error-prone kernel (2-row-windowed SAND reader with an
+inline tetrahedral gather). Not worth it now that P5-`fast` is already real-time. Revisit only if a
+few more % on the accurate tiers becomes critical.
+
 **Profiled breakdown (SAND_PROF, Echo 4K, filter unpack+apply wall time), correcting the earlier
 "gather is the wall" framing** — it isn't. `tm=fast` = 34 ms/frame; `tm=accurate` = 51 ms/frame.
 The +17 ms accurate penalty splits as: **~8 ms = loss of single-pass luma fusion** (the 3D chroma
