@@ -133,10 +133,11 @@ a ~44% chunk that still projects to **~1.4–1.6× faster 10-bit decode**. CABAC
 
 **Ranked opportunities (all software-decode only — the HW 4:2:0 path is unaffected):**
 1. **10-bit H.26x MC NEON** (qpel luma + epel chroma; `h`/`v`/`hv` and `put`/`uni`/`bi`/`*_w`) — the top
-   lever, ~44%+ of decode. **First check FFmpeg master**: aarch64 HEVC/VVC 10-bit MC NEON may already
-   exist upstream (the shared `h26x` template benefits HEVC *and* VVC) → backport rather than write. If
-   not upstream, it's a genuine contribution-worthy `.S` (widen the 8-bit `qpel_neon.S`/`epel_neon.S` to
-   16-bit loads / wider intermediates).
+   lever, ~44%+ of decode. **Checked upstream — not a backport: `aarch64/h26x/qpel_neon.S` + `epel_neon.S`
+   are 8-bit-only (`_8_neon`, zero `_10`/`_12`) at every version — n7.1.5, n8.0.3, AND current master.**
+   So it's a from-scratch `.S` (widen the 8-bit kernels to 16-bit loads / wider intermediates + `hv`
+   32-bit intermediate), and since the `h26x` template is shared by HEVC *and* VVC it's genuinely
+   contribution-worthy — target upstream FFmpeg, not just this fork.
 2. **HEVC intra-prediction NEON** (planar/DC/angular, `hevc/pred_template.c`) — none exists; dominant for
    all-intra clips (`hevc_all_i`, RExt test set). Also likely worth upstreaming.
 3. **SAO 10-bit NEON** — 8-bit only today; small.
