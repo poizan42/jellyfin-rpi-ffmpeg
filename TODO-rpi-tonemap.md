@@ -110,13 +110,20 @@ output** (pure tiling granularity): HDR10 fast 1.11→**1.17×**, HDR10 accurate
 default 0.55→**0.60×**, **DV-P5 `tm=fast` 0.73→~1.0× (real-time)**. This recovered ~6–7 ms of the
 ~8 ms "lost-fusion" cost below, cheaply — reframing the register-fused kernel (next para) as marginal.
 
-**Register-fused SAND→apply kernel — now LOW VALUE (deferred).** The plan to fuse the SAND unpack +
-1D-luma + 3D-chroma into one register-only pass (never writing the 10-bit plane) targeted the ~8 ms
-lost-fusion cost. After `TM_CHUNK`=4 the L1-resident intermediate already costs little: the residual
-vs the fast tier's no-intermediate luma is only ~3.5 ms/frame (~37.5 vs ~34), i.e. the fuse would buy
-~5% more end-to-end for a large, intricate, error-prone kernel (2-row-windowed SAND reader with an
-inline tetrahedral gather). Not worth it now that P5-`fast` is already real-time. Revisit only if a
-few more % on the accurate tiers becomes critical.
+**Register-fused SAND→apply kernel — TRIED, NEGATIVE (do not re-attempt).** Built the fused
+SAND30-unpack + 1D-luma + 3D-chroma → YU12 kernel: per 128-byte stripe (96 luma / 48 chroma sites),
+transcribed `USAND10` into tiny natural-order stack tiles (`vst3q`; chroma splits via `vld2q` since
+the 3-per-word stream is `U0,V0,U1,V1,…`), applied inline with all NEON constants hoisted out of the
+stripe loop (reusing `tm3d_calc4`), never writing a full 10-bit plane. Bit-identical to the
+`s10`-scratch path (md5). Both a reuse variant (per-stripe `lut1d_apply`/`tm3d_chroma_row` calls) and
+the fully-inlined variant were **no faster than `TM_CHUNK`=4** — SAND_PROF (Echo accurate): scratch
+36.9 ms vs fused 37.5 ms (marginally *slower*); end-to-end within run noise.
+**Why it failed:** the ~3.5 ms residual vs the fast tier is *not* the intermediate write (which
+`TM_CHUNK`=4 already made L1-cheap) — it's the **inherent 10-bit luma unpack** the cross-channel
+chroma 2×2 co-siting requires. The fast tier's `y8_lut` narrows to 8-bit *inside* the unpack and never
+forms 10-bit luma; the accurate/P5 chroma *must* have 10-bit luma, so that unpack cost is unavoidable
+regardless of fusion. Fusing only removes the (already-cheap) intermediate store, not the unpack.
+`TM_CHUNK`=4 captured essentially all the recoverable perf; P5-`fast` at ~1.0× is the real-time result.
 
 **Profiled breakdown (SAND_PROF, Echo 4K, filter unpack+apply wall time), correcting the earlier
 "gather is the wall" framing** — it isn't. `tm=fast` = 34 ms/frame; `tm=accurate` = 51 ms/frame.
