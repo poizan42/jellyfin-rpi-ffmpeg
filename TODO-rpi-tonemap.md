@@ -51,9 +51,17 @@ mandatory. Gather-latency-bound like the accurate tier; further CPU vectorisatio
 Faster on letterboxed scope content (fewer luma rows). Offline `dovi_tool` P5→P8.1 remains the
 zero-CPU alternative if a box is CPU-starved.
 
-Also related: `frame_is_hdr()` treats HLG (`ARIB_STD_B67`) as HDR but the LUTs are PQ-baked, so
-genuine HLG (incl. DV P8.4) is currently mis-tone-mapped (wrong transfer) — bake an HLG curve or
-gate it out.
+### HLG (ARIB_STD_B67) transfer  ✅ SHIPPED
+Was: `frame_is_hdr()` accepted HLG but the LUTs were PQ-baked, so genuine HLG (incl. DV P8.4) was
+mis-tone-mapped through the PQ curve. Fixed by baking a **second, HLG-input LUT set**
+(`ff_rpi_tm_*_hlg`, `rpi_tonemap_gen.py` now emits both PQ and HLG in one run — identical hable
+chain/grid, only the input `-color_trc` differs) and selecting by the frame's `color_trc` in
+`filter_frame` (thread active table pointers through `TMData`; `frame_is_hdr()` and the P5 gate
+unchanged, so P5/P8.1/P8.4 separation is intact). Validated: PQ output byte-identical (md5),
+`checkasm` + `SAND_TM_SELFCHECK` clean, HLG vs its zscale oracle 41/49/54 dB (Y/Cb/Cr — same
+fidelity the PQ tier gets), and ~17.7/255 mean-RGB correction vs the old PQ-on-HLG path, on a real
+main10 HLG clip. Note: **DV P8.4** (HLG base) tone-maps its HLG base directly and ignores the RPU
+for v1 — consistent with how P8.1 handles its HDR10 base.
 
 ### (original sketch — superseded by the 3D-LUT approach above)
 The first guess was `poly-luma 1D-LUT + gather-free NEON-MMR chroma`. We went with a composed 3D

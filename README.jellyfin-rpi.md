@@ -72,6 +72,13 @@ directly from that chain** into embedded LUTs (`libavfilter/rpi_tonemap_gen.py` 
 - `tm=none` (default) — plain truncation, byte-for-byte unchanged. **Exception:** a Dolby Vision
   profile 5 source always engages the DV path below (truncating it would corrupt colour).
 
+Both tiers select their tone LUTs by the frame's transfer: **PQ/HDR10** (SMPTE2084) uses the
+`ff_rpi_tm_*` set, **HLG** (ARIB_STD_B67, incl. DV P8.4's HLG base) uses a separately baked
+`ff_rpi_tm_*_hlg` set — same hable chain and grid, only the source EOTF differs, so HLG is
+linearized correctly instead of being mis-read through the PQ curve. Both sets are baked in one
+`rpi_tonemap_gen.py` run. HLG validated vs the zscale HLG→SDR oracle at 41/49/54 dB (Y/Cb/Cr),
+matching the PQ tier's own agreement with its oracle; PQ output stays byte-identical.
+
 **Dolby Vision profile 5** is handled automatically (no option): the P5 base layer is Dolby's
 *reshaped* IPT-PQ signal, not HDR10, so it's reconstructed to HDR10 from the per-frame RPU
 metadata (`AV_FRAME_DATA_DOVI_METADATA`) and then tone-mapped. Detected by RPU-present +
@@ -84,7 +91,7 @@ full 3D lookup since P5 luma is cross-channel). Validated bit-close to libplaceb
 HDR10 tonemap above. See `TODO-rpi-tonemap.md`.
 
 Deferred (see `TODO-rpi-tonemap.md`): command-line-tunable peak/operator/saturation, a BT.2390
-operator (`op=bt2390`), non-1000-nit peaks, 32-bit ARM parity for the tone LUTs, an HLG curve.
+operator (`op=bt2390`), non-1000-nit peaks, 32-bit ARM parity for the tone LUTs.
 
 ### 4. Build enablement for the HDR reference
 `--enable-libzimg` (`zscale`) gives a correct CPU HDR→SDR reference (`zscale+tonemap`).

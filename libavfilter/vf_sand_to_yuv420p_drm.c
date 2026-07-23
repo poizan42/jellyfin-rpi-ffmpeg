@@ -96,6 +96,7 @@ typedef struct BridgeContext {
     int      tm;           /* TM_NONE / TM_FAST / TM_ACCURATE (option) */
     uint8_t  l64[64], cb64[64], cr64[64];  /* 64-entry tbl LUTs (subsampled at init) */
     uint8_t  l64_next[64];                 /* l64_next[i]=curve((i+1)*16); for the single-pass .S kernel */
+    uint8_t  l64_hlg[64], cb64_hlg[64], cr64_hlg[64], l64_next_hlg[64];  /* HLG variants */
     /* Dolby Vision profile 5: per-RPU composed base-YCbCr(full-range) -> SDR 3D LUT */
     uint8_t *p5_lut;                       /* RPI_TM_LUT3D_N^3 * 3, rebuilt when the RPU changes */
     uint64_t p5_hash;                      /* hash of the RPU coeffs the bake consumed */
@@ -178,6 +179,10 @@ static av_cold int init(AVFilterContext *avctx)
         s->l64_next[i] = ff_rpi_tm_luma1d[FFMIN((i + 1) * 16, 1023)];
         s->cb64[i] = ff_rpi_tm_cb1d[i * 16];
         s->cr64[i] = ff_rpi_tm_cr1d[i * 16];
+        s->l64_hlg[i]      = ff_rpi_tm_luma1d_hlg[i * 16];
+        s->l64_next_hlg[i] = ff_rpi_tm_luma1d_hlg[FFMIN((i + 1) * 16, 1023)];
+        s->cb64_hlg[i] = ff_rpi_tm_cb1d_hlg[i * 16];
+        s->cr64_hlg[i] = ff_rpi_tm_cr1d_hlg[i * 16];
     }
     ff_mutex_init(&s->lock, NULL);
     s->heap_fd = open("/dev/dma_heap/linux,cma", O_RDWR | O_CLOEXEC);
@@ -328,6 +333,8 @@ typedef struct TMData {
     int            tm;
     const uint8_t *l64, *cb64, *cr64;  /* 64-entry tbl LUTs (fast NEON path) */
     const uint8_t *l64_next;           /* pairs with l64 for the single-pass .S kernel */
+    /* Active full-res tables for this frame's transfer (PQ or HLG). */
+    const uint8_t *luma1d, *cb1d, *cr1d, *lut3d;
     const uint8_t *p5_lut;             /* DV P5: base-YCbCr -> SDR 3D LUT (TM_P5) */
     int            p5_maxc;            /* P5 full-range grid extent (2^bl_bit_depth - 1) */
 } TMData;
@@ -364,7 +371,7 @@ static void lut1d_apply(uint8_t *dst, const uint16_t *src, unsigned n,
 static void tm3d_chroma_scalar(uint8_t *OU, uint8_t *OV,
                                const uint16_t *Y0, const uint16_t *Y1,
                                const uint16_t *U, const uint16_t *V,
-                               unsigned x0, unsigned cw)
+                               const uint8_t *lut3d, unsigned x0, unsigned cw)
 {
     const int N = RPI_TM_LUT3D_N;
     const int64_t MY = ((int64_t)(N-1)*64 *65536 + 438) / 876;
@@ -381,7 +388,7 @@ static void tm3d_chroma_scalar(uint8_t *OU, uint8_t *OV,
         int yi = ybq>>8, ui = ubq>>8, vi = vbq>>8;
         int fy = ybq&255, fu = ubq&255, fv = vbq&255;
         int yj = yi<N-1?yi+1:yi, uj = ui<N-1?ui+1:ui, vj = vi<N-1?vi+1:vi;
-#define C3(iy,iu,iv) (&ff_rpi_tm_lut3d[(((iy)*N+(iu))*N+(iv))*3])
+#define C3(iy,iu,iv) (&lut3d[(((iy)*N+(iu))*N+(iv))*3])
         const uint8_t *c0 = C3(yi,ui,vi), *c3 = C3(yj,uj,vj), *a, *b;
         int w0, w1, w2, w3;
         if (fy >= fu) {
@@ -446,7 +453,8 @@ static av_always_inline void tm3d_calc4(int32x4_t Y, int32x4_t Uu, int32x4_t Vv,
  * load per corner), then the Q8 weighted sum in u32. */
 static void tm3d_chroma_row(uint8_t *OU, uint8_t *OV,
                             const uint16_t *Y0, const uint16_t *Y1,
-                            const uint16_t *U, const uint16_t *V, unsigned cw)
+                            const uint16_t *U, const uint16_t *V,
+                            const uint8_t *lut3d, unsigned cw)
 {
     unsigned x = 0;
 #if defined(__aarch64__)
@@ -475,8 +483,8 @@ static void tm3d_chroma_row(uint8_t *OU, uint8_t *OV,
         vst1q_s32(o0,o0l); vst1q_s32(o0+4,o0h); vst1q_s32(oa,oal); vst1q_s32(oa+4,oah);
         vst1q_s32(ob,obl); vst1q_s32(ob+4,obh); vst1q_s32(o3,o3l); vst1q_s32(o3+4,o3h);
         for (int i=0;i<8;i++) {   /* software gather: one u16 (Cb|Cr) per corner per lane */
-            memcpy(&g0[i], ff_rpi_tm_lut3d+o0[i]+1, 2); memcpy(&ga[i], ff_rpi_tm_lut3d+oa[i]+1, 2);
-            memcpy(&gb[i], ff_rpi_tm_lut3d+ob[i]+1, 2); memcpy(&g3[i], ff_rpi_tm_lut3d+o3[i]+1, 2);
+            memcpy(&g0[i], lut3d+o0[i]+1, 2); memcpy(&ga[i], lut3d+oa[i]+1, 2);
+            memcpy(&gb[i], lut3d+ob[i]+1, 2); memcpy(&g3[i], lut3d+o3[i]+1, 2);
         }
         uint16x8_t h0=vld1q_u16(g0),ha=vld1q_u16(ga),hb=vld1q_u16(gb),h3=vld1q_u16(g3);
         uint16x8_t cb0=vandq_u16(h0,m8q),cba=vandq_u16(ha,m8q),cbb=vandq_u16(hb,m8q),cb3=vandq_u16(h3,m8q);
@@ -496,7 +504,7 @@ static void tm3d_chroma_row(uint8_t *OU, uint8_t *OV,
     }
 #undef CALC4
 #endif
-    tm3d_chroma_scalar(OU, OV, Y0, Y1, U, V, x, cw);   /* tail / non-NEON fallback */
+    tm3d_chroma_scalar(OU, OV, Y0, Y1, U, V, lut3d, x, cw);   /* tail / non-NEON fallback */
 }
 
 /* ---- Dolby Vision profile 5: per-RPU bake of base-YCbCr(full-range) -> SDR ----
@@ -854,7 +862,7 @@ static void tm_apply_chunk(const TMData *td, const AVFrame *S, unsigned ybase, u
     for (unsigned r = 0; r < ch; r++) {
         const uint16_t *Y = (const uint16_t *)S->data[0] + (size_t)r * sy;
         uint8_t *O = D->data[0] + (size_t)(ybase + r) * D->linesize[0];
-        lut1d_apply(O, Y, W, td->l64, ff_rpi_tm_luma1d);
+        lut1d_apply(O, Y, W, td->l64, td->luma1d);
     }
     if (td->tm == TM_FAST) {
         for (unsigned cr = 0; cr < ch / 2; cr++) {
@@ -862,8 +870,8 @@ static void tm_apply_chunk(const TMData *td, const AVFrame *S, unsigned ybase, u
             const uint16_t *V = (const uint16_t *)S->data[2] + (size_t)cr * sv;
             uint8_t *OU = D->data[1] + (size_t)(ybase/2 + cr) * D->linesize[1];
             uint8_t *OV = D->data[2] + (size_t)(ybase/2 + cr) * D->linesize[2];
-            lut1d_apply(OU, U, cw, td->cb64, ff_rpi_tm_cb1d);
-            lut1d_apply(OV, V, cw, td->cr64, ff_rpi_tm_cr1d);
+            lut1d_apply(OU, U, cw, td->cb64, td->cb1d);
+            lut1d_apply(OV, V, cw, td->cr64, td->cr1d);
         }
     } else { /* TM_ACCURATE — chroma-resolution 3D LUT, tetrahedral (NEON, bit-exact) */
         static int selfcheck = -1;
@@ -875,12 +883,12 @@ static void tm_apply_chunk(const TMData *td, const AVFrame *S, unsigned ybase, u
             const uint16_t *Y1 = (const uint16_t *)S->data[0] + (size_t)(cr*2+1) * sy;
             uint8_t *OU = D->data[1] + (size_t)(ybase/2 + cr) * D->linesize[1];
             uint8_t *OV = D->data[2] + (size_t)(ybase/2 + cr) * D->linesize[2];
-            tm3d_chroma_row(OU, OV, Y0, Y1, U, V, cw);
+            tm3d_chroma_row(OU, OV, Y0, Y1, U, V, td->lut3d, cw);
             if (selfcheck) {   /* DEBUG: NEON vs scalar on real frames, expect max 0 */
                 uint8_t *ru = av_malloc(cw), *rv = av_malloc(cw);
                 if (ru && rv) {
                     unsigned mx = 0;
-                    tm3d_chroma_scalar(ru, rv, Y0, Y1, U, V, 0, cw);
+                    tm3d_chroma_scalar(ru, rv, Y0, Y1, U, V, td->lut3d, 0, cw);
                     for (unsigned x = 0; x < cw; x++) {
                         unsigned d = OU[x] > ru[x] ? OU[x]-ru[x] : ru[x]-OU[x]; if (d > mx) mx = d;
                         d = OV[x] > rv[x] ? OV[x]-rv[x] : rv[x]-OV[x]; if (d > mx) mx = d;
@@ -925,8 +933,8 @@ static int tm_slice(AVFilterContext *avctx, void *arg, int jobnr, int nb_jobs)
             for (unsigned r = 0; r < ch / 2; r++) {
                 uint8_t *OU = td->dst->data[1] + (size_t)(y/2 + r) * td->dst->linesize[1];
                 uint8_t *OV = td->dst->data[2] + (size_t)(y/2 + r) * td->dst->linesize[2];
-                lut1d_apply(OU, su + (size_t)r * cw, cw, td->cb64, ff_rpi_tm_cb1d);
-                lut1d_apply(OV, sv + (size_t)r * cw, cw, td->cr64, ff_rpi_tm_cr1d);
+                lut1d_apply(OU, su + (size_t)r * cw, cw, td->cb64, td->cb1d);
+                lut1d_apply(OV, sv + (size_t)r * cw, cw, td->cr64, td->cr1d);
             }
         }
         av_free(su); av_free(sv);
@@ -1024,6 +1032,10 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     const AVFrameSideData *dovi_sd = av_frame_get_side_data(in, AV_FRAME_DATA_DOVI_METADATA);
     const int is_p5 = dovi_sd && !frame_is_hdr(in);
     const int do_tm = is_p5 || ((s->tm != TM_NONE) && frame_is_hdr(in));
+    /* HLG (ARIB_STD_B67) uses a different transfer than PQ, so its tone-map LUTs are
+     * baked separately (ff_rpi_tm_*_hlg). Select by the frame's transfer. (P5 never
+     * reaches here as HLG — is_p5 requires !frame_is_hdr; and its own path uses p5_lut.) */
+    const int is_hlg = in->color_trc == AVCOL_TRC_ARIB_STD_B67;
 
     if (is_p5) {
         const AVDOVIMetadata *meta = (const AVDOVIMetadata *)dovi_sd->data;
@@ -1053,8 +1065,14 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
          * (single-pass DRAM traffic; scratch stays L2-resident). */
         TMData tdm = { .dst = tmp, .src = mapped, .H = h,
                        .tm = is_p5 ? TM_P5 : s->tm,
-                       .l64 = s->l64, .cb64 = s->cb64, .cr64 = s->cr64,
-                       .l64_next = s->l64_next,
+                       .l64      = is_hlg ? s->l64_hlg      : s->l64,
+                       .cb64     = is_hlg ? s->cb64_hlg     : s->cb64,
+                       .cr64     = is_hlg ? s->cr64_hlg     : s->cr64,
+                       .l64_next = is_hlg ? s->l64_next_hlg : s->l64_next,
+                       .luma1d = is_hlg ? ff_rpi_tm_luma1d_hlg : ff_rpi_tm_luma1d,
+                       .cb1d   = is_hlg ? ff_rpi_tm_cb1d_hlg   : ff_rpi_tm_cb1d,
+                       .cr1d   = is_hlg ? ff_rpi_tm_cr1d_hlg   : ff_rpi_tm_cr1d,
+                       .lut3d  = is_hlg ? ff_rpi_tm_lut3d_hlg  : ff_rpi_tm_lut3d,
                        .p5_lut = s->p5_lut, .p5_maxc = s->p5_maxc };
         dmabuf_sync(fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE);
         ff_filter_execute(avctx, tm_slice, &tdm, rets, nb);
