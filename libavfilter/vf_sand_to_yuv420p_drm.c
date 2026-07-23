@@ -48,8 +48,9 @@ enum { TM_NONE = 0, TM_FAST, TM_VERYFAST, TM_ACCURATE, TM_P5, TM_P5_FAST, TM_P5_
 /* TM_VERYFAST: HDR10 -> same as TM_FAST (already real-time); DV P5 -> TM_P5_VERYFAST.
  * TM_P5: Dolby Vision profile 5, full 3D luma+chroma. TM_P5_FAST: 1D-luma (neutral-chroma)
  * approximation + 3D chroma — injected when a P5 frame is transcoded with tm=fast.
- * TM_P5_VERYFAST: 1D-luma + *nearest-neighbour* 3D chroma (one gather, no tetra blend) —
- * injected for P5 with tm=veryfast; ~+6% vs P5-fast, colour-approximate (grid-snapped chroma). */
+ * TM_P5_VERYFAST: 1D-luma + *nearest-neighbour* 3D chroma (one gather, no tetra blend) with
+ * ordered (Bayer) coordinate dither — injected for P5 with tm=veryfast; ~+6% vs P5-fast, the
+ * dither de-bands the grid-snapped chroma into sub-visible grain (colour-approximate). */
 
 #ifndef O_CLOEXEC
 #define O_CLOEXEC 0
@@ -828,13 +829,31 @@ static void p5_chroma_row(uint8_t *OU, uint8_t *OV, const uint16_t *Y0, const ui
     p5_chroma_scalar(OU, OV, Y0, Y1, U, V, lut, MY, MC, cw, x);
 }
 
-/* P5 chroma, NEAREST-NEIGHBOUR (tm=veryfast): round (avgY,Cb,Cr) to one grid cell -> a
- * single gather, no tetra select / weighted sum. ~halves the chroma apply arithmetic;
- * colour-approximate (snaps across the 33^3 grid ~28-code cells, visible on smooth
- * gradients). Opt-in speed tier; the tetrahedral p5_chroma_row stays the P5 default. */
+/* Ordered-dither matrix (standard Bayer 8x8, 0..63). Used by tm=veryfast to dither the
+ * 3D-LUT coordinate before the nearest-cell round, so grid quantization dissolves into
+ * sub-visible grain instead of hard steps. Indexed by pixel position -> deterministic. */
+static const uint8_t BAYER8[64] = {
+     0,32, 8,40, 2,34,10,42,
+    48,16,56,24,50,18,58,26,
+    12,44, 4,36,14,46, 6,38,
+    60,28,52,20,62,30,54,22,
+     3,35,11,43, 1,33, 9,41,
+    51,19,59,27,49,17,57,25,
+    15,47, 7,39,13,45, 5,37,
+    63,31,55,23,61,29,53,21,
+};
+/* Per-axis dither bias for site (x, chroma-row yrow): full-amplitude (amp256), spanning
+ * the whole [0,256) rounding interval (BAYER*4+2 -> [2,254]); axes decorrelated by tile
+ * phase offsets Y(0,0) U(+3,+5) V(+6,+2). Index stays in [0,N-1] for any bias<=254. */
+#define NN_BIAS(yrow,oy,x,ox) (BAYER8[(((yrow)+(oy))&7)*8 + (((x)+(ox))&7)]*4 + 2)
+
+/* P5 chroma, NEAREST-NEIGHBOUR + ordered dither (tm=veryfast): dither-round (avgY,Cb,Cr)
+ * to one grid cell -> a single gather, no tetra select / weighted sum. ~halves the chroma
+ * apply arithmetic; colour-approximate but the dither de-bands the 33^3 grid (~28-code
+ * cells) into grain. Opt-in speed tier; the tetrahedral p5_chroma_row stays the P5 default. */
 static void p5_chroma_nn_scalar(uint8_t *OU, uint8_t *OV, const uint16_t *Y0, const uint16_t *Y1,
                                 const uint16_t *U, const uint16_t *V, const uint8_t *lut,
-                                int MY, int MC, unsigned cw, unsigned x0)
+                                int MY, int MC, unsigned cw, unsigned x0, unsigned yrow)
 {
     const int N = RPI_TM_LUT3D_N, LIMQ = (N-1)<<8;
     for (unsigned x=x0; x<cw; x++) {
@@ -843,7 +862,9 @@ static void p5_chroma_nn_scalar(uint8_t *OU, uint8_t *OV, const uint16_t *Y0, co
         int uq=(int)(((int64_t)(U[x]&1023)*MC+32768)>>16);
         int vq=(int)(((int64_t)(V[x]&1023)*MC+32768)>>16);
         yq=yq<0?0:(yq>LIMQ?LIMQ:yq); uq=uq<0?0:(uq>LIMQ?LIMQ:uq); vq=vq<0?0:(vq>LIMQ?LIMQ:vq);
-        int yi=(yq+128)>>8, ui=(uq+128)>>8, vi=(vq+128)>>8;   /* round to nearest cell */
+        int yi=(yq+NN_BIAS(yrow,0,x,0))>>8;   /* ordered-dither round to nearest cell */
+        int ui=(uq+NN_BIAS(yrow,3,x,5))>>8;
+        int vi=(vq+NN_BIAS(yrow,6,x,2))>>8;
         yi = yi>N-1 ? N-1 : yi;
         ui = ui>N-1 ? N-1 : ui;
         vi = vi>N-1 ? N-1 : vi;
@@ -853,18 +874,25 @@ static void p5_chroma_nn_scalar(uint8_t *OU, uint8_t *OV, const uint16_t *Y0, co
 }
 static void p5_chroma_nn_row(uint8_t *OU, uint8_t *OV, const uint16_t *Y0, const uint16_t *Y1,
                              const uint16_t *U, const uint16_t *V, const uint8_t *lut,
-                             int MY, int MC, unsigned cw)
+                             int MY, int MC, unsigned cw, unsigned yrow)
 {
     unsigned x = 0;
 #if defined(__aarch64__)
     enum { N = RPI_TM_LUT3D_N };
-    const int32x4_t v32768=vdupq_n_s32(32768), v128=vdupq_n_s32(128), vz=vdupq_n_s32(0);
+    const int32x4_t v32768=vdupq_n_s32(32768), vz=vdupq_n_s32(0);
     const int32x4_t vLIMQ=vdupq_n_s32((N-1)<<8), vNm1=vdupq_n_s32(N-1);
     const int32x4_t vMY=vdupq_n_s32(MY), vMC=vdupq_n_s32(MC), vN=vdupq_n_s32(N), vST=vdupq_n_s32(3);
     const uint16x8_t m1023q=vdupq_n_u16(1023), m8q=vdupq_n_u16(0xff);
-    /* q = clamp((val*M + 32768)>>16, 0, LIMQ); idx = min((q+128)>>8, N-1) */
-#define NNIDX(val,vM) vminq_s32(vshrq_n_s32(vaddq_s32( \
-        vminq_s32(vmaxq_s32(vshrq_n_s32(vaddq_s32(vmulq_s32(val,vM),v32768),16),vz),vLIMQ), v128),8), vNm1)
+    /* Ordered-dither bias, built once per row: the main loop steps x by 8 from 0 and cw%8==0,
+     * so lane l always maps to Bayer column (l+ox)&7 (a fixed 8-lane pattern per row). */
+    int32_t bY[8], bU[8], bV[8];
+    for (int l=0;l<8;l++){ bY[l]=NN_BIAS(yrow,0,l,0); bU[l]=NN_BIAS(yrow,3,l,5); bV[l]=NN_BIAS(yrow,6,l,2); }
+    const int32x4_t bYl=vld1q_s32(bY), bYh=vld1q_s32(bY+4);
+    const int32x4_t bUl=vld1q_s32(bU), bUh=vld1q_s32(bU+4);
+    const int32x4_t bVl=vld1q_s32(bV), bVh=vld1q_s32(bV+4);
+    /* q = clamp((val*M + 32768)>>16, 0, LIMQ); idx = min((q+bias)>>8, N-1) */
+#define NNIDX(val,vM,vB) vminq_s32(vshrq_n_s32(vaddq_s32( \
+        vminq_s32(vmaxq_s32(vshrq_n_s32(vaddq_s32(vmulq_s32(val,vM),v32768),16),vz),vLIMQ), vB),8), vNm1)
 #define NNOFF(vy,vu,vv) vmulq_s32(vaddq_s32(vmulq_s32(vaddq_s32(vmulq_s32(vy,vN),vu),vN),vv),vST)
     for (; x + 8 <= cw; x += 8) {
         uint16x8_t y0a=vld1q_u16(Y0+2*x), y0b=vld1q_u16(Y0+2*x+8);
@@ -874,8 +902,8 @@ static void p5_chroma_nn_row(uint8_t *OU, uint8_t *OV, const uint16_t *Y0, const
         int32x4_t Ylo=vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(avg))), Yhi=vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(avg)));
         int32x4_t Ulo=vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(U8))),  Uhi=vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(U8)));
         int32x4_t Vlo=vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(V8))),  Vhi=vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(V8)));
-        int32x4_t offl=NNOFF(NNIDX(Ylo,vMY),NNIDX(Ulo,vMC),NNIDX(Vlo,vMC));
-        int32x4_t offh=NNOFF(NNIDX(Yhi,vMY),NNIDX(Uhi,vMC),NNIDX(Vhi,vMC));
+        int32x4_t offl=NNOFF(NNIDX(Ylo,vMY,bYl),NNIDX(Ulo,vMC,bUl),NNIDX(Vlo,vMC,bVl));
+        int32x4_t offh=NNOFF(NNIDX(Yhi,vMY,bYh),NNIDX(Uhi,vMC,bUh),NNIDX(Vhi,vMC,bVh));
         int32_t off[8]; uint16_t g[8];
         vst1q_s32(off,offl); vst1q_s32(off+4,offh);
         for (int i=0;i<8;i++) memcpy(&g[i], lut+off[i]+1, 2);   /* one u16 (Cb|Cr) per lane */
@@ -886,7 +914,7 @@ static void p5_chroma_nn_row(uint8_t *OU, uint8_t *OV, const uint16_t *Y0, const
 #undef NNIDX
 #undef NNOFF
 #endif
-    p5_chroma_nn_scalar(OU, OV, Y0, Y1, U, V, lut, MY, MC, cw, x);
+    p5_chroma_nn_scalar(OU, OV, Y0, Y1, U, V, lut, MY, MC, cw, x, yrow);
 }
 
 /* P5 apply for one chunk: luma (full-res Y + co-sited chroma) + chroma (block-avg Y). */
@@ -926,11 +954,11 @@ static void p5_apply_chunk(const TMData *td, const AVFrame *S, unsigned ybase, u
         const uint16_t *V=(const uint16_t*)S->data[2]+(size_t)cr*sv;
         uint8_t *OU=D->data[1]+(size_t)(ybase/2+cr)*D->linesize[1];
         uint8_t *OV=D->data[2]+(size_t)(ybase/2+cr)*D->linesize[2];
-        if (nn) p5_chroma_nn_row(OU, OV, Y0, Y1, U, V, lut, MYC, MC, cw);
+        if (nn) p5_chroma_nn_row(OU, OV, Y0, Y1, U, V, lut, MYC, MC, cw, ybase/2+cr);
         else    p5_chroma_row   (OU, OV, Y0, Y1, U, V, lut, MYC, MC, cw);
         if (selfcheck) {
             uint8_t *ru=av_malloc(cw),*rv=av_malloc(cw); unsigned mx=0;
-            if (ru&&rv){ if (nn) p5_chroma_nn_scalar(ru,rv,Y0,Y1,U,V,lut,MYC,MC,cw,0);
+            if (ru&&rv){ if (nn) p5_chroma_nn_scalar(ru,rv,Y0,Y1,U,V,lut,MYC,MC,cw,0,ybase/2+cr);
                          else    p5_chroma_scalar   (ru,rv,Y0,Y1,U,V,lut,MYC,MC,cw,0);
                 for (unsigned x=0;x<cw;x++){ unsigned d=OU[x]>ru[x]?OU[x]-ru[x]:ru[x]-OU[x]; if(d>mx)mx=d;
                     d=OV[x]>rv[x]?OV[x]-rv[x]:rv[x]-OV[x]; if(d>mx)mx=d; }

@@ -145,6 +145,22 @@ in `filter_frame`; `p5_apply_chunk` uses the 1D luma (like fast) + `p5_chroma_nn
 nearest-chroma middle ground would cost most of the arithmetic back for a fraction of the gain — not
 pursued. The tetrahedral arithmetic remains the floor for the accurate-quality tier.
 
+**De-banding `veryfast` — SHIPPED (ordered Bayer dither, ~free).** The nearest lookup's one flaw was
+grid-snap banding on smooth gradients. Fixed by **dithering the LUT coordinate** before the round: the
+`(q+128)>>8` nearest-round's `+128` becomes a per-pixel `BAYER8[...]*4+2` bias (full amplitude, spanning
+the whole [0,256) interval), decorrelated per axis (tile phase Y(0,0)/U(+3,+5)/V(+6,+2)), so cell
+boundaries dissolve into sub-visible grain that averages back to the interpolated colour. `p5_chroma_nn_row`
+builds 3 per-row bias vectors once (x%8==0 in the 8-wide loop ⇒ lane→column is a fixed per-row pattern),
+so the NEON inner loop is byte-for-byte the same op count as plain nearest — **the +6% is fully retained
+(~1.06×)**. Deterministic (function of x,y → md5-reproducible), NEON==scalar bit-exact (`SAND_TM_SELFCHECK`
+max 0). Quality (real P5, Agatha): per-pixel chroma ~45–51 dB vs tetrahedral (grain), **perceptual
+(5×5-blurred) ~63 dB** — visually the blotches are gone. This is what a research-agent investigation +
+standalone prototype (`scratchpad/dither_bench.c`: nearest 40–45 dB → dither 53 dB blur-PSNR, +10–14 dB)
+recommended over the alternatives (bilinear-in-chroma / single-axis-linear re-add gathers+arithmetic →
+collapse toward `fast`; finer 65³ grid keeps one gather but bloats the LUT 108KB→824KB out of cache).
+Follow-ups if ever needed: `amp128` bias (`*2+1`) halves the grain for a chroma-bitrate tradeoff; a 64×64
+blue-noise tile is a same-cost drop-in perceptual upgrade over Bayer.
+
 **Profiled breakdown (SAND_PROF, Echo 4K, filter unpack+apply wall time), correcting the earlier
 "gather is the wall" framing** — it isn't. (Numbers below are the *pre-`TM_CHUNK`=4* wall times that
 motivated the fusion work — `TM_CHUNK`=4 later cut accurate to ~37.5 ms; the *split* still holds.)
