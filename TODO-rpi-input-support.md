@@ -78,6 +78,34 @@ Directions (later):
 
 ---
 
+## 3. Accelerating the software-HEVC-decode wall — HW CABAC offload: RULED OUT for now
+
+Both §1 (non-4:2:0/12-bit → offline) and §2 (>4K → offline) bottom out on the same wall: **software
+HEVC decode on the A72**, whose slowest, inherently-serial part is CABAC entropy decode. Idea
+considered: offload that entropy stage to one of the Pi's fixed-function CABAC engines. **Ruled out
+under the current constraints** (no firmware modification / no custom VPU code):
+- **Argon (HEVC) CABAC** is ARM-reachable (rpivid drives the `hevc` MMIO block directly) but is *fused*
+  into a monolithic 4:2:0-only fixed-function pipeline — no standalone "entropy-only" tap, and it
+  rejects non-4:2:0 outright. Useless as a reusable primitive.
+- **H.264 CABAC** is the closer thing to a standalone entropy coprocessor (128-bit command ring +
+  doorbell), but it is **not ARM-visible** — it sits behind the VPU firmware / VCHIQ mailbox — and its
+  context models + command semantics are H.264-specific. Not reachable, and not obviously HEVC-usable.
+- Even if reachable, a per-symbol ARM↔coprocessor round-trip would likely cost more than the
+  arithmetic saved (CABAC decodes ~billions of bins/frame; these engines are meant to be sequenced by
+  adjacent silicon / on-die firmware, not driven symbol-by-symbol from the CPU).
+
+**Revisit only if/when the VPU-reversing strand yields the ability to run custom VPU code.** In that
+world one genuinely open question is worth an experiment: **can the H.264 CABAC command-queue engine be
+fed H.265 and produce anything useful?** The arithmetic range-decode *core* is shared between the two
+codecs even though context modeling / binarization differ — so a hybrid (engine does raw bin decoding,
+ARM/VPU does HEVC context selection) is at least conceivable. Speculative; strictly gated on the
+custom-VPU-code capability existing, and on driving the engine outside the firmware's H.264 path.
+See the parent research repo's `VideoCore-Codec-Architecture.md` §2 (H.264 CABAC command queue,
+registers `0x7f000b*`/`0x7f0027*`, doorbell `0x7f002714`) and §3 (the Argon HEVC block) for the
+reverse-engineered mechanics.
+
+---
+
 ## Not in scope (hard limits, for the record)
 - **Non-HEVC codecs** (H.264 / VP9 / AV1) — rpivid is HEVC-only; out of this pipeline entirely.
 - **Output beyond 8-bit 4:2:0 H.264 ≤1080p** — fixed by the bcm2835 encoder (level 4.0, one stream).
