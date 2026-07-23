@@ -5287,3 +5287,133 @@ function ff_hevc_put_hevc_epel_uni_w_v64_8_neon, export=1
         ldp             d8, d9, [sp], #64
         ret
 endfunc
+
+/* ---- 10-bit HEVC chroma epel uni_hv (all widths, width-generic) ---------
+ * void ff_hevc_put_hevc_epel_uni_hv_10_neon(
+ *      uint8_t *dst, ptrdiff_t dststride,            // x0 (u16), x1 bytes
+ *      const uint8_t *src, ptrdiff_t srcstride,      // x2 (u16), x3 bytes
+ *      int height, intptr_t mx, intptr_t my, int width); // x4, x5, x6, x7
+ * One function serves every chroma width — the dsp table passes the block
+ * width as an argument, so this pointer is wired into all width slots.
+ * C ref (h26x/h2656_inter_template.c put_uni_chroma_hv, BIT_DEPTH=10, 4-tap,
+ * CHROMA_EXTRA_BEFORE=1 / CHROMA_EXTRA=3):
+ *   h: tmp[x] = FILTER_h(src) >> 2                          (int16)
+ *   v: dst = clip3(0,1023, ((FILTER_v(tmp) >> 6) + 8) >> 4)
+ * Fused v-pass = sqrshrun #10 then umin 1023 (bit-exact, see luma note).
+ * H fills a 128-byte-stride int16 scratch (round-up-to-8 cols); V walks the
+ * width in 8-col blocks with calc_all4, plus a partial tail for 4/6/12.     */
+.macro calc_epelh_10 dst, src0, src1, src2, src3, op, shift
+        smull           \dst\().4s, \src0\().4h, v0.h[0]
+        smlal           \dst\().4s, \src1\().4h, v0.h[1]
+        smlal           \dst\().4s, \src2\().4h, v0.h[2]
+        smlal           \dst\().4s, \src3\().4h, v0.h[3]
+        \op             \dst\().4h, \dst\().4s, \shift
+.endm
+.macro calc_epelh2_10 dst, tmp, src0, src1, src2, src3, op, shift
+        smull2          \tmp\().4s, \src0\().8h, v0.h[0]
+        smlal2          \tmp\().4s, \src1\().8h, v0.h[1]
+        smlal2          \tmp\().4s, \src2\().8h, v0.h[2]
+        smlal2          \tmp\().4s, \src3\().8h, v0.h[3]
+        \op             \dst\().8h, \tmp\().4s, \shift
+.endm
+
+function ff_hevc_put_hevc_epel_uni_hv_10_neon, export=1
+        // ---- allocate int16 scratch: (h+3) rows * 128 bytes -------------
+        add             w9, w4, #3
+        lsl             w9, w9, #7              // (h+3)*128
+        mov             x11, sp                 // save sp
+        sub             sp, sp, x9              // tmp scratch (128-aligned)
+        // ---- H pass: src(u16) -> int16 tmp[stride 128], (h+3) rows ------
+        load_epel_filterh x5, x12               // v0 = horizontal filter (4-tap)
+        sub             x2, x2, x3              // src -= 1*srcstride
+        sub             x2, x2, #2              // src -= 1 sample (2 bytes)
+        mov             x9, #128                // tmp row stride
+        add             w10, w7, #7
+        lsr             w10, w10, #3            // nblocks = (width+7)/8
+        mov             x13, sp                 // tmp row base
+        add             w14, w4, #3             // rows = h+3
+1:      mov             x16, x2                 // src row ptr
+        mov             x17, x13                // tmp write ptr
+        mov             w15, w10                // block counter
+2:      ld1             {v16.8h, v17.8h}, [x16] // 16 samples for 8 outputs
+        add             x16, x16, #16           // advance 8 samples
+        ext             v18.16b, v16.16b, v17.16b, #2
+        ext             v19.16b, v16.16b, v17.16b, #4
+        ext             v20.16b, v16.16b, v17.16b, #6
+        calc_epelh_10   v1, v16, v18, v19, v20, sqshrn, #2
+        calc_epelh2_10  v1, v2, v16, v18, v19, v20, sqshrn2, #2
+        st1             {v1.8h}, [x17], #16
+        subs            w15, w15, #1
+        b.ne            2b
+        add             x2, x2, x3              // next src row
+        add             x13, x13, x9            // next tmp row
+        subs            w14, w14, #1
+        b.ne            1b
+        // ---- V pass: int16 tmp -> u16 dst, 8-col blocks + partial tail --
+        load_epel_filterh x6, x12               // v0 = vertical filter (4-tap)
+        mov             w15, #1023
+        dup             v3.8h, w15              // clip max
+        mov             x9, #128                // tmp row stride
+        mov             w15, w4                 // saved height
+        lsr             w16, w7, #3             // nfull = width/8
+        and             w17, w7, #7             // rem (0, 4 or 6)
+        mov             x12, sp                 // tmp column base
+        mov             x14, x0                 // dst block base
+        cbz             w16, 5f                 // no full 8-col blocks
+.macro calc src0, src1, src2, src3
+        ld1             {\src3\().8h}, [x13], x9
+        calc_epelh_10   v1, \src0, \src1, \src2, \src3, sqrshrun, #10
+        calc_epelh2_10  v1, v2, \src0, \src1, \src2, \src3, sqrshrun2, #10
+        umin            v1.8h, v1.8h, v3.8h
+        subs            w4, w4, #1
+        st1             {v1.8h}, [x0], x1
+.endm
+3:      mov             w4, w15                 // reset height
+        mov             x13, x12                // tmp read ptr
+        mov             x0, x14                 // dst ptr
+        ld1             {v16.8h}, [x13], x9
+        ld1             {v17.8h}, [x13], x9
+        ld1             {v18.8h}, [x13], x9
+1:      calc_all4
+2:      add             x12, x12, #16           // next tmp column block
+        add             x14, x14, #16           // next dst column block
+        subs            w16, w16, #1
+        b.ne            3b
+.purgem calc
+5:      cbz             w17, 6f                 // no remainder columns
+        // partial tail: compute an 8-wide block, store `rem` (4 or 6) cols
+        mov             w4, w15
+        mov             x13, x12
+        mov             x0, x14
+        ld1             {v16.8h}, [x13], x9
+        ld1             {v17.8h}, [x13], x9
+        ld1             {v18.8h}, [x13], x9
+        cmp             w17, #6
+        b.eq            7f
+        // rem == 4
+.macro calc src0, src1, src2, src3
+        ld1             {\src3\().8h}, [x13], x9
+        calc_epelh_10   v1, \src0, \src1, \src2, \src3, sqrshrun, #10
+        umin            v1.4h, v1.4h, v3.4h
+        subs            w4, w4, #1
+        st1             {v1.4h}, [x0], x1
+.endm
+1:      calc_all4
+2:      .purgem calc
+        b               6f
+        // rem == 6
+7:      sub             x1, x1, #8              // split-store stride adjust
+.macro calc src0, src1, src2, src3
+        ld1             {\src3\().8h}, [x13], x9
+        calc_epelh_10   v1, \src0, \src1, \src2, \src3, sqrshrun, #10
+        calc_epelh2_10  v1, v2, \src0, \src1, \src2, \src3, sqrshrun2, #10
+        umin            v1.8h, v1.8h, v3.8h
+        st1             {v1.4h}, [x0], #8
+        subs            w4, w4, #1
+        st1             {v1.s}[2], [x0], x1
+.endm
+1:      calc_all4
+2:      .purgem calc
+6:      mov             sp, x11
+        ret
+endfunc

@@ -5501,27 +5501,44 @@ qpel_bi_hv neon_i8mm
 DISABLE_I8MM
 #endif // HAVE_I8MM
 
-/* ---- 10-bit HEVC luma qpel uni_hv (prototype: width 8) ------------------
- * dst=x0 uint16, dststride=x1 bytes, src=x2 uint16, srcstride=x3 bytes,
- * height=x4, mx=x5, my=x6, width=x7(==8).
+/* ---- 10-bit HEVC luma qpel uni_hv (all widths, width-generic) -----------
+ * void ff_hevc_put_hevc_qpel_uni_hv_10_neon(
+ *      uint8_t *dst, ptrdiff_t dststride,            // x0 (u16), x1 bytes
+ *      const uint8_t *src, ptrdiff_t srcstride,      // x2 (u16), x3 bytes
+ *      int height, intptr_t mx, intptr_t my, int width); // x4, x5, x6, x7
+ * One function serves every luma width (4/6/8/12/16/24/32/48/64) — the C
+ * dsp table passes the block width as an argument, so this pointer is wired
+ * into all width slots.
  * C ref (h26x/h2656_inter_template.c put_uni_luma_hv, BIT_DEPTH=10):
- *   h: tmp[x] = FILTER_h(src) >> 2                    (int16)
+ *   h: tmp[x] = FILTER_h(src) >> 2                          (int16)
  *   v: val = FILTER_v(tmp) >> 6 ; dst = clip3(0,1023,(val+8)>>4)
- *   fused v: sqrshrun #10 (=(sum+512)>>10, sat u16) then umin 1023.
- * Both passes reuse calc_qpelh/calc_qpelh2 (s16->s32 MAC).                   */
-function ff_hevc_put_hevc_qpel_uni_hv8_10_neon, export=1
+ * The v-pass fuses to sqrshrun #10 (=(sum+512)>>10, sat u16) then umin 1023
+ * — bit-exact to the two-stage C for all int32 sums (the >>6 floor's +63
+ * span never crosses a 1024 boundary), then a u16 store.
+ * H fills a 128-byte-stride int16 scratch (round-up-to-8 cols); V walks the
+ * width in 8-col blocks with the shared calc_all ring, plus a partial tail
+ * for the non-multiple-of-8 widths (4/6/12).                                */
+function ff_hevc_put_hevc_qpel_uni_hv_10_neon, export=1
+        // ---- allocate int16 scratch: (h+7) rows * 128 bytes -------------
+        add             w9, w4, #7
+        lsl             w9, w9, #7              // (h+7)*128  (<= 71*128)
         mov             x11, sp                 // save sp
-        add             w10, w4, #7             // h+7 rows
-        lsl             x10, x10, #4            // *16 bytes (8 int16/row, tight)
-        sub             sp, sp, x10             // tmp_array on stack
-        // ---- H pass: (h+7) rows, src base = src - 3*srcstride - 3 samples
+        sub             sp, sp, x9              // tmp scratch (128-aligned)
+        // ---- H pass: src(u16) -> int16 tmp[stride 128], (h+7) rows ------
         load_qpel_filterh x5, x12               // v0 = horizontal filter
         sub             x2, x2, x3, lsl #1
         sub             x2, x2, x3              // src -= 3*srcstride
         sub             x2, x2, #6              // src -= 3 samples (6 bytes)
-        mov             x13, sp                 // tmp write ptr
-        add             w14, w4, #7             // row counter
-1:      ld1             {v16.8h, v17.8h}, [x2], x3   // 16 samples for 8 outputs
+        mov             x9, #128                // tmp row stride
+        add             w10, w7, #7
+        lsr             w10, w10, #3            // nblocks = (width+7)/8
+        mov             x13, sp                 // tmp row base
+        add             w14, w4, #7             // rows = h+7
+1:      mov             x16, x2                 // src row ptr
+        mov             x17, x13                // tmp write ptr
+        mov             w15, w10                // block counter
+2:      ld1             {v16.8h, v17.8h}, [x16] // 16 samples for 8 outputs
+        add             x16, x16, #16           // advance 8 samples
         ext             v18.16b, v16.16b, v17.16b, #2
         ext             v19.16b, v16.16b, v17.16b, #4
         ext             v20.16b, v16.16b, v17.16b, #6
@@ -5531,22 +5548,24 @@ function ff_hevc_put_hevc_qpel_uni_hv8_10_neon, export=1
         ext             v24.16b, v16.16b, v17.16b, #14
         calc_qpelh      v1, v16, v18, v19, v20, v21, v22, v23, v24, sqshrn, #2
         calc_qpelh2     v1, v2, v16, v18, v19, v20, v21, v22, v23, v24, sqshrn2, #2
-        st1             {v1.8h}, [x13], #16
+        st1             {v1.8h}, [x17], #16
+        subs            w15, w15, #1
+        b.ne            2b
+        add             x2, x2, x3              // next src row
+        add             x13, x13, x9            // next tmp row
         subs            w14, w14, #1
         b.ne            1b
-        // ---- V pass: 8-tap over tmp rows, fused output to 10-bit
+        // ---- V pass: int16 tmp -> u16 dst, 8-col blocks + partial tail --
         load_qpel_filterh x6, x12               // v0 = vertical filter
         mov             w15, #1023
         dup             v3.8h, w15              // clip max
-        mov             x9, #16                 // tmp row stride
-        mov             x13, sp                 // tmp read base
-        ld1             {v16.8h}, [x13], x9
-        ld1             {v17.8h}, [x13], x9
-        ld1             {v18.8h}, [x13], x9
-        ld1             {v19.8h}, [x13], x9
-        ld1             {v20.8h}, [x13], x9
-        ld1             {v21.8h}, [x13], x9
-        ld1             {v22.8h}, [x13], x9
+        mov             x9, #128                // tmp row stride
+        mov             w15, w4                 // saved height
+        lsr             w16, w7, #3             // nfull = width/8
+        and             w17, w7, #7             // rem (0, 4 or 6)
+        mov             x12, sp                 // tmp column base
+        mov             x14, x0                 // dst block base
+        cbz             w16, 5f                 // no full 8-col blocks
 .macro calc tmp, src0, src1, src2, src3, src4, src5, src6, src7
         ld1             {\tmp\().8h}, [x13], x9
         calc_qpelh      v1, \src0, \src1, \src2, \src3, \src4, \src5, \src6, \src7, sqrshrun, #10
@@ -5555,8 +5574,60 @@ function ff_hevc_put_hevc_qpel_uni_hv8_10_neon, export=1
         subs            w4, w4, #1
         st1             {v1.8h}, [x0], x1
 .endm
+3:      mov             w4, w15                 // reset height
+        mov             x13, x12                // tmp read ptr
+        mov             x0, x14                 // dst ptr
+        ld1             {v16.8h}, [x13], x9
+        ld1             {v17.8h}, [x13], x9
+        ld1             {v18.8h}, [x13], x9
+        ld1             {v19.8h}, [x13], x9
+        ld1             {v20.8h}, [x13], x9
+        ld1             {v21.8h}, [x13], x9
+        ld1             {v22.8h}, [x13], x9
 1:      calc_all
+2:      add             x12, x12, #16           // next tmp column block
+        add             x14, x14, #16           // next dst column block
+        subs            w16, w16, #1
+        b.ne            3b
 .purgem calc
-2:      mov             sp, x11
+5:      cbz             w17, 6f                 // no remainder columns
+        // partial tail: compute an 8-wide block, store `rem` (4 or 6) cols
+        mov             w4, w15
+        mov             x13, x12
+        mov             x0, x14
+        ld1             {v16.8h}, [x13], x9
+        ld1             {v17.8h}, [x13], x9
+        ld1             {v18.8h}, [x13], x9
+        ld1             {v19.8h}, [x13], x9
+        ld1             {v20.8h}, [x13], x9
+        ld1             {v21.8h}, [x13], x9
+        ld1             {v22.8h}, [x13], x9
+        cmp             w17, #6
+        b.eq            7f
+        // rem == 4
+.macro calc tmp, src0, src1, src2, src3, src4, src5, src6, src7
+        ld1             {\tmp\().8h}, [x13], x9
+        calc_qpelh      v1, \src0, \src1, \src2, \src3, \src4, \src5, \src6, \src7, sqrshrun, #10
+        umin            v1.4h, v1.4h, v3.4h
+        subs            w4, w4, #1
+        st1             {v1.4h}, [x0], x1
+.endm
+1:      calc_all
+2:      .purgem calc
+        b               6f
+        // rem == 6
+7:      sub             x1, x1, #8              // split-store stride adjust
+.macro calc tmp, src0, src1, src2, src3, src4, src5, src6, src7
+        ld1             {\tmp\().8h}, [x13], x9
+        calc_qpelh      v1, \src0, \src1, \src2, \src3, \src4, \src5, \src6, \src7, sqrshrun, #10
+        calc_qpelh2     v1, v2, \src0, \src1, \src2, \src3, \src4, \src5, \src6, \src7, sqrshrun2, #10
+        umin            v1.8h, v1.8h, v3.8h
+        st1             {v1.4h}, [x0], #8
+        subs            w4, w4, #1
+        st1             {v1.s}[2], [x0], x1
+.endm
+1:      calc_all
+2:      .purgem calc
+6:      mov             sp, x11
         ret
 endfunc
