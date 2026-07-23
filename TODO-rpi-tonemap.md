@@ -51,6 +51,17 @@ mandatory. Gather-latency-bound like the accurate tier; further CPU vectorisatio
 Faster on letterboxed scope content (fewer luma rows). Offline `dovi_tool` P5→P8.1 remains the
 zero-CPU alternative if a box is CPU-starved.
 
+**Fast tier (`tm=fast`) ✅ SHIPPED.** P5 now honours the `tm=` knob: default/`tm=accurate` = full
+3D luma+chroma (above); `tm=fast` (TM_P5_FAST) approximates luma with a **1D neutral-chroma curve**
+(`p5_luma1d`, baked per-RPU alongside the 3D LUT via the same `p5_decode_hdr10`+tone-curve, Cb=Cr=mid)
+applied with `lut1d_apply`, dropping the ~8.3M/frame 3D luma lookups; chroma stays the full 3D path
+(it's genuinely cross-channel). Structurally identical to the HDR10 accurate tier (10-bit scratch +
+1D luma + 3D chroma). **~0.73× at 4K** (vs 0.55×); luma ~45–51 dB vs the 3D path on real content
+(chroma bit-identical). Default P5 output is byte-unchanged (md5). Note: the single-pass `y8_lut`
+kernel is deliberately NOT used for P5 luma — the 3D chroma pass needs the 10-bit luma for 2×2
+co-siting anyway, so single-pass luma would force the slower "2-read" variant (see the dead-end note
+above); reusing the existing scratch + 1D `lut1d_apply` is both simpler and faster.
+
 ### HLG (ARIB_STD_B67) transfer  ✅ SHIPPED
 Was: `frame_is_hdr()` accepted HLG but the LUTs were PQ-baked, so genuine HLG (incl. DV P8.4) was
 mis-tone-mapped through the PQ curve. Fixed by baking a **second, HLG-input LUT set**

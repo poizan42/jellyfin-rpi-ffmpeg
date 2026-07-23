@@ -90,6 +90,12 @@ full 3D lookup since P5 luma is cross-channel). Validated bit-close to libplaceb
 (luma 3D lookup is heavier than HDR10's 1D luma; gather-bound). P8 (HDR10-tagged) uses the
 HDR10 tonemap above. See `TODO-rpi-tonemap.md`.
 
+P5 honours the `tm=` knob: `tm=none`/`accurate` (default) → the full 3D luma+chroma path above;
+**`tm=fast`** → a faster tier that approximates luma with a 1D neutral-chroma curve (baked per-RPU
+alongside the 3D LUT) while keeping chroma the full 3D path, so it drops the ~8.3M/frame 3D luma
+lookups. **~0.73× at 4K** (vs 0.55× accurate); luma within ~45–51 dB of the 3D path on real frames
+(chroma bit-identical). Colour-approximate but correct-hued — the accurate path stays the default.
+
 Deferred (see `TODO-rpi-tonemap.md`): command-line-tunable peak/operator/saturation, a BT.2390
 operator (`op=bt2390`), non-1000-nit peaks, 32-bit ARM parity for the tone LUTs.
 
@@ -144,7 +150,8 @@ HDR10 source — add `tm=fast` (real-time) or `tm=accurate` (quality):
 | 10-bit HEVC HDR10 4K (3840×2160), `tm=none` | ~1.16× | truncation, colour wrong |
 | 10-bit HEVC HDR10 4K (3840×2160), `tm=fast` | ~1.11× | **real-time, correct colour** (single-pass tone-map fold) |
 | 10-bit HEVC HDR10 4K (3840×2160), `tm=accurate` | ~0.77× | quality tier, not real-time (NEON tetrahedral 3D-LUT, gather-bound) |
-| 10-bit HEVC Dolby Vision **profile 5** 4K (3840×2160) | ~0.55× | correct colour via per-RPU 3D LUT + NEON tetrahedral (luma is a full 3D lookup); scalar was 0.15× |
+| 10-bit HEVC Dolby Vision **profile 5** 4K (3840×2160), default/`tm=accurate` | ~0.55× | correct colour via per-RPU 3D LUT + NEON tetrahedral (luma is a full 3D lookup); scalar was 0.15× |
+| 10-bit HEVC Dolby Vision **profile 5** 4K (3840×2160), `tm=fast` | ~0.73× | 1D neutral-chroma luma approx + full 3D chroma; luma ~45–51 dB vs accurate, chroma identical |
 
 The 4K unpack is **memory-latency-bound** on the scattered SAND reads (same wall that made the
 V3D GPU offload lose). Threading reaches the shared-bus ceiling with ~2–3 cores; the levers above

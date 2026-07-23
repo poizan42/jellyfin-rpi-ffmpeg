@@ -44,7 +44,9 @@
 #include "libavutil/opt.h"
 #include "rpi_tonemap_tables.h"   /* ff_rpi_tm_luma1d/cb1d/cr1d, ff_rpi_tm_lut3d, RPI_TM_LUT3D_N */
 
-enum { TM_NONE = 0, TM_FAST, TM_ACCURATE, TM_P5 };   /* TM_P5: Dolby Vision profile 5 (RPU reshape) */
+enum { TM_NONE = 0, TM_FAST, TM_ACCURATE, TM_P5, TM_P5_FAST };
+/* TM_P5: Dolby Vision profile 5, full 3D luma+chroma. TM_P5_FAST: 1D-luma (neutral-chroma)
+ * approximation + 3D chroma — injected when a P5 frame is transcoded with tm=fast. */
 
 #ifndef O_CLOEXEC
 #define O_CLOEXEC 0
@@ -102,6 +104,7 @@ typedef struct BridgeContext {
     uint64_t p5_hash;                      /* hash of the RPU coeffs the bake consumed */
     int      p5_valid;                     /* p5_lut currently holds a baked LUT */
     int      p5_maxc;                      /* 2^bl_bit_depth - 1 (full-range grid extent) */
+    uint8_t  p5_luma1d[1024], p5_l64[64];  /* P5 fast tier: base-Y -> SDR-Y at neutral chroma */
 } BridgeContext;
 
 /* Return a persistent read-only mapping of (fd,size), or NULL to signal the
@@ -337,6 +340,7 @@ typedef struct TMData {
     const uint8_t *luma1d, *cb1d, *cr1d, *lut3d;
     const uint8_t *p5_lut;             /* DV P5: base-YCbCr -> SDR 3D LUT (TM_P5) */
     int            p5_maxc;            /* P5 full-range grid extent (2^bl_bit_depth - 1) */
+    const uint8_t *p5_luma1d, *p5_l64; /* P5 fast tier: 1D neutral-chroma luma curve */
 } TMData;
 
 /* Apply a smooth 1024->8 tone curve to n contiguous 10-bit samples using a
@@ -636,6 +640,16 @@ static int p5_bake(BridgeContext *s, const AVDOVIMetadata *meta)
         e[0] = ff_rpi_tm_luma1d[Yhi];                 /* SDR Y  (1D tone curve) */
         p5_tm_chroma(Yh, Cbh, Crh, &e[1], &e[2]);     /* SDR Cb,Cr (3D tone LUT) */
     }
+    /* Fast tier: 1D base-Y -> SDR-Y curve at neutral chroma (Cb=Cr=mid). Approximates the
+     * cross-channel luma of the 3D LUT so the fast path can skip the full-res 3D luma lookup. */
+    const double neutral = (maxc + 1) / 2;
+    for (int y = 0; y < 1024; y++) {
+        double Yh, Cbh, Crh;
+        p5_decode_hdr10(&c, (double)FFMIN(y, maxc), neutral, neutral, &Yh, &Cbh, &Crh);
+        int Yhi = (int)lround(Yh); Yhi = Yhi<0?0:(Yhi>1023?1023:Yhi);
+        s->p5_luma1d[y] = ff_rpi_tm_luma1d[Yhi];
+    }
+    for (int i = 0; i < 64; i++) s->p5_l64[i] = s->p5_luma1d[i * 16];
     p5_gate_a(&c);
     s->p5_valid = 1;
     return 0;
@@ -819,12 +833,15 @@ static void p5_apply_chunk(const TMData *td, const AVFrame *S, unsigned ybase, u
     const int MC = P5_MC(td->p5_maxc), MYC = P5_MYC(td->p5_maxc);
     static int selfcheck = -1;
     if (selfcheck < 0) selfcheck = !!getenv("SAND_TM_SELFCHECK");
-    /* luma: full-res Y + nearest (replicated) chroma */
+    /* luma: TM_P5_FAST -> cheap 1D neutral-chroma curve (skips the full-res 3D lookup);
+     * TM_P5 -> full-res 3D lookup with nearest (replicated) chroma. */
+    const int fast = (td->tm == TM_P5_FAST);
     for (unsigned r=0; r<ch; r++) {
         const uint16_t *Y=(const uint16_t*)S->data[0]+(size_t)r*sy;
         const uint16_t *U=(const uint16_t*)S->data[1]+(size_t)(r/2)*su;
         const uint16_t *V=(const uint16_t*)S->data[2]+(size_t)(r/2)*sv;
         uint8_t *O=D->data[0]+(size_t)(ybase+r)*D->linesize[0];
+        if (fast) { lut1d_apply(O, Y, W, td->p5_l64, td->p5_luma1d); continue; }
         p5_luma_row(O, Y, U, V, lut, MC, W);
         if (selfcheck) {
             uint8_t *ref=av_malloc(W); unsigned mx=0;
@@ -960,7 +977,7 @@ static int tm_slice(AVFilterContext *avctx, void *arg, int jobnr, int nb_jobs)
         src.crop_bottom = td->src->height - (td->src->crop_top + y + ch);
         rv = av_rpi_sand_to_planar_frame(&s10, &src);   /* SAND30 -> 10-bit scratch */
         if (!rv) {                                      /* 10-bit -> 8-bit YU12       */
-            if (td->tm == TM_P5) p5_apply_chunk(td, &s10, y, ch);
+            if (td->tm == TM_P5 || td->tm == TM_P5_FAST) p5_apply_chunk(td, &s10, y, ch);
             else                 tm_apply_chunk(td, &s10, y, ch);
         }
     }
@@ -1064,7 +1081,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
         /* HDR tone-map: cache-tiled SAND -> 10-bit scratch -> LUT -> 8-bit YU12
          * (single-pass DRAM traffic; scratch stays L2-resident). */
         TMData tdm = { .dst = tmp, .src = mapped, .H = h,
-                       .tm = is_p5 ? TM_P5 : s->tm,
+                       .tm = is_p5 ? (s->tm == TM_FAST ? TM_P5_FAST : TM_P5) : s->tm,
                        .l64      = is_hlg ? s->l64_hlg      : s->l64,
                        .cb64     = is_hlg ? s->cb64_hlg     : s->cb64,
                        .cr64     = is_hlg ? s->cr64_hlg     : s->cr64,
@@ -1073,7 +1090,8 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
                        .cb1d   = is_hlg ? ff_rpi_tm_cb1d_hlg   : ff_rpi_tm_cb1d,
                        .cr1d   = is_hlg ? ff_rpi_tm_cr1d_hlg   : ff_rpi_tm_cr1d,
                        .lut3d  = is_hlg ? ff_rpi_tm_lut3d_hlg  : ff_rpi_tm_lut3d,
-                       .p5_lut = s->p5_lut, .p5_maxc = s->p5_maxc };
+                       .p5_lut = s->p5_lut, .p5_maxc = s->p5_maxc,
+                       .p5_luma1d = s->p5_luma1d, .p5_l64 = s->p5_l64 };
         dmabuf_sync(fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE);
         ff_filter_execute(avctx, tm_slice, &tdm, rets, nb);
         PROF(1);
