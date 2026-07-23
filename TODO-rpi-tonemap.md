@@ -125,6 +125,22 @@ forms 10-bit luma; the accurate/P5 chroma *must* have 10-bit luma, so that unpac
 regardless of fusion. Fusing only removes the (already-cheap) intermediate store, not the unpack.
 `TM_CHUNK`=4 captured essentially all the recoverable perf; P5-`fast` at ~1.0× is the real-time result.
 
+**Nearest-neighbour 3D chroma — TRIED, NEGATIVE (do not re-attempt).** To cut the ~9 ms chroma
+apply, replaced the tetrahedral (4-corner gather + 4-tap Q8 wsum + tetra select) with a
+nearest-neighbour cell lookup: round `(avgY4,Cb,Cr)` to one grid cell → **1 gather, no select, no
+wsum** (`tm3d_chroma_nn`, behind env `SAND_TM_NN`). NEON == scalar, tetrahedral path bit-identical
+when off. **Perf gain was only +6%** — P5-`fast` ~1.0→~1.06×, HDR10-accurate ~1.0→~1.06–1.07×
+(SAND_PROF setup+unpack ~37.5→~34.5 ms). The chroma apply is only ¼-resolution (4:2:0), so halving
+it saves ~3 ms of a ~37 ms filter, not the hoped ~5 ms. **Quality was unacceptable:** on HDR10 (Echo,
+smooth water/foliage) nn-vs-tetra chroma PSNR was only ~38 dB (max 15–16 codes; 56% of pixels differ
+>4 in RGB, 17% >10), and the crop shows **gross chroma blotching** — pink/red patches bleeding into
+the water reflection, shifted greens — not subtle banding but plainly wrong colour, from cells
+snapping across the ~28-code grid spacing in flat regions. P5 (Agatha) was milder (~46–48 dB, max 7–8)
+but the HDR10 failure disqualifies the method. A +6% gain does not justify visibly broken colour even
+as an opt-in tier; reverted. (A linear-in-Y + nearest-chroma middle ground would cost most of the
+arithmetic back for a fraction of the gain — not worth pursuing given the +6% ceiling.) The chroma
+apply arithmetic is the floor for the tetrahedral quality this pipeline ships.
+
 **Profiled breakdown (SAND_PROF, Echo 4K, filter unpack+apply wall time), correcting the earlier
 "gather is the wall" framing** — it isn't. `tm=fast` = 34 ms/frame; `tm=accurate` = 51 ms/frame.
 The +17 ms accurate penalty splits as: **~8 ms = loss of single-pass luma fusion** (the 3D chroma
