@@ -17,6 +17,40 @@ content from the command line, rather than hardcoded:
 Because the LUTs (1D fast, 3D accurate) are built from math at init, these should just re-parameterize
 the table builder — no per-frame cost. Rebuild tables only when a knob or the source peak changes.
 
+### Test corpus for the non-1000-nit `peak=` path
+The current tone-map assumes a 1000-nit source (the fallback). To validate the auto/`peak=`
+path we need HDR10 material authored at a *different* peak. Candidates from Kodi's curated
+sample list ([kodi.wiki/view/Samples](https://kodi.wiki/view/Samples)) — referenced by wiki
+section + sample title, so they're publicly retrievable — with the authored peak measured via
+`ffprobe` (mastering-display `max_luminance` / `MaxCLL`):
+
+**Primary — plain HDR10, HEVC, no Dolby Vision (directly usable by the rpivid pipeline):**
+| Kodi section → sample title | mastering peak | MaxCLL |
+|---|---|---|
+| 4K UHD/HDR → *HDR 10-bit HEVC 24fps (Exodus)* | **1200 nits** | — |
+| 4K UHD/HDR → *HDR10+ Profile B HEVC 10-bit 23.976* (Birds of Prey clip) | **4000 nits** | 683 |
+| HD audio → *DTS-HD MA 5.1 Baraka HDR Sample* | **4000 nits** | 1571 |
+
+**MaxCLL ≠ 1000 with mastering = 1000 (exercises the MaxCLL branch of auto-peak):**
+| Kodi section → sample title | mastering | MaxCLL |
+|---|---|---|
+| 4K UHD/HDR → *HDR10+ Profile A HEVC 10-bit 23.976* | 1000 | **2279** |
+| HD audio → *EAC3-JOC ATMOS Sample* | 1000 | **2666** |
+
+**Non-1000 but Dolby Vision (HEVC; usable only if the DV profile is handled — the pipeline
+does DV P5, these are P7/P8):**
+| Kodi section → sample title | mastering | MaxCLL / note |
+|---|---|---|
+| 4K UHD/HDR → *Dolby Vision demos (recovered)* → Food / Landscape / People | 4000 | 10000 / 8507 / 7264 |
+| 4K UHD/HDR → *DV FEL vs. BL comparisons* → Days of Thunder HDR12 | 4000 | 2863 (DV FEL, 12-bit dual-layer — likely not rpivid-decodable) |
+| 4K UHD/HDR → *HDR vs. Dolby Vision Looped Test Samples* → Alligator | 1000 / MaxCLL 10000 | DV per-frame L1 max = **706 nits** (DV-dynamic non-1000) |
+
+Notes: the transcode pipeline is **HEVC-only**, so the AV1/VP9 HDR samples in the same Kodi
+section (e.g. *Costa Rica 4K AV1*, *Alaska 8K AV1*, *HDR10+ VP9*) are out of scope regardless
+of peak. Samples with **no** mastering/MaxCLL metadata (e.g. *Camp by Sony*, *iPhone 11 HDR10*)
+hit the 1000 fallback and are fallback-path tests, not non-1000 tests. Several entries in the
+sample set may still be mid-download — re-probe peaks before relying on them.
+
 ## Dolby Vision profile 5 — RPU-reshaping path  ✅ SHIPPED (per-RPU baked 3D LUT + NEON apply)
 P5's base layer isn't HDR10 — it's Dolby's reshaped IPT-PQ signal — so the generic PQ tone-map
 (and plain 10→8 truncation) came out wrong-coloured; the correction lives in the RPU metadata,
