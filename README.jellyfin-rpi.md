@@ -270,3 +270,28 @@ real-time** — the earlier `dovi_tool` P5→P8.1 offline fallback is no longer 
 The dominant cost of the CPU filter is the **fixed 4K SAND unpack** (memory-latency-bound; unchanged
 by `out=half`, which is why the 4K→720p 3:1 case — non-integer, still full-res + ISP — keeps the
 `veryfast`+dither tier). `out=half` only helps the exact-2:1 path, but there it's decisive.
+
+### Software-decode path (offline)
+
+The formats rpivid can't decode — non-4:2:0 (4:2:2 / 4:4:4), 12-bit, or >4K — fall back to **software
+HEVC decode** (+ swscale + `h264_v4l2m2m`). These are all **offline / sub-real-time** and always will be
+(CABAC is the serial wall), but they benefit from the 10/12-bit MC NEON added in this fork (§
+`TODO-rpi-input-support.md` §4). Measured on this Pi 4B, current build, real samples
+(`samples/ByteDance-HEVC/`), decode → `scale=1280:720` → `format=yuv420p` → `h264_v4l2m2m`, steady-state
+(150–250 frames), **no HDR tone-map** (raw pipeline throughput):
+
+| input (→ 720p) | why SW | sample | fps | speed |
+|---|---|---|---:|---:|
+| 4K 4:2:2 10-bit (60p) | 4:2:2 | `hevc_4k60P_rext_10bit_422_eos_r5c_1` | 6.4 | **0.11×** |
+| 4K 4:2:2 10-bit (50p) | 4:2:2 | `hevc_4k50P` | 5.2 | 0.10× |
+| 4K 4:4:4 12-bit (24p) | 4:4:4 + 12-bit | `hevc_4K24P_rext_12bit_444_yuv444p12le_1` | 4.4 | **0.18×** |
+| 1080p 4:4:4 10-bit (24p) | 4:4:4 | `hevc_2K24P_rext_10bit_444_yuv444p10le_1` | 14 | **0.59×** |
+| 5.7K 4:2:0 8-bit (60p) | >4K | `hevc_5.7k60P_slice` | 8.4 | 0.14× |
+| 8K 4:2:0 8-bit (30p) | >4K | `hevc_8k30P_slice` | 4.9 | 0.16× |
+
+(`speed` is normalised to the source frame-rate, so 0.11× = 11 % of real-time.) These are up from the
+pre-MC-NEON C decoder (1080p 4:4:4 ≈0.48× → 0.59×; 4K 4:2:2 the top of the ≈0.05–0.10× range) — the
+~1.3× decode win, diluted end-to-end by the (unchanged) scale + encode stages. HDR sources additionally
+need a CPU tone-map (`zscale`+`tonemap`, absent from the lean build), which lowers these further. The
+practical takeaway is unchanged: **these formats are batch/offline on the Pi 4, not live** — real-time
+is only the HW 4:2:0-8/10-bit ≤4K path above.
