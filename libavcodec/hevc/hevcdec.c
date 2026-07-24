@@ -3254,6 +3254,36 @@ static int hevc_frame_start(HEVCContext *s, HEVCLayerContext *l,
         const HEVCSPS *sps_base = s->layers[0].sps;
         enum AVPixelFormat pix_fmt = sps->pix_fmt;
 
+        /* Snapshot the previous SPS's hardware-relevant geometry before
+         * set_sps() drops the old sps, so a cosmetic mid-stream SPS change
+         * (e.g. VUI timing only, as produced by concatenating two streams of
+         * differing frame rate) can be told apart from a real format/pool
+         * change. On an unchanged-geometry change we must NOT re-run
+         * get_format(): that tears down and rebuilds the hwaccel and its
+         * dma-heap CAPTURE pool while the old pool is still pinned by frames
+         * in flight, transiently doubling CMA use and exhausting it on the
+         * RPi v4l2-request path. Only the base layer is considered (a
+         * multilayer SPS change stays on the full-reinit path). */
+        const HEVCSPS *const sps_prev = (l == &s->layers[0]) ? l->sps : NULL;
+        int prev_w = 0, prev_h = 0, prev_bd = 0, prev_cf = 0, prev_dpb = 0;
+        int had_prev = 0;
+        enum AVPixelFormat prev_pf = AV_PIX_FMT_NONE;
+        /* hw_device_ctx (not avctx->hwaccel) is the reliable "hardware
+         * decode" signal here: for thread-unsafe hwaccels under frame
+         * threading the per-worker avctx->hwaccel is wiped by the pthread
+         * serialisation (so it reads NULL in this callback), whereas
+         * hw_device_ctx and l->sps are synced to every worker context. */
+        if (sps_prev && sps_prev->width > 0 && s->avctx->hw_device_ctx &&
+            sps_prev->vps->nb_layers < 2) {
+            had_prev = 1;
+            prev_w   = sps_prev->width;
+            prev_h   = sps_prev->height;
+            prev_pf  = sps_prev->pix_fmt;
+            prev_bd  = sps_prev->bit_depth;
+            prev_cf  = sps_prev->chroma_format_idc;
+            prev_dpb = sps_prev->temporal_layer[sps_prev->max_sub_layers - 1].max_dec_pic_buffering;
+        }
+
         if (l != &s->layers[0]) {
             if (!sps_base) {
                 av_log(s->avctx, AV_LOG_ERROR,
@@ -3291,12 +3321,42 @@ static int hevc_frame_start(HEVCContext *s, HEVCLayerContext *l,
             return ret;
 
         if (l == &s->layers[0]) {
+            /* export_stream_params() overwrites avctx->pix_fmt with the
+             * software format; get_format() normally runs right after and
+             * resets it to the negotiated (hwaccel) format. When the guard
+             * below skips get_format() we must restore it ourselves —
+             * otherwise decoded frames get tagged with the software pixfmt
+             * and the filtergraph reconfigures (and fails on the hw filters). */
+            const enum AVPixelFormat pix_fmt_negotiated = s->avctx->pix_fmt;
+
             export_stream_params(s, sps);
 
-            ret = get_format(s, sps);
-            if (ret < 0) {
-                set_sps(s, l, NULL);
-                return ret;
+            /* Re-run get_format() — which reinitialises the hwaccel and
+             * reallocates its dma-heap buffer pool — only when a
+             * hardware-relevant parameter actually changes. A same-geometry
+             * mid-stream SPS change (e.g. only VUI timing, or a smaller DPB,
+             * as when concatenating two streams) keeps the existing pipeline
+             * and hw_frames_ctx intact, avoiding a CMA-exhausting transient
+             * double allocation and the downstream filtergraph reinit.
+             * The existing CAPTURE pool is sized for prev_dpb decode slots and
+             * can serve a stream needing the same or fewer (>=); every other
+             * field must match exactly as they define the buffer format. */
+            int hw_geom_same = had_prev && sps->vps->nb_layers < 2 &&
+                prev_pf  == sps->pix_fmt &&
+                prev_w   == sps->width &&
+                prev_h   == sps->height &&
+                prev_bd  == sps->bit_depth &&
+                prev_cf  == sps->chroma_format_idc &&
+                prev_dpb >= sps->temporal_layer[sps->max_sub_layers - 1].max_dec_pic_buffering;
+
+            if (hw_geom_same) {
+                s->avctx->pix_fmt = pix_fmt_negotiated;
+            } else {
+                ret = get_format(s, sps);
+                if (ret < 0) {
+                    set_sps(s, l, NULL);
+                    return ret;
+                }
             }
 
             new_sequence = 1;

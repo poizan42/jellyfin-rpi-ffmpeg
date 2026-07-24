@@ -37,12 +37,19 @@ ramps/grid as `rpi_tonemap_gen.py`; the NEON apply is unchanged. HLG and DV-P5 u
 - **Mid-stream / live streams:** detection + rebuild is per-frame, keyed on `gen_peak`, so a
   peak that changes partway through a stream (spliced / dumped-live) triggers a rebuild at the
   boundary. The HEVC decoder makes the mastering/MaxCLL SEI sticky per coded-video-sequence
-  (`hevcdec.c` `set_side_data`), so there is no per-frame thrash. **Caveat (separate, pre-existing
-  limitation):** if the peak change coincides with an **SPS change** (different res/framerate at
-  the new CVS), the rpivid / v4l2-request HW **decoder** must reconfigure, which currently fails
-  on the Pi 4's 512 MB CMA (dma-heap exhaustion → RPS/dst-buffer errors → stall; reproduces with
-  `tm=none`, i.e. independent of the tone-map). A pure SEI/peak change with unchanged SPS
-  regenerates cleanly. Test clips + write-up: external sample disk `samples/hdr-splice-test/`.
+  (`hevcdec.c` `set_side_data`), so there is no per-frame thrash. **Cross-CVS SPS change —
+  FIXED** (`hevcdec.c` `hevc_frame_start`): the two spliced segments differ in a non-geometry
+  SPS field (here framerate/VUI and DPB depth), which used to force a full hwaccel/`hw_frames_ctx`
+  reinit at the new CVS → the rpivid v4l2-request pool was reallocated while the old pool was
+  still pinned by in-flight frames → transient ~2× CMA → dma-heap exhaustion on the Pi 4's 512 MB
+  CMA (RPS/dst-buffer errors → stall; reproduced with `tm=none`, i.e. independent of the
+  tone-map). Now a mid-stream SPS change whose decoded geometry is unchanged (same
+  width/height/pix_fmt/bit_depth/chroma, and DPB ≤ the existing pool) **skips** `get_format()`,
+  keeping the pool and `hw_frames_ctx` intact — the spliced 1200→1571 clip now transcodes end to
+  end (single- and multi-threaded, `tm=none` and `tm=accurate`; 149/149 frames). A genuine
+  resolution/bit-depth change still reinitialises (that path — mid-stream *resize* on the HW
+  decoder — remains a separate limitation). Test clips + write-up: external sample disk
+  `samples/hdr-splice-test/`.
 
 Original design notes (retained):
 Today the LUTs are baked at **build time** by `rpi_tonemap_gen.py` shelling out to
