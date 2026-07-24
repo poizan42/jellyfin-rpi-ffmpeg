@@ -57,7 +57,7 @@ path, the 22 that don't are exactly the 8K/5.7K set and the RExt 4:2:2/4:4:4/mon
 HW), so it's a wrapper-routing question, **not new kernels** (the Pi 4 never hardware-decodes them —
 no SAND frame is produced). But software HEVC decode is the wall and it's **below real-time even at
 1080p** (1080p 4:4:4 10-bit ≈0.48× / 12 fps; 4K 4:2:2/4:4:4 ≈0.05–0.10×), so treat this whole group
-as **offline/batch on the Pi 4**, not live. See `TODO-rpi-input-support.md`.
+as **offline/batch on the Pi 4**, not live. See [`TODO-rpi-input-support.md`](TODO-rpi-input-support.md).
 
 ## Path selection
 
@@ -85,7 +85,7 @@ On the **SW path** (offline — sub-real-time: 1080p 4:4:4 10-bit ≈0.48×, 4K 
 C decoder) HDR additionally needs a CPU tone-map (`zscale=t=linear:npl=100,tonemap=hable,zscale=t=bt709…`;
 needs a `zscale`-enabled build). The 10-bit software decode is now **~1.3× faster** (thermal-fair A/B,
 4K 4:2:2) since the H.26x motion-comp kernels (uni/put/bi, all widths) got NEON — still offline, but less
-so; CABAC is now the wall. See `TODO-rpi-input-support.md` §4.
+so; CABAC is now the wall. See [`TODO-rpi-input-support.md` §4](TODO-rpi-input-support.md#4-software-hevc-decode--profiled-neon-gaps-the-productive-lever-for-12).
 
 **Validated** against the 59-clip ByteDance corpus (`samples/ByteDance-HEVC/`): the selector routes
 **37→HW / 22→SW** at a 720p target — matching every clip's measured `hw_transcode` verdict (0 mismatches)
@@ -149,7 +149,7 @@ with the same zscale/hable tone LUT), then applied with NEON fixed-point tetrahe
 full 3D lookup since P5 luma is cross-channel). Validated bit-close to libplacebo
 (`apply_dolbyvision`): HDR10 decode ≥62 dB PSNR, end-to-end SDR ≥51 dB. Perf ~0.60× at 4K
 (luma 3D lookup is heavier than HDR10's 1D luma; gather-bound). P8 (HDR10-tagged) uses the
-HDR10 tonemap above. See `TODO-rpi-tonemap.md`.
+HDR10 tonemap above. See [`TODO-rpi-tonemap.md`](TODO-rpi-tonemap.md).
 
 P5 honours the `tm=` knob: `tm=none`/`accurate` (default) → the full 3D luma+chroma path above;
 **`tm=fast`** → a faster tier that approximates luma with a 1D neutral-chroma curve (baked per-RPU
@@ -167,7 +167,7 @@ NEON==scalar bit-exact, and free (it's just the round's `+128` becoming a per-pi
 tier; fast/accurate stay the defaults. On HDR10/HLG sources `tm=veryfast` is identical to `tm=fast`
 (their chroma is already the cheap separable path — only P5's cross-channel 3D chroma has anything to drop).
 
-Deferred (see `TODO-rpi-tonemap.md`): command-line-tunable peak/operator/saturation, a BT.2390
+Deferred (see [`TODO-rpi-tonemap.md`](TODO-rpi-tonemap.md)): command-line-tunable peak/operator/saturation, a BT.2390
 operator (`op=bt2390`), non-1000-nit peaks, 32-bit ARM parity for the tone LUTs.
 
 ### 4. Build enablement for the HDR reference
@@ -273,13 +273,13 @@ by `out=half`, which is why the 4K→720p 3:1 case — non-integer, still full-r
 
 ### Software-decode path (offline)
 
-(Optimization log, shipped wins and negative results for this path: `SW-DECODE-OPTIMIZATION.md`;
-entropy-decode deep dive: `CABAC-SIMD-analysis.md`.)
+(Optimization log, shipped wins and negative results for this path: [`SW-DECODE-OPTIMIZATION.md`](SW-DECODE-OPTIMIZATION.md);
+entropy-decode deep dive: [`CABAC-SIMD-analysis.md`](CABAC-SIMD-analysis.md).)
 
 The formats rpivid can't decode — non-4:2:0 (4:2:2 / 4:4:4), 12-bit, or >4K — fall back to **software
 HEVC decode** (+ swscale + `h264_v4l2m2m`). These are all **offline / sub-real-time** and always will be
-(CABAC is the serial wall), but they benefit from the 10/12-bit MC NEON added in this fork (§
-`TODO-rpi-input-support.md` §4) and the **12-bit inverse-transform NEON** added here (the 12-bit
+(CABAC is the serial wall), but they benefit from the 10/12-bit MC NEON added in this fork (see
+[`TODO-rpi-input-support.md` §4](TODO-rpi-input-support.md#4-software-hevc-decode--profiled-neon-gaps-the-productive-lever-for-12)) and the **12-bit inverse-transform NEON** added here (the 12-bit
 `idct[]` was falling back to C — only `idct_dc` was wired). Measured on this Pi 4B, current build, real samples
 (`samples/ByteDance-HEVC/`), decode → `scale=1280:720` → `format=yuv420p` → `h264_v4l2m2m`, steady-state
 (150–250 frames), **no HDR tone-map** (raw pipeline throughput):
