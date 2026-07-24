@@ -202,3 +202,56 @@ decode.**
 - `libavcodec/hevc/cabac.c:981-1491` — `ff_hevc_hls_residual_coding`; dequant/scaling
   `:1411-1434`; bypass call-sites `:897,:948,:952,:963,:976`; gt1/ctx_set `:1329-1345`.
 - `libavcodec/hevc/hevcdec.c:2828` — WPP thread parallelism (`hls_decode_entry_wpp`).
+
+---
+
+## 7. Prior-art verification — rpi-ffmpeg `by22` (VERIFIED)
+
+Follow-up to experiment #1 (§6): the `by22` bypass-batching prior art was located and
+audited against the actual source. **It is real, and it ports to our aarch64 target in
+pure C — no assembly required.**
+
+**Source.** jc-kynesim/rpi-ffmpeg (already the `rpi` remote in this submodule), branches
+`work/rpi_hevc_master_3` and `work/rpi_cabac_7`. Code in `libavcodec/hevc_cabac.c`
+(the four `get_cabac_by22_{start,finish,peek,flush}` inlines + `bypass_start/finish`
+macros + `alt1cabac_inv_range[256]` table + `hevc_mem_bits32` loader), `libavcodec/cabac.h`
+(the `by22` state), and a **32-bit-only** `libavcodec/arm/hevc_cabac.h` (asm peek/flush).
+
+**Mechanism (confirms §3's algebra exactly).** `bypass_start` repacks decoder state so
+`low` holds ~22 fresh stream bits and stashes a per-`range` reciprocal; `by22_peek`
+returns 22 bypass bits via one **reciprocal multiply** `((uint64_t)low*inv)>>32` — the
+closed form for "R constant across a bypass run"; `flush(n,val)` consumes only the bits
+actually used and refills. A whole Exp-Golomb/Rice value decodes in a few instructions
+(prefix `= clz(~y)`, then suffix shifts) instead of a per-bin `while(get_cabac_bypass())`.
+
+**Portability findings:**
+1. **No aarch64 asm exists** (hand asm is 32-bit `arm/` only) — but it doesn't matter.
+   `USE_BY22 = HAVE_FAST_64BIT || ARCH_ARM || ARCH_x86`; `USE_BY22_DIV = ARCH_X86`. On this
+   build `HAVE_FAST_64BIT=1`, `ARCH_X86=0` (both in `config.h`), so aarch64 takes the
+   **generic-C reciprocal-table path** (`alt1cabac_inv_range`, 64-bit `umulh`-style
+   multiply). The batching win is available in **portable C, zero assembly**.
+2. **Reimplementation, not cherry-pick.** The rpi fork is an old *flat*-layout,
+   heavily-customized decoder (`s->HEVClc->cc`, `PROFILE_*`); our tree is modern nested
+   `hevc/cabac.c`. The patch will not apply; the ~150-line primitive ports cleanly, the
+   call-site rewrites are the labour.
+3. **Target sites confirmed one-bin-at-a-time today:** `coeff_abs_level_remaining_decode`
+   (`hevc/cabac.c:941`), `coeff_sign_flag_decode` (`:971`),
+   `last_significant_coeff_suffix_decode` (`:892`); 29 `get_cabac_bypass` sites total.
+
+**Scoped port:**
+- Add `by22` fields to `CABACContext` in `cabac.h` (our decoder struct has no union — add
+  `uint16_t bits, range`; ~free).
+- Port the primitive: `alt1cabac_inv_range[256]`, `hevc_mem_bits32`, `hevc_clz32`, the four
+  `get_cabac_by22_*` inlines.
+- Rewrite the three decoders above to bracket the coefficient-subset loop with
+  `bypass_start/finish` and use `peek/flush`.
+- Bracket correctly around WPP state save/load & `cabac_reinit` (must not be mid-`by22` at
+  a save point).
+
+**Caveats:** `start/finish` has fixed overhead → only worth it for *runs* of bypass bins
+(the rpi source itself notes "probably not worth it for just one value"); `CABAC_BITS=16`
+matches ours; rpi-ffmpeg is LGPL (same as this tree) → adapt-with-attribution is fine.
+Validate bit-exact with `-f md5`, measure with `perf` on `ffmpeg_g`.
+
+**Verdict:** genuinely portable, no SVE/gather/asm dependency — a C primitive plus targeted
+call-site rewrites, with same-CPU precedent. Low-to-medium effort; recommended prototype.
