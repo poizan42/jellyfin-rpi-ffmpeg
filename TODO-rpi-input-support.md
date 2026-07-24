@@ -166,8 +166,20 @@ a ~44% chunk that still projects to **~1.4–1.6× faster 10-bit decode**. CABAC
    ~1.6× CPU” was from a *non-interleaved* A/B (the C build ran second, warm/throttled) and overstated
    it; ~1.3× interleaved is the honest number. The RExt corpus is **uni-predicted**, so `put`/`bi` add
    ~no local speedup here — they are coverage for B-frame content and upstream completeness (validated
-   bit-exact). **Still C (follow-on):** weighted pred `uni_w`/`bi_w` (fades; a large, rarer matrix),
-   and 12-bit. Committed to the fork (`jellyfin-rpi`); clean for upstream submission.
+   bit-exact).
+
+   **COMPLETE (2026-07-24): the entire HEVC motion-comp NEON, 10- AND 12-bit.** Beyond the profiled
+   `uni_hv`, the full family is now NEON, all checkasm bit-exact (839 `hevc_pel` cases pass at depth
+   8/10/12): **uni** (h/v/hv), **put** (h/v/hv, int16 out — the bi ref0 intermediate), **bi** (pixels/
+   h/v/hv, +src2 combine), **uni_w** and **bi_w** (weighted uni/bi — variable runtime shift via
+   `dup`+`sqrshl`/`sshl`, weights/offsets from the extra stack args), each for luma (qpel, 8-tap) and
+   chroma (epel, 4-tap), every width. 12-bit is derived from 10-bit by constant substitution (h-shift
+   #4, uni-hv v #8, bi #3, bi_w log2Wd base +2, ox<<4, pixels<<2, clip 4095); the two paths could be a
+   single BD-parameterised macro set — a worthwhile upstream cleanup, deferred to keep the shipped
+   10-bit untouched. Measured decode win is the ~1.3× above (uni-predicted corpus); `put`/`bi`/`*_w`
+   are coverage for B-frame / weighted content and upstream completeness. 8-bit path unchanged.
+   Committed to the fork (`jellyfin-rpi`); clean for upstream submission (benefits all aarch64,
+   HEVC + VVC via the shared `h26x` template).
 2. **HEVC intra-prediction NEON** (planar/DC/angular, `hevc/pred_template.c`) — none exists; dominant for
    all-intra clips (`hevc_all_i`, RExt test set). Also likely worth upstreaming.
 3. **SAO 10-bit NEON** — 8-bit only today; small.
