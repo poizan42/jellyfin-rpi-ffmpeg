@@ -48,8 +48,9 @@ ramps/grid as `rpi_tonemap_gen.py`; the NEON apply is unchanged. HLG and DV-P5 u
   keeping the pool and `hw_frames_ctx` intact — the spliced 1200→1571 clip now transcodes end to
   end (single- and multi-threaded, `tm=none` and `tm=accurate`; 149/149 frames). A genuine
   resolution/bit-depth change still reinitialises (that path — mid-stream *resize* on the HW
-  decoder — remains a separate limitation). Test clips + write-up: external sample disk
-  `samples/hdr-splice-test/`.
+  decoder — remains a separate limitation; reproducers `hevc_res_splice_2160p_then_1080p.hevc`
+  and `hevc_depth_splice_10bit_then_8bit.hevc` still fail at the boundary by design). Test
+  clips + write-up: external sample disk `samples/hdr-splice-test/`.
 
 Original design notes (retained):
 Today the LUTs are baked at **build time** by `rpi_tonemap_gen.py` shelling out to
