@@ -323,12 +323,20 @@ hotspot. This **refutes** the Opus estimate that the dequant hoist was the "bigg
 and **confirms** Fable's `<1%`. A NEON dequant/sign pass would chase `<0.5%` for real added
 complexity (a deferred-coefficient array) — not worthwhile.
 
-### 9c. Remaining levers — deferred (high effort, marginal/uncertain)
-- **Sig-map dual-preload pipelining** (§3): needs a new batched aarch64 asm routine
-  (the per-bin `get_cabac_inline` is `volatile`, so consecutive calls can't overlap);
-  ~1–2% of the sig-map portion of `get_cabac` for substantial hand-asm. Deferred.
+### 9c. Remaining levers — declined (the CLZ result predicts they won't help)
+- **Sig-map dual-preload pipelining** (§3): scoped and declined. The significance-map
+  bins are only **~2% of decode** (srcline: `significant_coeff_flag_decode` `cabac.c:1059`
+  = 0.62% + loop ~1%), and — decisively — **9a is the empirical proof that per-bin load
+  latency is already hidden on the A72**: CLZ removed a *fully dependent* ~4-of-~14-cycle
+  load yet `get_cabac` fell only ~6% (not the ~28% a fully-exposed load would give), i.e.
+  the out-of-order engine already hides ~78% of that latency. Sig-map pipelining hoists the
+  same class of per-bin load, so its realistic ceiling is ~6% × ~2% ≈ **~0.1% of decode**,
+  below the noise floor — not worth a new batched, correctness-critical CABAC asm routine.
 - **Branchy engine for skewed contexts** (§3): uncertain sign, needs a second engine
-  variant wired per-call-site by context skew. Deferred.
+  variant wired per-call-site by context skew. Declined for the same effort/reward reasons.
+
+**The A72 already does the pipelining implicitly** (9a is the evidence); there is no
+software CABAC lever left that clears the noise floor on this microarchitecture.
 
 ### Conclusion
 `get_cabac` (the context arithmetic engine) is the irreducible serial wall; the one cheap
