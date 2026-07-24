@@ -17,7 +17,25 @@ content from the command line, rather than hardcoded:
 Because the LUTs (1D fast, 3D accurate) are built from math at init, these should just re-parameterize
 the table builder — no per-frame cost. Rebuild tables only when a knob or the source peak changes.
 
-### Design: build the LUTs at init via libplacebo/zscale; keep the NEON apply
+### Design: build the LUTs at init via libplacebo/zscale; keep the NEON apply  ✅ SHIPPED (zscale, 2026-07-24)
+**Shipped for the PQ/HDR10 path** in `vf_sand_to_yuv420p_drm.c`: a `peak=` option (0=auto)
+plus runtime detection (MaxCLL→mastering→1000 fallback); when the source peak ≠ 1000 the
+PQ LUTs are regenerated at the first frame via an **in-process
+`buffersrc→zscale=t=linear:npl=100→tonemap=hable:peak=<nits/100>→zscale=t=bt709→format`
+graph** (gated `#if CONFIG_ZSCALE_FILTER && CONFIG_TONEMAP_FILTER`), fed the same synthetic
+ramps/grid as `rpi_tonemap_gen.py`; the NEON apply is unchanged. HLG and DV-P5 untouched.
+- **Bit-parity verified:** generating at peak=1000 produces byte-identical output to the
+  baked tables (framemd5) — confirms the generator reproduces the baked tuning *and* that the
+  baked PQ set is 1000-nit.
+- **Measured recovery** (same-build A/B, luma-clip ≥234, first frame): Baraka (MaxCLL 1571)
+  0.31%→**0.07%**; Exodus (mastering 1200) 2.48%→**1.60%**; slightly darker (correct
+  compression). Auto-detected peaks: 1571 / 1200 nits.
+- **Fallback:** ~1000-nit and untagged PQ keep the baked tables (no gen); a build **without**
+  zscale/tonemap emits a one-time warning and uses the baked 1000-nit tables (`#else` branch,
+  compile-verified). libplacebo/`op=bt2390` as an alternative backend remains future work
+  (its curve differs from vf_tonemap's hable → not bit-parity).
+
+Original design notes (retained):
 Today the LUTs are baked at **build time** by `rpi_tonemap_gen.py` shelling out to
 `zscale+tonemap=hable` at a fixed 1000-nit peak, embedded as `static const`
 (`rpi_tonemap_tables.h`, `RPI_TM_PEAK_NITS 1000`). To make them peak-correct, **move the

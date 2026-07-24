@@ -38,11 +38,17 @@
 #include "libavutil/buffer.h"
 #include "libavutil/thread.h"
 
+#include "libavutil/mastering_display_metadata.h"
+#include "config_components.h"
 #include "avfilter.h"
 #include "filters.h"
 #include "video.h"
 #include "libavutil/opt.h"
 #include "rpi_tonemap_tables.h"   /* ff_rpi_tm_luma1d/cb1d/cr1d, ff_rpi_tm_lut3d, RPI_TM_LUT3D_N */
+#if CONFIG_ZSCALE_FILTER && CONFIG_TONEMAP_FILTER
+#include "buffersrc.h"
+#include "buffersink.h"
+#endif
 
 enum { TM_NONE = 0, TM_FAST, TM_VERYFAST, TM_ACCURATE, TM_P5, TM_P5_FAST, TM_P5_VERYFAST };
 /* TM_VERYFAST: HDR10 -> same as TM_FAST (already real-time); DV P5 -> TM_P5_VERYFAST.
@@ -110,6 +116,14 @@ typedef struct BridgeContext {
     int      p5_valid;                     /* p5_lut currently holds a baked LUT */
     int      p5_maxc;                      /* 2^bl_bit_depth - 1 (full-range grid extent) */
     uint8_t  p5_luma1d[1024], p5_l64[64];  /* P5 fast tier: base-Y -> SDR-Y at neutral chroma */
+    /* Peak-aware PQ tone-map: LUTs regenerated at runtime for the source's actual peak
+     * (via the same zscale+tonemap chain the baked ff_rpi_tm_* come from). PQ only;
+     * HLG and P5 are untouched. Falls back to the baked 1000-nit tables when unavailable. */
+    int      peak_opt;                     /* option: override source peak nits (0 = auto) */
+    int      gen_peak;                     /* nits the g_* tables hold (0 = invalid / use baked) */
+    int      warned_nopeak;                /* one-shot "no zscale" fallback warning */
+    uint8_t *g_luma1d, *g_cb1d, *g_cr1d, *g_lut3d;      /* runtime PQ 1D+3D tables */
+    uint8_t  g_l64[64], g_cb64[64], g_cr64[64], g_l64_next[64];  /* derived 64-entry NEON tables */
 } BridgeContext;
 
 /* Return a persistent read-only mapping of (fd,size), or NULL to signal the
@@ -213,6 +227,10 @@ static av_cold void uninit(AVFilterContext *avctx)
     ff_mutex_destroy(&s->lock);
     if (s->heap_fd >= 0) close(s->heap_fd);
     av_freep(&s->p5_lut);
+    av_freep(&s->g_luma1d);
+    av_freep(&s->g_cb1d);
+    av_freep(&s->g_cr1d);
+    av_freep(&s->g_lut3d);
 }
 
 static int config_output(AVFilterLink *outlink)
@@ -1184,6 +1202,145 @@ static int tm_slice(AVFilterContext *avctx, void *arg, int jobnr, int nb_jobs)
     return rv;
 }
 
+#if CONFIG_ZSCALE_FILTER && CONFIG_TONEMAP_FILTER
+/* Peak-aware PQ tone-map LUT generation (PQ/HDR10 only). Mirrors the build-time
+ * libavfilter/rpi_tonemap_gen.py at runtime, parameterized by the source peak, using the
+ * same zscale+tonemap=hable chain the baked ff_rpi_tm_* tables come from — so peak=1000
+ * reproduces them. The generated tables are applied by the identical NEON kernels (zero
+ * per-frame cost); generation happens once per stream (or when the peak changes). */
+#define TM_GAIN 1.5   /* fast-tier chroma saturation gain (matches rpi_tonemap_gen.py) */
+
+static AVFrame *mk444(int w, int h)
+{
+    AVFrame *f = av_frame_alloc();
+    if (!f) return NULL;
+    f->format = AV_PIX_FMT_YUV444P10LE; f->width = w; f->height = h;
+    if (av_frame_get_buffer(f, 32) < 0) { av_frame_free(&f); return NULL; }
+    f->pts = 0;
+    f->color_trc = AVCOL_TRC_SMPTE2084; f->color_primaries = AVCOL_PRI_BT2020;
+    f->colorspace = AVCOL_SPC_BT2020_NCL; f->color_range = AVCOL_RANGE_MPEG;
+    return f;
+}
+static inline void setp(AVFrame *f, int p, int x, int y, uint16_t v)
+{ ((uint16_t *)(f->data[p] + (size_t)y * f->linesize[p]))[x] = v; }
+static inline uint8_t getp8(const AVFrame *f, int p, int x, int y)
+{ return f->data[p][(size_t)y * f->linesize[p] + x]; }
+
+/* Push one synthetic BT.2020-PQ yuv444p10le frame through
+ * zscale=t=linear:npl=100,tonemap=hable:peak=P,zscale=t=bt709...,format=yuv444p ; return the
+ * yuv444p (8-bit) output. Consumes `inp`. NULL on failure. */
+static AVFrame *tm_gen_run(void *logctx, double peak, AVFrame *inp)
+{
+    AVFilterGraph *g = avfilter_graph_alloc();
+    AVFilterContext *src = NULL, *sink = NULL;
+    AVFilterInOut *outs = NULL, *ins = NULL;
+    AVFrame *out = NULL;
+    char args[256], chain[256];
+    if (!g) { av_frame_free(&inp); return NULL; }
+    snprintf(args, sizeof args,
+             "video_size=%dx%d:pix_fmt=%d:time_base=1/25:pixel_aspect=1/1",
+             inp->width, inp->height, AV_PIX_FMT_YUV444P10LE);
+    if (avfilter_graph_create_filter(&src, avfilter_get_by_name("buffer"),  "in",  args, NULL, g) < 0) goto done;
+    if (avfilter_graph_create_filter(&sink, avfilter_get_by_name("buffersink"), "out", NULL, NULL, g) < 0) goto done;
+    snprintf(chain, sizeof chain,
+             "zscale=t=linear:npl=100,tonemap=hable:peak=%.6f,"
+             "zscale=t=bt709:m=bt709:p=bt709:r=tv,format=yuv444p", peak);
+    outs = avfilter_inout_alloc(); ins = avfilter_inout_alloc();
+    if (!outs || !ins) goto done;
+    outs->name = av_strdup("in");  outs->filter_ctx = src;  outs->pad_idx = 0; outs->next = NULL;
+    ins->name  = av_strdup("out"); ins->filter_ctx  = sink; ins->pad_idx  = 0; ins->next  = NULL;
+    if (avfilter_graph_parse_ptr(g, chain, &ins, &outs, NULL) < 0) goto done;
+    if (avfilter_graph_config(g, NULL) < 0) goto done;
+    if (av_buffersrc_add_frame(src, inp) < 0) { inp = NULL; goto done; }
+    inp = NULL;                                   /* consumed by buffersrc */
+    if (av_buffersrc_add_frame(src, NULL) < 0) goto done;
+    out = av_frame_alloc();
+    if (out && av_buffersink_get_frame(sink, out) < 0) av_frame_free(&out);
+done:
+    avfilter_inout_free(&outs); avfilter_inout_free(&ins);
+    avfilter_graph_free(&g);
+    av_frame_free(&inp);
+    return out;
+}
+
+/* Regenerate the PQ tables for peak_nits into the s->g_* buffers. Returns 0 on success. */
+static int pq_lut_regen(AVFilterContext *avctx, BridgeContext *s, int peak_nits)
+{
+    const int N = RPI_TM_LUT3D_N;
+    const double peak = peak_nits / 100.0;
+    AVFrame *in, *out;
+    int rv = AVERROR(ENOMEM);
+
+    if (!s->g_luma1d) {
+        s->g_luma1d = av_malloc(1024); s->g_cb1d = av_malloc(1024);
+        s->g_cr1d   = av_malloc(1024); s->g_lut3d = av_malloc((size_t)N*N*N*3);
+        if (!s->g_luma1d || !s->g_cb1d || !s->g_cr1d || !s->g_lut3d) goto fail;
+    }
+
+    /* 1D luma ramp: Y=0..1023, neutral chroma. */
+    if (!(in = mk444(1024, 2))) goto fail;
+    for (int y = 0; y < 2; y++) for (int x = 0; x < 1024; x++)
+        { setp(in,0,x,y,x); setp(in,1,x,y,512); setp(in,2,x,y,512); }
+    if (!(out = tm_gen_run(avctx, peak, in))) goto fail;
+    for (int i = 0; i < 1024; i++) s->g_luma1d[i] = getp8(out, 0, i, 0);
+    av_frame_free(&out);
+
+    /* 1D Cb ramp (U=0..1023), then bake the fast-tier 1.5x saturation gain around 128. */
+    if (!(in = mk444(1024, 2))) goto fail;
+    for (int y = 0; y < 2; y++) for (int x = 0; x < 1024; x++)
+        { setp(in,0,x,y,512); setp(in,1,x,y,x); setp(in,2,x,y,512); }
+    if (!(out = tm_gen_run(avctx, peak, in))) goto fail;
+    for (int i = 0; i < 1024; i++)
+        s->g_cb1d[i] = av_clip_uint8(lrint(128 + TM_GAIN * ((int)getp8(out,1,i,0) - 128)));
+    av_frame_free(&out);
+
+    /* 1D Cr ramp (V=0..1023). */
+    if (!(in = mk444(1024, 2))) goto fail;
+    for (int y = 0; y < 2; y++) for (int x = 0; x < 1024; x++)
+        { setp(in,0,x,y,512); setp(in,1,x,y,512); setp(in,2,x,y,x); }
+    if (!(out = tm_gen_run(avctx, peak, in))) goto fail;
+    for (int i = 0; i < 1024; i++)
+        s->g_cr1d[i] = av_clip_uint8(lrint(128 + TM_GAIN * ((int)getp8(out,2,i,0) - 128)));
+    av_frame_free(&out);
+
+    /* 33^3 identity grid, limited-range 10-bit: Y in [64,940], C in [64,960].
+     * Row iy holds all (Cb,Cr) combos for luma level iy at column icb*N+icr. */
+    if (!(in = mk444(N * N, N))) goto fail;
+    for (int iy = 0; iy < N; iy++) {
+        int Yc = lrint(64 + iy * (940.0 - 64.0) / (N - 1));
+        for (int icb = 0; icb < N; icb++) {
+            int Ccb = lrint(64 + icb * (960.0 - 64.0) / (N - 1));
+            for (int icr = 0; icr < N; icr++) {
+                int Ccr = lrint(64 + icr * (960.0 - 64.0) / (N - 1));
+                int col = icb * N + icr;
+                setp(in,0,col,iy,Yc); setp(in,1,col,iy,Ccb); setp(in,2,col,iy,Ccr);
+            }
+        }
+    }
+    if (!(out = tm_gen_run(avctx, peak, in))) goto fail;
+    for (int iy = 0; iy < N; iy++)
+        for (int icb = 0; icb < N; icb++)
+            for (int icr = 0; icr < N; icr++) {
+                int col = icb * N + icr;
+                uint8_t *p = &s->g_lut3d[(((size_t)iy * N + icb) * N + icr) * 3];
+                p[0] = getp8(out,0,col,iy); p[1] = getp8(out,1,col,iy); p[2] = getp8(out,2,col,iy);
+            }
+    av_frame_free(&out);
+
+    /* Derive the 64-entry NEON tables (identical to init's subsample). */
+    for (int i = 0; i < 64; i++) {
+        s->g_l64[i]      = s->g_luma1d[i * 16];
+        s->g_l64_next[i] = s->g_luma1d[FFMIN((i + 1) * 16, 1023)];
+        s->g_cb64[i]     = s->g_cb1d[i * 16];
+        s->g_cr64[i]     = s->g_cr1d[i * 16];
+    }
+    s->gen_peak = peak_nits;
+    return 0;
+fail:
+    return rv;
+}
+#endif /* CONFIG_ZSCALE_FILTER && CONFIG_TONEMAP_FILTER */
+
 static int filter_frame(AVFilterLink *inlink, AVFrame *in)
 {
     AVFilterContext *avctx = inlink->dst;
@@ -1277,6 +1434,49 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
         }
     }
 
+    /* Peak-aware tone-map (plain PQ/HDR10 only): if the authored source peak differs from
+     * the baked 1000-nit tables, regenerate the PQ LUTs for the real peak (once per stream).
+     * Untagged PQ and ~1000-nit content keep the baked tables. */
+    int use_gen = 0;
+    if (do_tm && !is_p5 && !is_hlg) {
+        int peak_nits = s->peak_opt;
+        if (peak_nits <= 0) {
+            const AVFrameSideData *cll = av_frame_get_side_data(in, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
+            const AVFrameSideData *mdm = av_frame_get_side_data(in, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
+            if (cll) peak_nits = ((const AVContentLightMetadata *)cll->data)->MaxCLL;
+            if (peak_nits <= 0 && mdm) {
+                const AVMasteringDisplayMetadata *m = (const AVMasteringDisplayMetadata *)mdm->data;
+                if (m->has_luminance) peak_nits = lrint(av_q2d(m->max_luminance));
+            }
+            if (peak_nits <= 0) peak_nits = 1000;   /* untagged: keep baked (no darkening) */
+        }
+        /* Explicit peak= always (re)generates (honour the override, and lets peak=1000
+         * validate that generation reproduces the baked tables); auto-detected peaks within
+         * ~1000 nits keep the baked tables. */
+        if (s->peak_opt > 0 || abs(peak_nits - 1000) > 50) {
+#if CONFIG_ZSCALE_FILTER && CONFIG_TONEMAP_FILTER
+            if (s->gen_peak != peak_nits) {
+                if (pq_lut_regen(avctx, s, peak_nits) < 0) {
+                    av_log(avctx, AV_LOG_WARNING,
+                           "peak-aware tone-map LUT gen failed for %d nits; using 1000-nit tables\n", peak_nits);
+                    s->gen_peak = 0;
+                } else {
+                    av_log(avctx, AV_LOG_VERBOSE,
+                           "tone-map: generated LUTs for source peak %d nits\n", peak_nits);
+                }
+            }
+            use_gen = (s->gen_peak == peak_nits);
+#else
+            if (!s->warned_nopeak) {
+                av_log(avctx, AV_LOG_WARNING,
+                       "source peak %d nits: peak-aware tone-map needs an ffmpeg built with "
+                       "zscale+tonemap; using 1000-nit tables (highlights >1000 nits roll off)\n", peak_nits);
+                s->warned_nopeak = 1;
+            }
+#endif
+        }
+    }
+
     if (!do_tm && !half) {
         /* SDR / tm=none, full size: single-pass SAND -> 8-bit YU12. */
         ThreadData td = { .dst = tmp, .src = mapped, .H = h };
@@ -1295,14 +1495,14 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
          * [2x2 box-average when half] -> LUT/narrow -> 8-bit YU12. */
         TMData tdm = { .dst = tmp, .src = mapped, .H = h, .half = half,
                        .tm = eff_tm,
-                       .l64      = is_hlg ? s->l64_hlg      : s->l64,
-                       .cb64     = is_hlg ? s->cb64_hlg     : s->cb64,
-                       .cr64     = is_hlg ? s->cr64_hlg     : s->cr64,
-                       .l64_next = is_hlg ? s->l64_next_hlg : s->l64_next,
-                       .luma1d = is_hlg ? ff_rpi_tm_luma1d_hlg : ff_rpi_tm_luma1d,
-                       .cb1d   = is_hlg ? ff_rpi_tm_cb1d_hlg   : ff_rpi_tm_cb1d,
-                       .cr1d   = is_hlg ? ff_rpi_tm_cr1d_hlg   : ff_rpi_tm_cr1d,
-                       .lut3d  = is_hlg ? ff_rpi_tm_lut3d_hlg  : ff_rpi_tm_lut3d,
+                       .l64      = is_hlg ? s->l64_hlg      : (use_gen ? s->g_l64      : s->l64),
+                       .cb64     = is_hlg ? s->cb64_hlg     : (use_gen ? s->g_cb64     : s->cb64),
+                       .cr64     = is_hlg ? s->cr64_hlg     : (use_gen ? s->g_cr64     : s->cr64),
+                       .l64_next = is_hlg ? s->l64_next_hlg : (use_gen ? s->g_l64_next : s->l64_next),
+                       .luma1d = is_hlg ? ff_rpi_tm_luma1d_hlg : (use_gen ? s->g_luma1d : ff_rpi_tm_luma1d),
+                       .cb1d   = is_hlg ? ff_rpi_tm_cb1d_hlg   : (use_gen ? s->g_cb1d   : ff_rpi_tm_cb1d),
+                       .cr1d   = is_hlg ? ff_rpi_tm_cr1d_hlg   : (use_gen ? s->g_cr1d   : ff_rpi_tm_cr1d),
+                       .lut3d  = is_hlg ? ff_rpi_tm_lut3d_hlg  : (use_gen ? s->g_lut3d  : ff_rpi_tm_lut3d),
                        .p5_lut = s->p5_lut, .p5_maxc = s->p5_maxc,
                        .p5_luma1d = s->p5_luma1d, .p5_l64 = s->p5_l64 };
         dmabuf_sync(fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE);
@@ -1396,6 +1596,8 @@ static const AVOption sand_to_yuv420p_drm_options[] = {
       AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 1, FLAGS, .unit = "out" },
         { "full", "same size as input (downstream ISP does any resize)", 0, AV_OPT_TYPE_CONST, { .i64 = 0 }, 0, 0, FLAGS, .unit = "out" },
         { "half", "half width+height (fused 2x2 downscale; skip scale_v4l2m2m)", 0, AV_OPT_TYPE_CONST, { .i64 = 1 }, 0, 0, FLAGS, .unit = "out" },
+    { "peak", "override HDR source peak luminance in nits for the PQ tone-map (0 = auto from mastering/MaxCLL)",
+      OFFSET(peak_opt), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 100000, FLAGS },
     { NULL }
 };
 AVFILTER_DEFINE_CLASS(sand_to_yuv420p_drm);
