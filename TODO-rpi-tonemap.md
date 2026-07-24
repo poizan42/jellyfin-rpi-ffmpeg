@@ -34,6 +34,15 @@ ramps/grid as `rpi_tonemap_gen.py`; the NEON apply is unchanged. HLG and DV-P5 u
   zscale/tonemap emits a one-time warning and uses the baked 1000-nit tables (`#else` branch,
   compile-verified). libplacebo/`op=bt2390` as an alternative backend remains future work
   (its curve differs from vf_tonemap's hable → not bit-parity).
+- **Mid-stream / live streams:** detection + rebuild is per-frame, keyed on `gen_peak`, so a
+  peak that changes partway through a stream (spliced / dumped-live) triggers a rebuild at the
+  boundary. The HEVC decoder makes the mastering/MaxCLL SEI sticky per coded-video-sequence
+  (`hevcdec.c` `set_side_data`), so there is no per-frame thrash. **Caveat (separate, pre-existing
+  limitation):** if the peak change coincides with an **SPS change** (different res/framerate at
+  the new CVS), the rpivid / v4l2-request HW **decoder** must reconfigure, which currently fails
+  on the Pi 4's 512 MB CMA (dma-heap exhaustion → RPS/dst-buffer errors → stall; reproduces with
+  `tm=none`, i.e. independent of the tone-map). A pure SEI/peak change with unchanged SPS
+  regenerates cleanly. Test clips + write-up: external sample disk `samples/hdr-splice-test/`.
 
 Original design notes (retained):
 Today the LUTs are baked at **build time** by `rpi_tonemap_gen.py` shelling out to

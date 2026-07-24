@@ -1435,7 +1435,11 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     }
 
     /* Peak-aware tone-map (plain PQ/HDR10 only): if the authored source peak differs from
-     * the baked 1000-nit tables, regenerate the PQ LUTs for the real peak (once per stream).
+     * the baked 1000-nit tables, regenerate the PQ LUTs for the real peak — once per stream,
+     * and again whenever the peak changes (e.g. a spliced/live stream whose mastering/MaxCLL
+     * SEI updates at a new coded-video-sequence). Rebuild-on-change is keyed on gen_peak, like
+     * the DV-P5 RPU rebuild above; the HEVC decoder makes the SEI sticky per-CVS, so a frame
+     * mid-segment reports its segment's peak (no per-frame thrash — see hevcdec set_side_data).
      * Untagged PQ and ~1000-nit content keep the baked tables. */
     int use_gen = 0;
     if (do_tm && !is_p5 && !is_hlg) {
