@@ -100,3 +100,41 @@ board: decode transform/entropy levers are shipped or exhausted, the scaler is i
 here (no HW ingests the source format), and encode is already HW. The one live lever is the
 **resolution-only (>4K 8-bit 4:2:0) ISP-resize offload** above — conditional and unmeasured.
 Otherwise these formats remain batch/offline on the Pi 4, as `README.jellyfin-rpi.md` states.
+
+## Parked threads (investigate later)
+
+These are not pursued yet; recorded so they aren't lost or re-derived.
+
+### A. Opt-in lossy "fast decode" (behind a CLI flag)
+Trade decode accuracy for speed *deliberately*, since the pipeline already discards
+accuracy (3:1/1.5:1 downscale + lossy 3 Mbit re-encode). Candidate approximations:
+truncated / low-frequency-only inverse transform; decoding at reduced bit depth before MC;
+early chroma subsampling to 4:2:0 before MC; skipping in-loop filters.
+- **Why it might be acceptable:** the 3:1 downscale is itself a low-pass filter that
+  removes the high-frequency band where truncated-IDCT / dropped-LSB error lives, so much
+  of the error may never reach the encoder. This is the crux — needs verification.
+- **The real risk — drift, not per-frame error:** these are non-conformant, so the
+  decoder's reference frames diverge from the encoder's and error **accumulates over
+  inter-prediction chains** (worst at end-of-GOP, reset at each I/IDR). The artifact to
+  look for is *progressive* degradation within a GOP.
+- **Free first probe (no code):** FFmpeg's existing `-skip_loop_filter all|nonref|bidir`
+  is exactly a "faster but incorrect" knob (skips deblocking) — measure speed and inspect
+  artifacts after downscale+re-encode before writing any custom truncation.
+  (`-lowres` DCT-downscale decoding — the cleanest form of the idea — is **not** wired for
+  HEVC in FFmpeg, only older codecs, so that route is custom work.)
+- **Evaluation:** VMAF/SSIM of the final 720p output vs the correct transcode across a few
+  clips, plus visual inspection for GOP-progressive drift. Must be **opt-in via a flag** —
+  never the default (it produces non-conformant output).
+
+### B. Decode/convert fusion (bandwidth, not accuracy)
+swscale currently re-reads the full-res reconstructed frame **cold** from DRAM (~50 MB/frame
+for 4K 4:4:4 12-bit) to downscale+convert. The MC-reference frame write to DRAM is
+unavoidable (references are consumed at native res/depth by later frames — the full frame
+*must* be materialized), but the *cold re-read* could be avoided by converting each region
+into the 720p 8-bit 4:2:0 output while it is still cache-warm from reconstruction
+("tapping the reconstruction write stream"). Caveats: deep surgery breaking FFmpeg's
+decode↔filter separation (CTU-row completion hook, downscale vertical-filter window,
+deblock/SAO cross-boundary lag, non-CTU-aligned output); and it saves only swscale's
+**memory-read** component, not the polyphase `hscale` **compute**. Cheapest gate before any
+work: measure the memory-read vs compute split of swscale's ~23% (perf bus/cache-stall
+events + the `v3d-experiments/membw` probe). Unmeasured.
