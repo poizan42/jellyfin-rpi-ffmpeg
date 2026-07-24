@@ -44,6 +44,13 @@ typedef struct CABACContext{
     const uint8_t *bytestream_start;
     const uint8_t *bytestream;
     const uint8_t *bytestream_end;
+    /* Scratch state for the HEVC "by22" bypass-batching path (libavcodec/hevc/cabac.c).
+     * Appended at the end so the aarch64 get_cabac asm (which addresses bytestream /
+     * bytestream_end by offset) is unaffected. */
+    struct {
+        uint16_t bits;
+        uint16_t range;
+    } by22;
 }CABACContext;
 
 int ff_init_cabac_decoder(CABACContext *c, const uint8_t *buf, int buf_size);

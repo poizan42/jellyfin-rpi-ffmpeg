@@ -255,3 +255,45 @@ Validate bit-exact with `-f md5`, measure with `perf` on `ffmpeg_g`.
 
 **Verdict:** genuinely portable, no SVE/gather/asm dependency — a C primitive plus targeted
 call-site rewrites, with same-CPU precedent. Low-to-medium effort; recommended prototype.
+
+---
+
+## 8. `by22` prototype — implemented & measured (bit-exact, modest win)
+
+Implemented per §7. Self-contained in the HEVC cabac TU, gated by `USE_BY22`
+(`= HAVE_FAST_64BIT || ARCH_ARM || ARCH_X86` → on for aarch64):
+- `libavcodec/cabac.h` — appended a `{ uint16_t bits, range; } by22;` scratch field to
+  `CABACContext` (at the end, so the aarch64 `get_cabac` asm offsets are unaffected).
+- `libavcodec/hevc/cabac.c` — the `alt1cabac_inv_range[256]` reciprocal table, the
+  `hevc_mem_bits32`/`hevc_clz32` helpers, the four `get_cabac_by22_{start,finish,peek,flush}`
+  inlines + `bypass_start/finish` macros, `by22` variants of `coeff_abs_level_remaining_decode`
+  and `coeff_sign_flag_decode` (with the scalar versions kept under `#if !USE_BY22`), and a
+  `bypass_start(lc)`…`bypass_finish(lc)` bracket around the per-subgroup bypass run
+  (the sign flags + `coeff_abs_level_remaining`; context bins stay outside). Adapted from
+  jc-kynesim/rpi-ffmpeg (LGPL, © John Cox).
+
+**Correctness: bit-exact.** Whole-decoder `-f framemd5` matched the pre-change reference on
+all 16 corpus clips (8/10/12-bit × 400/420/422/444 + real-world RExt/Main). `by22` confirmed
+compiled-in and active (the reciprocal table is present in `cabac.o`).
+
+**Performance: real but modest** — controlled `USE_BY22` on/off A/B, decode-only, `-threads 1`,
+`perf task-clock` on `ffmpeg_g`:
+
+| clip | `ff_hevc_hls_residual_coding` self-time | decode speed |
+|---|---|---|
+| 10-bit 4:4:4 (most bypass-heavy) | 13.87% → **11.88%** (−2.0pp, ~14% rel) | 0.328× → 0.331× |
+| Main10 4:2:0 | 3.45% → 3.22% | 1.02× → 1.06× |
+| 12-bit 4:4:4 | 3.86% → 3.60% | 0.137× → 0.139× |
+
+The batching **reliably cuts `residual_coding` self-time ~10–14% relative**, confirming the
+mechanism works — but the **whole-decode speedup is ~1–2%, within run-to-run noise**, because
+residual-coding bypass is only a slice of decode and `get_cabac` (the context-coded engine,
+~9% on the 4:4:4 clip) dominates the CABAC cost. This is the empirical answer to the
+Opus↔Fable question: on this corpus the workload is **not** strongly bypass-bound, and the
+result lands at the **low end** of the §4 estimate (~3–6% → measured ~1–2%).
+
+**Kept anyway:** bit-exact, low-risk, self-contained, gated, with same-CPU prior art — a
+correct if small improvement, and it confirms empirically that the remaining CABAC cost is
+the context engine (the genuine, un-SIMD-able serial wall), not bypass. No further CABAC
+work is warranted for this workload; the larger levers remain elsewhere (the swscale resize
+~17–23%, already NEON; and thread-level parallelism).

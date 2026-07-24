@@ -23,6 +23,7 @@
 
 #include "libavutil/attributes.h"
 #include "libavutil/common.h"
+#include "libavutil/intreadwrite.h"
 
 #include "cabac_functions.h"
 #include "data.h"
@@ -30,6 +31,149 @@
 #include "hevcdec.h"
 
 #define CABAC_MAX_BIN 31
+
+/*
+ * BY22 bypass-batching for the residual-coding bypass run.
+ *
+ * Adapted from jc-kynesim/rpi-ffmpeg (branch work/rpi_hevc_master_3,
+ * libavcodec/hevc_cabac.c), LGPL, Copyright (c) John Cox. Instead of decoding one
+ * bypass bin at a time, a whole run of bypass bins is decoded by peeking up to 22 bits
+ * at once via a reciprocal multiply (the arithmetic range is constant across a bypass
+ * run, so 1/range can be precomputed). On aarch64 the reciprocal-table (non-divide)
+ * path is taken; no assembly is required.
+ *
+ * Enter with get_cabac_by22_start()/bypass_start(), decode with
+ * get_cabac_by22_peek()/_flush(), leave with get_cabac_by22_finish()/bypass_finish().
+ * While inside the bracket c->range holds the reciprocal, so ordinary get_cabac() /
+ * get_cabac_bypass() MUST NOT be called until bypass_finish().
+ */
+#ifndef USE_BY22
+#define USE_BY22 (HAVE_FAST_64BIT || ARCH_ARM || ARCH_X86)
+#endif
+#define USE_BY22_DIV  ARCH_X86
+
+#if USE_BY22 && !USE_BY22_DIV
+#define I(x) (uint32_t)((0x10000000000ULL / (uint64_t)(x)) + 1ULL)
+static const uint32_t alt1cabac_inv_range[256] __attribute__((aligned(256))) = {
+                                                    0,      I(257), I(258), I(259),
+    I(260), I(261), I(262), I(263), I(264), I(265), I(266), I(267), I(268), I(269),
+    I(270), I(271), I(272), I(273), I(274), I(275), I(276), I(277), I(278), I(279),
+    I(280), I(281), I(282), I(283), I(284), I(285), I(286), I(287), I(288), I(289),
+    I(290), I(291), I(292), I(293), I(294), I(295), I(296), I(297), I(298), I(299),
+    I(300), I(301), I(302), I(303), I(304), I(305), I(306), I(307), I(308), I(309),
+    I(310), I(311), I(312), I(313), I(314), I(315), I(316), I(317), I(318), I(319),
+    I(320), I(321), I(322), I(323), I(324), I(325), I(326), I(327), I(328), I(329),
+    I(330), I(331), I(332), I(333), I(334), I(335), I(336), I(337), I(338), I(339),
+    I(340), I(341), I(342), I(343), I(344), I(345), I(346), I(347), I(348), I(349),
+    I(350), I(351), I(352), I(353), I(354), I(355), I(356), I(357), I(358), I(359),
+    I(360), I(361), I(362), I(363), I(364), I(365), I(366), I(367), I(368), I(369),
+    I(370), I(371), I(372), I(373), I(374), I(375), I(376), I(377), I(378), I(379),
+    I(380), I(381), I(382), I(383), I(384), I(385), I(386), I(387), I(388), I(389),
+    I(390), I(391), I(392), I(393), I(394), I(395), I(396), I(397), I(398), I(399),
+    I(400), I(401), I(402), I(403), I(404), I(405), I(406), I(407), I(408), I(409),
+    I(410), I(411), I(412), I(413), I(414), I(415), I(416), I(417), I(418), I(419),
+    I(420), I(421), I(422), I(423), I(424), I(425), I(426), I(427), I(428), I(429),
+    I(430), I(431), I(432), I(433), I(434), I(435), I(436), I(437), I(438), I(439),
+    I(440), I(441), I(442), I(443), I(444), I(445), I(446), I(447), I(448), I(449),
+    I(450), I(451), I(452), I(453), I(454), I(455), I(456), I(457), I(458), I(459),
+    I(460), I(461), I(462), I(463), I(464), I(465), I(466), I(467), I(468), I(469),
+    I(470), I(471), I(472), I(473), I(474), I(475), I(476), I(477), I(478), I(479),
+    I(480), I(481), I(482), I(483), I(484), I(485), I(486), I(487), I(488), I(489),
+    I(490), I(491), I(492), I(493), I(494), I(495), I(496), I(497), I(498), I(499),
+    I(500), I(501), I(502), I(503), I(504), I(505), I(506), I(507), I(508), I(509),
+    I(510), I(511)
+};
+#undef I
+#endif
+
+#if USE_BY22
+
+#if !USE_BY22_DIV
+// * 1/x @ 32 bits gets us 22 bits of accuracy
+#define CABAC_BY22_PEEK_BITS  22
+#else
+// A real 32-bit divide gets us another bit
+#define CABAC_BY22_PEEK_BITS  23
+#endif
+
+static av_always_inline uint32_t hevc_mem_bits32(const void *buf, const unsigned int offset)
+{
+    return AV_RB32((const uint8_t *)buf + (offset >> 3)) << (offset & 7);
+}
+
+static av_always_inline unsigned int hevc_clz32(const uint32_t x)
+{
+    // __builtin_clz is defined on int; adjust if int is wider than 32 bits
+    return __builtin_clz(x) - (sizeof(int) * 8 - 32);
+}
+
+static inline void get_cabac_by22_start(CABACContext *const c)
+{
+    const unsigned int bits = __builtin_ctz(c->low);
+    const uint32_t m = hevc_mem_bits32(c->bytestream, 0);
+    uint32_t x = ((uint32_t)c->low << (22 - CABAC_BITS)) ^ ((m ^ 0x80000000U) >> (9 + CABAC_BITS - bits));
+#if !USE_BY22_DIV
+    const uint32_t inv = alt1cabac_inv_range[c->range & 0xff];
+#endif
+
+    c->bytestream -= (CABAC_BITS / 8);
+    c->by22.bits = bits;
+#if !USE_BY22_DIV
+    c->by22.range = c->range;
+    c->range = inv;
+#endif
+    c->low = x;
+}
+
+static inline void get_cabac_by22_finish(CABACContext *const c)
+{
+    unsigned int used = c->by22.bits;
+    unsigned int bytes_used = (used / CABAC_BITS) * (CABAC_BITS / 8);
+    unsigned int bits_used = used & (CABAC_BITS == 16 ? 15 : 7);
+
+    c->bytestream += bytes_used + (CABAC_BITS / 8);
+    c->low = (((uint32_t)c->low >> (22 - CABAC_BITS + bits_used)) | 1) << bits_used;
+#if !USE_BY22_DIV
+    c->range = c->by22.range;
+#endif
+}
+
+static inline uint32_t get_cabac_by22_peek(const CABACContext *const c)
+{
+#if USE_BY22_DIV
+    return ((unsigned int)c->low / (unsigned int)c->range) << 9;
+#else
+    uint32_t x = c->low & ~1U;
+    const uint32_t inv = c->range;
+
+    if (inv != 0)
+        x = (uint32_t)(((uint64_t)x * (uint64_t)inv) >> 32);
+
+    return x << 1;
+#endif
+}
+
+// We must always have used at least one bit so n != 0
+static inline void get_cabac_by22_flush(CABACContext *c, const unsigned int n, const uint32_t val)
+{
+    // Subtract the bits used & reshift up to the top of the word
+#if USE_BY22_DIV
+    const uint32_t low = (((unsigned int)c->low << n) - (((val >> (32 - n)) * (unsigned int)c->range) << 23));
+#else
+    const uint32_t low = (((uint32_t)c->low << n) - (((val >> (32 - n)) * c->by22.range) << 23));
+#endif
+
+    // and refill lower bits (may OR over existing bits, which is harmless)
+    c->by22.bits += n;
+    c->low = low | (hevc_mem_bits32(c->bytestream, c->by22.bits) >> 9);
+}
+
+#define bypass_start(lc)  get_cabac_by22_start(&(lc)->cc)
+#define bypass_finish(lc) get_cabac_by22_finish(&(lc)->cc)
+#else
+#define bypass_start(lc)
+#define bypass_finish(lc)
+#endif  // USE_BY22
 
 // ELEM(NAME, NUM_BINS)
 #define CABAC_ELEMS(ELEM)                     \
@@ -938,6 +1082,40 @@ static av_always_inline int coeff_abs_level_greater2_flag_decode(HEVCLocalContex
     return GET_CABAC(COEFF_ABS_LEVEL_GREATER2_FLAG_OFFSET + inc);
 }
 
+#if USE_BY22
+/* by22 variant: must be called only inside a bypass_start()/bypass_finish() bracket
+ * (c->range holds the reciprocal). Decodes the TR/EGk code by peeking up to 22 bits. */
+static av_always_inline int coeff_abs_level_remaining_decode(HEVCLocalContext *lc, int rc_rice_param)
+{
+    CABACContext *const c = &lc->cc;
+    const unsigned int rice_param = rc_rice_param;
+    uint32_t y = get_cabac_by22_peek(c);
+    unsigned int prefix = hevc_clz32(~y);
+    unsigned int last_coeff_abs_level_remaining;
+    unsigned int n;
+    // y << prefix will always have top bit 0
+
+    if (prefix < 3) {
+        const unsigned int suffix = (y << prefix) >> (31 - rice_param);
+        last_coeff_abs_level_remaining = (prefix << rice_param) + suffix;
+        n = prefix + 1 + rice_param;
+    } else if (prefix * 2 + rice_param <= CABAC_BY22_PEEK_BITS + 2) {
+        const uint32_t suffix = ((y << prefix) | 0x80000000) >> (34 - (prefix + rice_param));
+        last_coeff_abs_level_remaining = (2 << rice_param) + suffix;
+        n = prefix * 2 + rice_param - 2;
+    } else {
+        unsigned int suffix;
+        get_cabac_by22_flush(c, prefix, y);
+        y = get_cabac_by22_peek(c);
+        suffix = (y | 0x80000000) >> (34 - (prefix + rice_param));
+        last_coeff_abs_level_remaining = (2 << rice_param) + suffix;
+        n = prefix + rice_param - 2;
+    }
+
+    get_cabac_by22_flush(c, n, y);
+    return last_coeff_abs_level_remaining;
+}
+#else
 static av_always_inline int coeff_abs_level_remaining_decode(HEVCLocalContext *lc, int rc_rice_param)
 {
     int prefix = 0;
@@ -967,7 +1145,24 @@ static av_always_inline int coeff_abs_level_remaining_decode(HEVCLocalContext *l
     }
     return last_coeff_abs_level_remaining;
 }
+#endif
 
+#if USE_BY22
+/* by22 variant: must be called only inside a bypass_start()/bypass_finish() bracket.
+ * Returns the nb sign bits right-justified (same contract as the scalar version), so
+ * the callers' `<< (16 - nb)` positioning is unchanged. */
+static av_always_inline int coeff_sign_flag_decode(HEVCLocalContext *lc, uint8_t nb)
+{
+    CABACContext *const c = &lc->cc;
+    uint32_t y;
+
+    if (nb == 0)
+        return 0;
+    y = get_cabac_by22_peek(c);
+    get_cabac_by22_flush(c, nb, y);
+    return y >> (32 - nb);
+}
+#else
 static av_always_inline int coeff_sign_flag_decode(HEVCLocalContext *lc, uint8_t nb)
 {
     int i;
@@ -977,6 +1172,7 @@ static av_always_inline int coeff_sign_flag_decode(HEVCLocalContext *lc, uint8_t
         ret = (ret << 1) | get_cabac_bypass(&lc->cc);
     return ret;
 }
+#endif
 
 void ff_hevc_hls_residual_coding(HEVCLocalContext *lc, const HEVCPPS *pps,
                                  int x0, int y0,
@@ -1357,6 +1553,11 @@ void ff_hevc_hls_residual_coding(HEVCLocalContext *lc, const HEVCPPS *pps,
             if (first_greater1_coeff_idx != -1) {
                 coeff_abs_level_greater1_flag[first_greater1_coeff_idx] += coeff_abs_level_greater2_flag_decode(lc, c_idx, ctx_set);
             }
+
+            /* All CABAC reads from here to bypass_finish() are bypass bins (sign flags +
+             * coeff_abs_level_remaining). Decode them as one batched by22 run. No
+             * context-coded get_cabac() or plain get_cabac_bypass() may occur inside. */
+            bypass_start(lc);
             if (!pps->sign_data_hiding_flag || !sign_hidden ) {
                 coeff_sign_flag = coeff_sign_flag_decode(lc, nb_significant_coeff_flag) << (16 - nb_significant_coeff_flag);
             } else {
@@ -1433,6 +1634,7 @@ void ff_hevc_hls_residual_coding(HEVCLocalContext *lc, const HEVCPPS *pps,
                 }
                 coeffs[y_c * trafo_size + x_c] = trans_coeff_level;
             }
+            bypass_finish(lc);
         }
     }
 
