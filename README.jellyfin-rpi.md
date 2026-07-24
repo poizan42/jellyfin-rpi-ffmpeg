@@ -273,6 +273,9 @@ by `out=half`, which is why the 4K→720p 3:1 case — non-integer, still full-r
 
 ### Software-decode path (offline)
 
+(Optimization log, shipped wins and negative results for this path: `SW-DECODE-OPTIMIZATION.md`;
+entropy-decode deep dive: `CABAC-SIMD-analysis.md`.)
+
 The formats rpivid can't decode — non-4:2:0 (4:2:2 / 4:4:4), 12-bit, or >4K — fall back to **software
 HEVC decode** (+ swscale + `h264_v4l2m2m`). These are all **offline / sub-real-time** and always will be
 (CABAC is the serial wall), but they benefit from the 10/12-bit MC NEON added in this fork (§
