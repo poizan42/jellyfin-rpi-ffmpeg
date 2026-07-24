@@ -819,26 +819,32 @@ endfunc
 
 idct_4x4 8
 idct_4x4 10
+idct_4x4 12
 
 idct_8x8 8
 idct_8x8 10
+idct_8x8 12
 
 tr_16x4 firstpass, 7, 512, 1
 tr_16x4 secondpass_8, 20 - 8, 512, 1
 tr_16x4 secondpass_10, 20 - 10, 512, 1
+tr_16x4 secondpass_12, 20 - 12, 512, 1
 tr_16x4 noscale, 0, 2048, 4
 
 idct_16x16 8
 idct_16x16 10
+idct_16x16 12
 
 .ltorg
 tr_32x4 firstpass, 7
 tr_32x4 secondpass_8, 20 - 8
 tr_32x4 secondpass_10, 20 - 10
+tr_32x4 secondpass_12, 20 - 12
 .ltorg
 
 idct_32x32 8
 idct_32x32 10
+idct_32x32 12
 
 .macro tr4_luma_shift r0, r1, r2, r3, shift
         saddl           v0.4s, \r0, \r2         // c0 = src0 + src2
