@@ -31,6 +31,21 @@ of speed for a closer match to the zscale reference (~0.94× / ~0.60×), and `tm
 extra headroom past real-time at coarser chroma. Validated on a real library (see the status doc);
 on a 1080p transcode the pipeline is limited by the single-threaded rpivid decode thread, not the CPU.
 
+## Documentation (this fork)
+
+- **[README.jellyfin-rpi.md](README.jellyfin-rpi.md)** — full design, build, usage, the
+  supported-input matrix, and the performance tables (HW and software-decode paths).
+- **[SW-DECODE-OPTIMIZATION.md](SW-DECODE-OPTIMIZATION.md)** — optimization log for the
+  software-decode path (the 4:2:2 / 4:4:4 / 12-bit / >4K formats hardware can't do):
+  shipped wins (12-bit IDCT NEON, CABAC), measured-and-dropped experiments with the reasons,
+  and parked future threads.
+- **[CABAC-SIMD-analysis.md](CABAC-SIMD-analysis.md)** — deep dive on whether HEVC CABAC /
+  entropy decode can be SIMD-ised, and the micro-optimisations that came out of it.
+- **[TODO-rpi-input-support.md](TODO-rpi-input-support.md)** — roadmap for widening the
+  input formats the transcode path accepts.
+- **[TODO-rpi-tonemap.md](TODO-rpi-tonemap.md)** — deferred follow-ups for the SAND→YU12
+  HDR tone-map filter.
+
 ---
 
 # Upstream FFmpeg README
