@@ -38,6 +38,14 @@ reciprocal-multiply peek instead of per-bin. Adapted from rpi-ffmpeg (LGPL). Bit
 **~1–2% whole-decode** (near noise) — `get_cabac` dominates. Full write-up:
 `CABAC-SIMD-analysis.md` §8. Files: `libavcodec/cabac.h`, `libavcodec/hevc/cabac.c`.
 
+### CABAC CLZ renorm — correct, neutral-to-marginal
+The per-bin renorm shift in the aarch64 `get_cabac` asm was a dependent table load;
+replaced with `clz` (`norm_shift[x]==clz32(x)−23`). Bit-exact; `get_cabac` self-time
+9.17%→8.64% (10-bit 4:4:4); wall-clock neutral (below ~1% noise). Kept as a correct,
+load-removing, compounding change. `CABAC-SIMD-analysis.md` §9a. File:
+`libavcodec/aarch64/cabac.h`. (Dequant-hoist checked and dropped — dequant is ~0.8% of
+decode, not a lever; §9b. Remaining CABAC levers deferred as high-effort/marginal; §9c.)
+
 ## Dropped / negative results (with the why)
 
 ### SAO 10/12-bit NEON — profile no-go

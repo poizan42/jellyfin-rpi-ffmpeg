@@ -50,7 +50,10 @@ static av_always_inline int get_cabac_inline_aarch64(CABACContext *c,
         "sub        %w[low]       , %w[low]     , %w[tmp]       \n\t"
         "add        %[r_b]        , %[tables]   , %[norm_off]   \n\t"
         "add        %[r_a]        , %[tables]   , %[mlps_off]   \n\t"
-        "ldrb       %w[tmp]       , [%[r_b], %w[range], SXTW]   \n\t"
+        // renorm shift = ff_h264_norm_shift[range] == clz32(range) - 23 for the
+        // reachable range domain [1,511]; use clz to drop a dependent L1 load.
+        "clz        %w[tmp]       , %w[range]                   \n\t"
+        "sub        %w[tmp]       , %w[tmp]     , #23           \n\t"
         "ldrb       %w[r_a]       , [%[r_a], %w[bit], SXTW]     \n\t"
         "lsl        %w[low]       , %w[low]     , %w[tmp]       \n\t"
         "lsl        %w[range]     , %w[range]   , %w[tmp]       \n\t"

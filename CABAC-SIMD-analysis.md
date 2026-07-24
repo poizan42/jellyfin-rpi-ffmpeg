@@ -294,6 +294,45 @@ result lands at the **low end** of the §4 estimate (~3–6% → measured ~1–2
 
 **Kept anyway:** bit-exact, low-risk, self-contained, gated, with same-CPU prior art — a
 correct if small improvement, and it confirms empirically that the remaining CABAC cost is
-the context engine (the genuine, un-SIMD-able serial wall), not bypass. No further CABAC
-work is warranted for this workload; the larger levers remain elsewhere (the swscale resize
-~17–23%, already NEON; and thread-level parallelism).
+the context engine (the genuine, un-SIMD-able serial wall), not bypass.
+
+---
+
+## 9. Context-engine micro-optimizations (measured)
+
+Follow-up pass targeting `get_cabac` itself (the ~9% context-coded arithmetic engine — the
+part §2 identifies as the true serial wall), plus resolving the §4 dequant-hoist question.
+
+### 9a. CLZ renorm — shipped (bit-exact, neutral-to-marginal)
+The per-bin renormalisation shift in the aarch64 `get_cabac_inline` asm
+(`libavcodec/aarch64/cabac.h`) was a dependent L1 load `ff_h264_norm_shift[range]`.
+Replaced with `clz`: `norm_shift[x] == clz32(x) − 23` exactly for the reachable range
+domain `[1,511]` (verified against the table in `cabac.c`), and on aarch64 `clz(0)=32 →
+9` also matches `norm_shift[0]`, so it is robust even for the unreachable `range==0`.
+- Bit-exact on all 16 corpus clips.
+- `get_cabac` self-time **9.17% → 8.64%** (10-bit 4:4:4) — removes the dependent load.
+- Wall-clock: **neutral** (interleaved, thermal-controlled A/B: baseline min/median
+  19.43/20.44 s vs 19.58/20.17 s — indistinguishable). The gain is below the ~1% noise
+  floor, but the change is correct, load-removing, and compounds. Kept.
+
+### 9b. Dequant hoist — NOT pursued (the §4 Opus↔Fable dispute, resolved)
+`perf report --sort=srcline` on `ff_hevc_hls_residual_coding` shows the per-coefficient
+dequant is **not** a concentrated cost: the `int64` multiply (`cabac.c:1626`) = 0.21%, the
+clip (`:1631`) = 0.56%, scale-matrix lookup < 0.11% — **~0.8% of decode, smeared**, no fat
+hotspot. This **refutes** the Opus estimate that the dequant hoist was the "biggest lever"
+and **confirms** Fable's `<1%`. A NEON dequant/sign pass would chase `<0.5%` for real added
+complexity (a deferred-coefficient array) — not worthwhile.
+
+### 9c. Remaining levers — deferred (high effort, marginal/uncertain)
+- **Sig-map dual-preload pipelining** (§3): needs a new batched aarch64 asm routine
+  (the per-bin `get_cabac_inline` is `volatile`, so consecutive calls can't overlap);
+  ~1–2% of the sig-map portion of `get_cabac` for substantial hand-asm. Deferred.
+- **Branchy engine for skewed contexts** (§3): uncertain sign, needs a second engine
+  variant wired per-call-site by context skew. Deferred.
+
+### Conclusion
+`get_cabac` (the context arithmetic engine) is the irreducible serial wall; the one cheap
+win there (CLZ renorm) is taken and the rest are high-effort/marginal. **The CABAC thread is
+exhausted** at the practical level. Larger levers remain elsewhere (the swscale resize
+~17–23%, already NEON, and only ISP-offloadable in the >4K-8-bit-4:2:0 case — see
+`SW-DECODE-OPTIMIZATION.md`; and thread-level parallelism).
