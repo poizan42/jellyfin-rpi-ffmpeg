@@ -17,6 +17,51 @@ content from the command line, rather than hardcoded:
 Because the LUTs (1D fast, 3D accurate) are built from math at init, these should just re-parameterize
 the table builder — no per-frame cost. Rebuild tables only when a knob or the source peak changes.
 
+### Design: build the LUTs at init via libplacebo/zscale; keep the NEON apply
+Today the LUTs are baked at **build time** by `rpi_tonemap_gen.py` shelling out to
+`zscale+tonemap=hable` at a fixed 1000-nit peak, embedded as `static const`
+(`rpi_tonemap_tables.h`, `RPI_TM_PEAK_NITS 1000`). To make them peak-correct, **move the
+generation to filter init** and parameterize by the source peak (from mastering-display /
+MaxCLL, or an explicit `peak=`):
+- Generate the curve at init from the **real** tone-mapper — **libplacebo** (preferred) or
+  **zscale** — via an in-process filtergraph or the lib's C API, then **keep applying it with
+  the existing NEON `tbl` path**. Decoupling *generation* (libplacebo/zscale, once per stream)
+  from *apply* (NEON, per-frame) means **zero per-frame cost** and **exact fidelity** — no
+  reimplementing zimg's curve in C (the reason it was baked externally in the first place).
+- Cost is a one-time init table build (~1k luma + ~1k chroma + 33³ grid of simple math /
+  a tiny filtergraph pass); rebuild only when the peak or a knob changes. Negligible vs decode.
+- **libplacebo folds in three deferred items at once:** peak-awareness, `op=bt2390` (it does
+  BT.2390 natively; zscale's `tonemap` doesn't), and it matches Jellyfin's own tonemap backend.
+  zscale keeps bit-exact continuity with today's baked `hable` look — could expose both as a
+  backend knob. **Same dependency also unblocks the software-decode path's HDR tone-map.**
+- The full Jellyfin-FFmpeg build ships **libzimg + libplacebo** already (the lean local config
+  omits them only to speed up iteration), so this adds no real dependency. Keep the baked
+  1000-nit `rpi_tonemap_tables.h` as an optional no-dep fallback for a stripped build.
+
+**Priority is a quality refinement, not a correctness fix.** Verified (2026-07-24) that the
+*current* fixed-1000 pipeline already does something **sensible** on non-DV non-1000-nit HDR10
+sources: `tm=fast`/`tm=accurate` both produce correct colour and tone (vs the washed-out
+`tm=none`), and the two tiers agree in luma (accurate is slightly more neutral in chroma). The
+fixed-1000 assumption shows up only as reduced highlight headroom — above-1000-nit highlights
+roll off toward white (hable, graceful; not a hard clip). Mild on ~1200-nit content (Exodus),
+visible only in the brightest speculars on 4000-nit masters (Baraka). So peak-aware LUTs are
+about **recovering blown highlights on high-peak masters**, not fixing a broken image.
+
+Quantified the recovery (2026-07-24, `zscale=t=linear:npl=100,tonemap=hable:peak=<P>` on the
+real files, luma-clip = fraction of Y ≥ 234; peak=10 ≙ 1000 nits reproduces the current baked
+curve, confirming units):
+
+| sample (master peak) | clip @ peak=1000 | clip @ correct peak | overall |
+|---|---|---|---|
+| Baraka (4000) | 0.94% | **0.40%** (peak=40) | ~halves blown highlights; mean 51→47 (slightly darker) |
+| Exodus (1200) | 9.9%  | **8.4%** (peak=12) | trims ~1.5 pp; brightest sunlit region keeps texture |
+
+So correct-peak roughly halves the clipped-to-white pixels on a 4000-nit master (and darkens
+slightly, the correct compression) — a real but modest highlight-detail gain, confirming the
+"quality refinement, not correctness fix" framing. (Measured with a local build after adding
+`--enable-libzimg`; `--enable-libplacebo` still pending — its `--enable-vulkan` dependency
+fails to configure here despite vulkan 1.3.239 + glslang present, a separate item.)
+
 ### Test corpus for the non-1000-nit `peak=` path
 The current tone-map assumes a 1000-nit source (the fallback). To validate the auto/`peak=`
 path we need HDR10 material authored at a *different* peak. Candidates from Kodi's curated
