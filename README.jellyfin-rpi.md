@@ -191,8 +191,16 @@ make -j4
 - `--enable-sand` + `--enable-v4l2-request` are required for the SAND filter and rpivid decode.
 - `--enable-libzimg`/`--enable-libplacebo`/`--enable-vulkan` are only needed for the HDR
   *reference* (not for `tm=fast`/`accurate`, which are self-contained NEON + embedded LUTs).
+  (They will also drive peak-aware LUT generation and the SW-decode HDR tone-map — see
+  [`TODO-rpi-tonemap.md`](TODO-rpi-tonemap.md).)
 - libplacebo/glslang were rebuilt from Debian *forky* sources against bookworm; the extra Vulkan
-  1.4 headers are needed by libplacebo 7.360.
+  1.4 headers are needed by libplacebo 7.360. **`--enable-vulkan` fails on bookworm's stock Vulkan
+  headers (1.3.239 → "vulkan requested but not found")** — hence the 1.4 `--extra-cflags` include.
+- **Runtime (important):** libplacebo/Vulkan filtering must use the **lavapipe (llvmpipe) software
+  Vulkan** ICD — `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.aarch64.json` with
+  `-init_hw_device vulkan`. The Pi's **V3D** Vulkan driver can't do the FFmpeg/libplacebo
+  external-memory interop (`hwupload` → `VK_ERROR_INVALID_EXTERNAL_HANDLE`). This is why libplacebo
+  is only a CPU-side *reference/LUT-gen* tool here, not a per-frame filter.
 
 Bit-exact + microbench of the SAND kernels: `tests/checkasm/checkasm --test=rpi_sand [--bench]`.
 
