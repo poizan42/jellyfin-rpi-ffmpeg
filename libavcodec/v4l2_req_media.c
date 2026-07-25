@@ -31,6 +31,7 @@
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <linux/media.h>
 #include <linux/mman.h>
@@ -570,9 +571,22 @@ static void queue_put_inuse(struct buf_pool *const bp, struct qent_base *be)
 static struct qent_base *queue_get_free(struct buf_pool *const bp)
 {
     struct qent_base *buf;
+    struct timespec deadline;
+
+    /* Backstop against a permanent hang: with a fixed pool this waits for a
+     * buffer to be recycled by downstream. Downstream here (SAND filter, ISP,
+     * HW H.264 encoder) is fast, so a legitimate wait is well under a second;
+     * only a genuinely wedged pipeline blocks for seconds. Cap the total wait
+     * with an absolute CLOCK_REALTIME deadline (the cond uses the default
+     * clock) and return NULL on timeout, turning a would-be forever-hang into a
+     * clean AVERROR(ENOMEM) at the caller (a dropped frame) that releases the
+     * single-instance device instead of wedging it. */
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += 5;
 
     pthread_mutex_lock(&bp->lock);
-    while ((buf = bq_get_free(bp)) == NULL && pthread_cond_wait(&bp->cond, &bp->lock) == 0)
+    while ((buf = bq_get_free(bp)) == NULL &&
+           pthread_cond_timedwait(&bp->cond, &bp->lock, &deadline) == 0)
         /* Loop */;
     pthread_mutex_unlock(&bp->lock);
     return buf;
