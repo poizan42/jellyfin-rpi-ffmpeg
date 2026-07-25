@@ -1621,6 +1621,7 @@ static int configure_output_video_filter(FilterGraphPriv *fgp, AVFilterGraph *gr
 {
     OutputFilterPriv *ofp = ofp_from_ofilter(ofilter);
     AVFilterContext *last_filter = out->filter_ctx;
+    const AVPixFmtDescriptor *sink_desc;
     AVBPrint bprint;
     int pad_idx = out->pad_idx;
     int ret;
@@ -1681,7 +1682,15 @@ static int configure_output_video_filter(FilterGraphPriv *fgp, AVFilterGraph *gr
         av_frame_side_data_remove(&ofp->side_data, &ofp->nb_side_data, AV_FRAME_DATA_DISPLAYMATRIX);
     }
 
-    if ((ofp->width || ofp->height) && (ofp->flags & OFILTER_FLAG_AUTOSCALE)) {
+    /* Never insert a software scaler ahead of a hardware sink: swscale cannot
+     * process hwframe/DRM_PRIME formats. On a filtergraph reinit the sink w/h
+     * are already locked, so this block (skipped on first config when they were
+     * 0) would otherwise splice an unbridgeable software scale next to the
+     * hardware filter chain and fail format negotiation with ENOSYS. The hw
+     * chain (e.g. scale_v4l2m2m) already produces the locked output size. */
+    sink_desc = av_pix_fmt_desc_get(ofp->format);
+    if ((ofp->width || ofp->height) && (ofp->flags & OFILTER_FLAG_AUTOSCALE) &&
+        !(sink_desc && (sink_desc->flags & AV_PIX_FMT_FLAG_HWACCEL))) {
         char args[255];
         AVFilterContext *filter;
         const AVDictionaryEntry *e = NULL;
