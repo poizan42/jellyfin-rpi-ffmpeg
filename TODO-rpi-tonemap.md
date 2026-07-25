@@ -47,16 +47,21 @@ ramps/grid as `rpi_tonemap_gen.py`; the NEON apply is unchanged. HLG and DV-P5 u
   width/height/pix_fmt/bit_depth/chroma, and DPB ≤ the existing pool) **skips** `get_format()`,
   keeping the pool and `hw_frames_ctx` intact — the spliced 1200→1571 clip now transcodes end to
   end (single- and multi-threaded, `tm=none` and `tm=accurate`; 149/149 frames). A genuine
-  resolution/bit-depth change still reinitialises (that path — mid-stream *resize* on the HW
-  decoder — remains a separate limitation; reproducers `hevc_res_splice_2160p_then_1080p.hevc`
-  and `hevc_depth_splice_10bit_then_8bit.hevc` fail at the boundary by design). Those
-  reproducers also surfaced two teardown **deadlocks** that used to wedge the single-instance
-  rpivid device on any failed reconfig — now fixed so an unsupported change **fails cleanly**
-  (exit + device released) instead of hanging: (1) a use-after-free in the sand filter's
-  dma-buf pool (fixed by refcounting the pool, `vf_sand_to_yuv420p_drm.c`), and (2) an orphaned
-  `decode_q` entry when the v4l2-request dst-buffer alloc fails (fixed by enqueuing only after
-  `start_frame` succeeds, `v4l2_req_hevc_vx.c` / `v4l2_req_decode_q.c`). Test clips + write-up:
-  external sample disk `samples/hdr-splice-test/`.
+  resolution/bit-depth change **now also transcodes through in-process on the HW path**
+  (reproducer `hevc_res_splice_2160p_then_1080p.hevc`: 4K→1080p, 149/149 frames): the
+  decoder already rebuilds its queues/pool/`hw_frames_ctx` from the new SPS, and the
+  filtergraph reinit was unblocked by not inserting a software autoscaler ahead of the
+  DRM_PRIME sink (`fftools/ffmpeg_filter.c`, commit `0e35d31c15` — swscale can't bridge
+  DRM_PRIME, which was the `-38`). Remaining in-process limits: a reinit whose transient
+  ~2× dst-pool CMA exceeds the Pi's 512 MB (a grow, or same-4K), and a change beyond rpivid
+  (4:2:2/4:4:4/12-bit/>4K → software decode) that a single DRM-filter command can't serve —
+  both **fail cleanly** (device released) and are a caller restart-with-reprobe case.
+  Getting there required first fixing two teardown **deadlocks** that used to wedge the
+  single-instance rpivid device on any failed reconfig: (1) a use-after-free in the sand
+  filter's dma-buf pool (refcounted the pool, `vf_sand_to_yuv420p_drm.c`), and (2) an
+  orphaned `decode_q` entry when the v4l2-request dst-buffer alloc fails (enqueue only after
+  `start_frame` succeeds, `v4l2_req_hevc_vx.c` / `v4l2_req_decode_q.c`). Test clips +
+  write-up: external sample disk `samples/hdr-splice-test/`.
 
 Original design notes (retained):
 Today the LUTs are baked at **build time** by `rpi_tonemap_gen.py` shelling out to
