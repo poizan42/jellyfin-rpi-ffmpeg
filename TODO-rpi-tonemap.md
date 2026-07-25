@@ -60,8 +60,16 @@ ramps/grid as `rpi_tonemap_gen.py`; the NEON apply is unchanged. HLG and DV-P5 u
   single-instance rpivid device on any failed reconfig: (1) a use-after-free in the sand
   filter's dma-buf pool (refcounted the pool, `vf_sand_to_yuv420p_drm.c`), and (2) an
   orphaned `decode_q` entry when the v4l2-request dst-buffer alloc fails (enqueue only after
-  `start_frame` succeeds, `v4l2_req_hevc_vx.c` / `v4l2_req_decode_q.c`). Test clips +
-  write-up: external sample disk `samples/hdr-splice-test/`.
+  `start_frame` succeeds, `v4l2_req_hevc_vx.c` / `v4l2_req_decode_q.c`). Two further
+  robustness bugs (found in an adversarial design review of the deferred work) are also
+  fixed: (3) a **segfault** on a mid-stream HW→SW fallback (a switch to 4:2:2/4:4:4/12-bit,
+  or an hwaccel-init failure) — `set_sps` freed the software decode arrays and skipped
+  re-alloc because the old hwaccel was still attached, so SW decode ran on NULL arrays; now
+  the arrays are allocated after `get_format` commits to SW (`hevcdec.c`); and (4) an
+  unbounded fixed-pool buffer wait (`queue_get_free`) that could hang the decoder forever if
+  downstream wedged — now deadline-bounded to a clean ENOMEM (`v4l2_req_media.c`). Test
+  clips + write-up (incl. a HW→SW reproducer): external sample disk
+  `samples/hdr-splice-test/`.
 
 Original design notes (retained):
 Today the LUTs are baked at **build time** by `rpi_tonemap_gen.py` shelling out to
