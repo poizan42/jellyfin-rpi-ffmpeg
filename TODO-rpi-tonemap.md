@@ -49,8 +49,14 @@ ramps/grid as `rpi_tonemap_gen.py`; the NEON apply is unchanged. HLG and DV-P5 u
   end (single- and multi-threaded, `tm=none` and `tm=accurate`; 149/149 frames). A genuine
   resolution/bit-depth change still reinitialises (that path — mid-stream *resize* on the HW
   decoder — remains a separate limitation; reproducers `hevc_res_splice_2160p_then_1080p.hevc`
-  and `hevc_depth_splice_10bit_then_8bit.hevc` still fail at the boundary by design). Test
-  clips + write-up: external sample disk `samples/hdr-splice-test/`.
+  and `hevc_depth_splice_10bit_then_8bit.hevc` fail at the boundary by design). Those
+  reproducers also surfaced two teardown **deadlocks** that used to wedge the single-instance
+  rpivid device on any failed reconfig — now fixed so an unsupported change **fails cleanly**
+  (exit + device released) instead of hanging: (1) a use-after-free in the sand filter's
+  dma-buf pool (fixed by refcounting the pool, `vf_sand_to_yuv420p_drm.c`), and (2) an orphaned
+  `decode_q` entry when the v4l2-request dst-buffer alloc fails (fixed by enqueuing only after
+  `start_frame` succeeds, `v4l2_req_hevc_vx.c` / `v4l2_req_decode_q.c`). Test clips + write-up:
+  external sample disk `samples/hdr-splice-test/`.
 
 Original design notes (retained):
 Today the LUTs are baked at **build time** by `rpi_tonemap_gen.py` shelling out to
