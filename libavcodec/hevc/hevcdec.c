@@ -3359,6 +3359,26 @@ static int hevc_frame_start(HEVCContext *s, HEVCLayerContext *l,
                 }
             }
 
+            /* get_format() may have dropped the hwaccel and committed to
+             * software decoding — a mid-stream switch to a format the hwaccel
+             * can't handle (e.g. 4:2:2/4:4:4/12-bit on rpivid), or an
+             * hwaccel-init failure taking ff_get_format's try_again path.
+             * set_sps() above skipped the software decode arrays because the
+             * old hwaccel was still attached at that point; now that the
+             * software path is committed, allocate them. Guard on !cbf_luma so
+             * a stream that was software from the start (arrays already built by
+             * set_sps) is not re-initialised (which would leak). */
+            if (!s->avctx->hwaccel && !l->cbf_luma) {
+                ret = pic_arrays_init(l, sps);
+                if (ret < 0) {
+                    set_sps(s, l, NULL);
+                    return ret;
+                }
+                ff_hevc_pred_init(&s->hpc,     sps->bit_depth);
+                ff_hevc_dsp_init (&s->hevcdsp, sps->bit_depth);
+                ff_videodsp_init (&s->vdsp,    sps->bit_depth);
+            }
+
             new_sequence = 1;
         }
     }
