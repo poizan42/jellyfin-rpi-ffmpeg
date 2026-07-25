@@ -3359,28 +3359,30 @@ static int hevc_frame_start(HEVCContext *s, HEVCLayerContext *l,
                 }
             }
 
-            /* get_format() may have dropped the hwaccel and committed to
-             * software decoding — a mid-stream switch to a format the hwaccel
-             * can't handle (e.g. 4:2:2/4:4:4/12-bit on rpivid), or an
-             * hwaccel-init failure taking ff_get_format's try_again path.
-             * set_sps() above skipped the software decode arrays because the
-             * old hwaccel was still attached at that point; now that the
-             * software path is committed, allocate them. Guard on !cbf_luma so
-             * a stream that was software from the start (arrays already built by
-             * set_sps) is not re-initialised (which would leak). */
-            if (!s->avctx->hwaccel && !l->cbf_luma) {
-                ret = pic_arrays_init(l, sps);
-                if (ret < 0) {
-                    set_sps(s, l, NULL);
-                    return ret;
-                }
-                ff_hevc_pred_init(&s->hpc,     sps->bit_depth);
-                ff_hevc_dsp_init (&s->hevcdsp, sps->bit_depth);
-                ff_videodsp_init (&s->vdsp,    sps->bit_depth);
-            }
-
             new_sequence = 1;
         }
+    }
+
+    /* Ensure the software decode arrays exist whenever we are decoding this
+     * layer in software but set_sps() skipped them. set_sps() (both here and in
+     * hevc_update_thread_context) skips pic_arrays_init while avctx->hwaccel is
+     * still attached; on a mid-stream HW->SW fallback (a format the hwaccel
+     * can't handle, e.g. 4:2:2/4:4:4/12-bit on rpivid, or an hwaccel-init
+     * failure) the hwaccel is only dropped by the get_format() above — and under
+     * frame threading a peer worker receives the new SPS via
+     * hevc_update_thread_context without reaching that path at all. Checking
+     * every frame (cheap: it only allocates when the arrays are actually
+     * missing) covers both. Guard on !cbf_luma so a stream that was software
+     * from the start is not re-initialised and leaked. */
+    if (l->sps && !s->avctx->hwaccel && !l->cbf_luma) {
+        ret = pic_arrays_init(l, l->sps);
+        if (ret < 0) {
+            set_sps(s, l, NULL);
+            return ret;
+        }
+        ff_hevc_pred_init(&s->hpc,     l->sps->bit_depth);
+        ff_hevc_dsp_init (&s->hevcdsp, l->sps->bit_depth);
+        ff_videodsp_init (&s->vdsp,    l->sps->bit_depth);
     }
 
     if (l->horizontal_bs) {
