@@ -52,10 +52,15 @@ ramps/grid as `rpi_tonemap_gen.py`; the NEON apply is unchanged. HLG and DV-P5 u
   decoder already rebuilds its queues/pool/`hw_frames_ctx` from the new SPS, and the
   filtergraph reinit was unblocked by not inserting a software autoscaler ahead of the
   DRM_PRIME sink (`fftools/ffmpeg_filter.c`, commit `0e35d31c15` — swscale can't bridge
-  DRM_PRIME, which was the `-38`). Remaining in-process limits: a reinit whose transient
-  ~2× dst-pool CMA exceeds the Pi's 512 MB (a grow, or same-4K), and a change beyond rpivid
-  (4:2:2/4:4:4/12-bit/>4K → software decode) that a single DRM-filter command can't serve —
-  both **fail cleanly** (device released) and are a caller restart-with-reprobe case.
+  DRM_PRIME, which was the `-38`). A change **beyond rpivid** (4:2:2/4:4:4/12-bit/>4K →
+  software decode) now **also transcodes through in-process**: `sand_to_yuv420p_drm` accepts
+  software `yuv420p` input (the graph auto-converts the software decoder output to yuv420p via
+  swscale) and re-emits the same DRM_PRIME YU12, so the fixed HW tail (scale + H.264 encode)
+  is unchanged — software decode on CPU, scale+encode still on HW (no tone-map on the SW path
+  yet). This beats a caller restart, which would livelock (the caller rebuilds the identical
+  command). Only remaining in-process limit: a reinit whose transient ~2× dst-pool CMA exceeds
+  the Pi's 512 MB (a grow, or same-4K) — that still fails cleanly (device released) and is the
+  deferred Stage-2 measure-gated work.
   Getting there required first fixing two teardown **deadlocks** that used to wedge the
   single-instance rpivid device on any failed reconfig: (1) a use-after-free in the sand
   filter's dma-buf pool (refcounted the pool, `vf_sand_to_yuv420p_drm.c`), and (2) an
