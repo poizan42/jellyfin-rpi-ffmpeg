@@ -42,7 +42,9 @@
 #include "config_components.h"
 #include "avfilter.h"
 #include "filters.h"
+#include "formats.h"
 #include "video.h"
+#include "libavutil/imgutils.h"
 #include "libavutil/opt.h"
 #include "rpi_tonemap_tables.h"   /* ff_rpi_tm_luma1d/cb1d/cr1d, ff_rpi_tm_lut3d, RPI_TM_LUT3D_N */
 #if CONFIG_ZSCALE_FILTER && CONFIG_TONEMAP_FILTER
@@ -112,6 +114,7 @@ typedef struct BridgeContext {
     const AVClass *class;
     int      heap_fd;
     AVBufferRef *pool_ref;   /* SandPool; also referenced by each emitted OutBuf */
+    AVBufferRef *drm_device; /* lazily created for the software-input fallback path */
     MapEnt   mcache[MAP_CACHE_N];
     int      mcache_n;
     unsigned mmap_count;   /* SAND_PROF: distinct input buffers mmap'd (should plateau) */
@@ -253,6 +256,7 @@ static av_cold void uninit(AVFilterContext *avctx)
     /* Drop the filter's pool reference; sandpool_free frees the slots + lock
      * only once the last still-outstanding output frame is also released. */
     av_buffer_unref(&s->pool_ref);
+    av_buffer_unref(&s->drm_device);
     if (s->heap_fd >= 0) close(s->heap_fd);
     av_freep(&s->p5_lut);
     av_freep(&s->g_luma1d);
@@ -286,23 +290,43 @@ static int config_output(AVFilterLink *outlink)
     FilterLink *inl  = ff_filter_link(inlink);
     FilterLink *outl = ff_filter_link(outlink);
     av_buffer_unref(&outl->hw_frames_ctx);
+
+    /* The DRM device for the output frames context: normally taken from the
+     * input's hw frames context (DRM_PRIME SAND). On the software-input
+     * fallback path (a mid-stream switch to a format rpivid can't decode, e.g.
+     * 4:2:2/4:4:4/12-bit, auto-converted to yuv420p upstream) there is no input
+     * hw frames context, so create our own DRM device once and reuse it. */
+    AVBufferRef *device_ref = NULL;
     if (inl->hw_frames_ctx) {
-        AVHWFramesContext *in_fc = (AVHWFramesContext *)inl->hw_frames_ctx->data;
-        AVBufferRef *out_ref = av_hwframe_ctx_alloc(in_fc->device_ref);
-        if (!out_ref)
-            return AVERROR(ENOMEM);
-        AVHWFramesContext *out_fc = (AVHWFramesContext *)out_ref->data;
-        out_fc->format    = AV_PIX_FMT_DRM_PRIME;
-        out_fc->sw_format = AV_PIX_FMT_YUV420P;
-        out_fc->width     = outlink->w;
-        out_fc->height    = outlink->h;
-        int ret = av_hwframe_ctx_init(out_ref);
-        if (ret < 0) {
-            av_buffer_unref(&out_ref);
-            return ret;
+        device_ref = ((AVHWFramesContext *)inl->hw_frames_ctx->data)->device_ref;
+    } else {
+        if (!s->drm_device) {
+            int ret = av_hwdevice_ctx_create(&s->drm_device, AV_HWDEVICE_TYPE_DRM,
+                                             NULL, NULL, 0);
+            if (ret < 0) {
+                av_log(outlink->src, AV_LOG_ERROR,
+                       "software-input path: cannot create DRM device: %s\n",
+                       av_err2str(ret));
+                return ret;
+            }
         }
-        outl->hw_frames_ctx = out_ref;
+        device_ref = s->drm_device;
     }
+
+    AVBufferRef *out_ref = av_hwframe_ctx_alloc(device_ref);
+    if (!out_ref)
+        return AVERROR(ENOMEM);
+    AVHWFramesContext *out_fc = (AVHWFramesContext *)out_ref->data;
+    out_fc->format    = AV_PIX_FMT_DRM_PRIME;
+    out_fc->sw_format = AV_PIX_FMT_YUV420P;
+    out_fc->width     = outlink->w;
+    out_fc->height    = outlink->h;
+    int ret = av_hwframe_ctx_init(out_ref);
+    if (ret < 0) {
+        av_buffer_unref(&out_ref);
+        return ret;
+    }
+    outl->hw_frames_ctx = out_ref;
     return 0;
 }
 
@@ -1372,6 +1396,98 @@ fail:
 }
 #endif /* CONFIG_ZSCALE_FILTER && CONFIG_TONEMAP_FILTER */
 
+/* Software-input fallback path. The source switched mid-stream to a format
+ * rpivid cannot decode (4:2:2/4:4:4/12-bit/>4K), so the decoder produces
+ * software frames; fftools auto-converts them to yuv420p ahead of us. Copy that
+ * planar frame into a pooled dma-buf and emit the same DRM_PRIME YU12 descriptor
+ * the SAND path emits, so the fixed hardware tail (ISP scale + H.264 encode) is
+ * unchanged. No tone-map here (tm=none on the SW path) — it is a rare, already
+ * sub-real-time path; HDR-on-SW is a later refinement. */
+static int filter_frame_sw(AVFilterLink *inlink, AVFrame *in)
+{
+    AVFilterContext *avctx = inlink->dst;
+    BridgeContext *s = avctx->priv;
+    AVFilterLink *outlink = avctx->outputs[0];
+    AVFrame *out = NULL;
+    OutBuf *b = NULL;
+    int idx = -1, fd = -1, rv;
+    void *map = NULL;
+
+    const unsigned w = av_frame_cropped_width(in);
+    const unsigned h = av_frame_cropped_height(in);
+    const unsigned wo = w, ho = h;   /* full size; the ISP scaler downscales */
+    const unsigned bpl = wo;
+    const size_t ysz = (size_t)bpl * ho, csz = ysz / 4, total = ysz + 2 * csz;
+
+    if ((idx = pool_acquire(s, total, &fd, &map)) < 0) {
+        av_log(avctx, AV_LOG_ERROR, "dma-buf pool exhausted/alloc failed\n");
+        rv = AVERROR(ENOMEM); goto fail;
+    }
+
+    {   /* copy the yuv420p planes into the YU12 dma-buf, honouring input crop */
+        const int cw = ((int)wo + 1) / 2, ch = ((int)ho + 1) / 2;
+        const uint8_t *sy = in->data[0] + in->crop_top * in->linesize[0] + in->crop_left;
+        const uint8_t *su = in->data[1] + (in->crop_top / 2) * in->linesize[1] + in->crop_left / 2;
+        const uint8_t *sv = in->data[2] + (in->crop_top / 2) * in->linesize[2] + in->crop_left / 2;
+        dmabuf_sync(fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE);
+        av_image_copy_plane((uint8_t *)map,             bpl,     sy, in->linesize[0], wo, ho);
+        av_image_copy_plane((uint8_t *)map + ysz,       bpl / 2, su, in->linesize[1], cw, ch);
+        av_image_copy_plane((uint8_t *)map + ysz + csz, bpl / 2, sv, in->linesize[2], cw, ch);
+        dmabuf_sync(fd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE);
+    }
+
+    if (!(b = av_mallocz(sizeof(*b)))) { rv = AVERROR(ENOMEM); goto fail_release; }
+    b->idx = idx;
+    if (!(b->pool_ref = av_buffer_ref(s->pool_ref))) { rv = AVERROR(ENOMEM); goto fail_release; }
+    b->desc.nb_objects = 1;
+    b->desc.objects[0].fd = fd;
+    b->desc.objects[0].size = ((SandPool *)s->pool_ref->data)->pool[idx].size;
+    b->desc.objects[0].format_modifier = DRM_FORMAT_MOD_LINEAR;
+    b->desc.nb_layers = 1;
+    b->desc.layers[0].format = DRM_FORMAT_YUV420;
+    b->desc.layers[0].nb_planes = 3;
+    b->desc.layers[0].planes[0].object_index = 0;
+    b->desc.layers[0].planes[0].offset = 0;
+    b->desc.layers[0].planes[0].pitch = bpl;
+    b->desc.layers[0].planes[1].object_index = 0;
+    b->desc.layers[0].planes[1].offset = ysz;
+    b->desc.layers[0].planes[1].pitch = bpl / 2;
+    b->desc.layers[0].planes[2].object_index = 0;
+    b->desc.layers[0].planes[2].offset = ysz + csz;
+    b->desc.layers[0].planes[2].pitch = bpl / 2;
+
+    if (!(out = av_frame_alloc())) { rv = AVERROR(ENOMEM); goto fail_release; }
+    out->buf[0] = av_buffer_create((uint8_t *)b, sizeof(*b), outbuf_free, NULL, 0);
+    if (!out->buf[0]) { rv = AVERROR(ENOMEM); goto fail_release; }
+    b = NULL;   /* ownership -> out->buf[0] */
+    out->data[0] = (uint8_t *)&((OutBuf *)out->buf[0]->data)->desc;
+    out->format = AV_PIX_FMT_DRM_PRIME;
+    out->width = wo; out->height = ho;
+    av_frame_copy_props(out, in);
+    out->crop_top = out->crop_left = out->crop_bottom = out->crop_right = 0;
+    {
+        FilterLink *outl = ff_filter_link(outlink);
+        if (outl->hw_frames_ctx)
+            out->hw_frames_ctx = av_buffer_ref(outl->hw_frames_ctx);
+    }
+    av_frame_free(&in);
+    return ff_filter_frame(outlink, out);
+
+fail_release:
+    {
+        SandPool *sp = (SandPool *)s->pool_ref->data;
+        ff_mutex_lock(&sp->lock);
+        if (idx >= 0) sp->pool[idx].in_use = 0;
+        ff_mutex_unlock(&sp->lock);
+    }
+fail:
+    if (b) av_buffer_unref(&b->pool_ref);
+    av_free(b);
+    av_frame_free(&out);
+    av_frame_free(&in);
+    return rv;
+}
+
 static int filter_frame(AVFilterLink *inlink, AVFrame *in)
 {
     AVFilterContext *avctx = inlink->dst;
@@ -1384,6 +1500,11 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     void *map = NULL;
     int rv;
     int64_t _t0;
+
+    /* Software-input fallback (mid-stream HW->SW): handled separately, emitting
+     * the same DRM_PRIME YU12 so the hardware tail is unchanged. */
+    if (in->format != AV_PIX_FMT_DRM_PRIME)
+        return filter_frame_sw(inlink, in);
 
     if (prof_on < 0) prof_on = !!getenv("SAND_PROF");
     _t0 = prof_on ? prof_now() : 0;
@@ -1642,6 +1763,27 @@ static const AVOption sand_to_yuv420p_drm_options[] = {
 };
 AVFILTER_DEFINE_CLASS(sand_to_yuv420p_drm);
 
+/* Input: DRM_PRIME SAND (the rpivid HW path) OR software yuv420p (the mid-stream
+ * HW->SW fallback — the decoder drops to software for formats rpivid can't handle
+ * and fftools auto-converts them to yuv420p ahead of us). Output is always the
+ * DRM_PRIME YU12 the ISP/encoder consume. Advertising yuv420p input lets the
+ * filtergraph re-negotiate across a HW->SW switch instead of failing; the HW path
+ * still negotiates DRM_PRIME (it matches the decoder output, no conversion). */
+static int query_formats(const AVFilterContext *avctx,
+                         AVFilterFormatsConfig **cfg_in,
+                         AVFilterFormatsConfig **cfg_out)
+{
+    static const enum AVPixelFormat in_fmts[]  =
+        { AV_PIX_FMT_DRM_PRIME, AV_PIX_FMT_YUV420P, AV_PIX_FMT_NONE };
+    static const enum AVPixelFormat out_fmts[] =
+        { AV_PIX_FMT_DRM_PRIME, AV_PIX_FMT_NONE };
+    int ret;
+    if ((ret = ff_formats_ref(ff_make_format_list(in_fmts),  &cfg_in[0]->formats))  < 0 ||
+        (ret = ff_formats_ref(ff_make_format_list(out_fmts), &cfg_out[0]->formats)) < 0)
+        return ret;
+    return 0;
+}
+
 static const AVFilterPad inputs[] = {
     { .name = "default", .type = AVMEDIA_TYPE_VIDEO, .filter_frame = filter_frame },
 };
@@ -1663,5 +1805,5 @@ FFFilter ff_vf_sand_to_yuv420p_drm = {
     .uninit        = uninit,
     FILTER_INPUTS(inputs),
     FILTER_OUTPUTS(outputs),
-    FILTER_SINGLE_PIXFMT(AV_PIX_FMT_DRM_PRIME),
+    FILTER_QUERY_FUNC2(query_formats),
 };
