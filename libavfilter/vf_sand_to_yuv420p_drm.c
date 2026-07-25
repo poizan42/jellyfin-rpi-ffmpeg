@@ -89,6 +89,17 @@ typedef struct PoolBuf {
     int    in_use;
 } PoolBuf;
 
+/* The dma-buf pool is refcounted independently of the filter context: an
+ * emitted output frame's AVBufferRef can outlive filter uninit (it may still be
+ * buffered downstream when the graph is torn down), and its free callback must
+ * be able to return the slot without touching freed filter state. Both the
+ * filter and every outstanding output buffer hold a reference; the pool and its
+ * slots are destroyed only when the last reference drops (sandpool_free). */
+typedef struct SandPool {
+    AVMutex lock;
+    PoolBuf pool[POOL_N];
+} SandPool;
+
 /* Lever 2: persistent fd-keyed mmap cache for the decoder's input SAND buffers.
  * The decoder recycles a fixed set of dma-buf fds, so mapping them once (instead
  * of a fresh mmap+munmap of ~16 MB per frame in av_hwframe_map) removes that
@@ -100,8 +111,7 @@ typedef struct MapEnt { int fd; void *addr; size_t size; } MapEnt;
 typedef struct BridgeContext {
     const AVClass *class;
     int      heap_fd;
-    AVMutex  lock;
-    PoolBuf  pool[POOL_N];
+    AVBufferRef *pool_ref;   /* SandPool; also referenced by each emitted OutBuf */
     MapEnt   mcache[MAP_CACHE_N];
     int      mcache_n;
     unsigned mmap_count;   /* SAND_PROF: distinct input buffers mmap'd (should plateau) */
@@ -188,14 +198,35 @@ static int map_input_cached(BridgeContext *s, const AVFrame *in, AVFrame *mapped
  * itself stays in the pool (reused) — only marked free here. */
 typedef struct OutBuf {
     AVDRMFrameDescriptor desc;   /* frame->data[0] points here */
-    BridgeContext *s;
+    AVBufferRef *pool_ref;       /* ref to the SandPool backing this frame's slot */
     int idx;                     /* pool slot */
 } OutBuf;
+
+static void sandpool_free(void *opaque, uint8_t *data)
+{
+    SandPool *sp = (SandPool *)data;
+    for (int i = 0; i < POOL_N; i++) {
+        if (sp->pool[i].map && sp->pool[i].map != MAP_FAILED) munmap(sp->pool[i].map, sp->pool[i].size);
+        if (sp->pool[i].fd >= 0) close(sp->pool[i].fd);
+    }
+    ff_mutex_destroy(&sp->lock);
+    av_free(sp);
+}
 
 static av_cold int init(AVFilterContext *avctx)
 {
     BridgeContext *s = avctx->priv;
-    for (int i = 0; i < POOL_N; i++) s->pool[i].fd = -1;
+    SandPool *sp = av_mallocz(sizeof(*sp));
+    if (!sp)
+        return AVERROR(ENOMEM);
+    for (int i = 0; i < POOL_N; i++) sp->pool[i].fd = -1;
+    ff_mutex_init(&sp->lock, NULL);
+    s->pool_ref = av_buffer_create((uint8_t *)sp, sizeof(*sp), sandpool_free, NULL, 0);
+    if (!s->pool_ref) {
+        ff_mutex_destroy(&sp->lock);
+        av_free(sp);
+        return AVERROR(ENOMEM);
+    }
     for (int i = 0; i < 64; i++) {   /* subsample the 1024-entry curves at code = i*16 */
         s->l64[i]      = ff_rpi_tm_luma1d[i * 16];
         s->l64_next[i] = ff_rpi_tm_luma1d[FFMIN((i + 1) * 16, 1023)];
@@ -206,7 +237,6 @@ static av_cold int init(AVFilterContext *avctx)
         s->cb64_hlg[i] = ff_rpi_tm_cb1d_hlg[i * 16];
         s->cr64_hlg[i] = ff_rpi_tm_cr1d_hlg[i * 16];
     }
-    ff_mutex_init(&s->lock, NULL);
     s->heap_fd = open("/dev/dma_heap/linux,cma", O_RDWR | O_CLOEXEC);
     if (s->heap_fd < 0) {
         av_log(avctx, AV_LOG_ERROR, "Cannot open /dev/dma_heap/linux,cma: %s\n", strerror(errno));
@@ -218,13 +248,11 @@ static av_cold int init(AVFilterContext *avctx)
 static av_cold void uninit(AVFilterContext *avctx)
 {
     BridgeContext *s = avctx->priv;
-    for (int i = 0; i < POOL_N; i++) {
-        if (s->pool[i].map && s->pool[i].map != MAP_FAILED) munmap(s->pool[i].map, s->pool[i].size);
-        if (s->pool[i].fd >= 0) close(s->pool[i].fd);
-    }
     for (int i = 0; i < s->mcache_n; i++)
         munmap(s->mcache[i].addr, s->mcache[i].size);
-    ff_mutex_destroy(&s->lock);
+    /* Drop the filter's pool reference; sandpool_free frees the slots + lock
+     * only once the last still-outstanding output frame is also released. */
+    av_buffer_unref(&s->pool_ref);
     if (s->heap_fd >= 0) close(s->heap_fd);
     av_freep(&s->p5_lut);
     av_freep(&s->g_luma1d);
@@ -282,31 +310,34 @@ static int config_output(AVFilterLink *outlink)
  * the pool index and fills *fd/*map, or -1 on failure. */
 static int pool_acquire(BridgeContext *s, size_t size, int *fd, void **map)
 {
+    SandPool *sp = (SandPool *)s->pool_ref->data;
     int idx = -1;
-    ff_mutex_lock(&s->lock);
+    ff_mutex_lock(&sp->lock);
     for (int i = 0; i < POOL_N; i++)
-        if (!s->pool[i].in_use && s->pool[i].map && s->pool[i].size >= size) { idx = i; break; }
+        if (!sp->pool[i].in_use && sp->pool[i].map && sp->pool[i].size >= size) { idx = i; break; }
     if (idx < 0) {
-        for (int i = 0; i < POOL_N; i++) if (s->pool[i].map == NULL) {   /* alloc a fresh slot */
+        for (int i = 0; i < POOL_N; i++) if (sp->pool[i].map == NULL) {   /* alloc a fresh slot */
             struct dma_heap_allocation_data a = { .len = size, .fd_flags = O_RDWR | O_CLOEXEC };
             if (ioctl(s->heap_fd, DMA_HEAP_IOCTL_ALLOC, &a) < 0) break;
             void *m = mmap(NULL, a.len, PROT_READ | PROT_WRITE, MAP_SHARED, a.fd, 0);
             if (m == MAP_FAILED) { close(a.fd); break; }
-            s->pool[i] = (PoolBuf){ .fd = a.fd, .map = m, .size = a.len, .in_use = 0 };
+            sp->pool[i] = (PoolBuf){ .fd = a.fd, .map = m, .size = a.len, .in_use = 0 };
             idx = i; break;
         }
     }
-    if (idx >= 0) { s->pool[idx].in_use = 1; *fd = s->pool[idx].fd; *map = s->pool[idx].map; }
-    ff_mutex_unlock(&s->lock);
+    if (idx >= 0) { sp->pool[idx].in_use = 1; *fd = sp->pool[idx].fd; *map = sp->pool[idx].map; }
+    ff_mutex_unlock(&sp->lock);
     return idx;
 }
 
 static void outbuf_free(void *opaque, uint8_t *data)
 {
     OutBuf *b = (OutBuf *)data;
-    ff_mutex_lock(&b->s->lock);
-    b->s->pool[b->idx].in_use = 0;   /* return to pool; dma-buf kept for reuse */
-    ff_mutex_unlock(&b->s->lock);
+    SandPool *sp = (SandPool *)b->pool_ref->data;
+    ff_mutex_lock(&sp->lock);
+    sp->pool[b->idx].in_use = 0;   /* return to pool; dma-buf kept for reuse */
+    ff_mutex_unlock(&sp->lock);
+    av_buffer_unref(&b->pool_ref);   /* may trigger sandpool_free if filter already gone */
     av_free(b);
 }
 
@@ -1522,10 +1553,11 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     }
 
     if (!(b = av_mallocz(sizeof(*b)))) { rv = AVERROR(ENOMEM); goto fail_release; }
-    b->s = s; b->idx = idx;
+    b->idx = idx;
+    if (!(b->pool_ref = av_buffer_ref(s->pool_ref))) { rv = AVERROR(ENOMEM); goto fail_release; }
     b->desc.nb_objects = 1;
     b->desc.objects[0].fd = fd;
-    b->desc.objects[0].size = s->pool[idx].size;
+    b->desc.objects[0].size = ((SandPool *)s->pool_ref->data)->pool[idx].size;
     b->desc.objects[0].format_modifier = DRM_FORMAT_MOD_LINEAR;
     b->desc.nb_layers = 1;
     b->desc.layers[0].format = DRM_FORMAT_YUV420;
@@ -1575,10 +1607,14 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     return ff_filter_frame(outlink, out);
 
 fail_release:
-    ff_mutex_lock(&s->lock);
-    if (idx >= 0) s->pool[idx].in_use = 0;
-    ff_mutex_unlock(&s->lock);
+    {
+        SandPool *sp = (SandPool *)s->pool_ref->data;
+        ff_mutex_lock(&sp->lock);
+        if (idx >= 0) sp->pool[idx].in_use = 0;
+        ff_mutex_unlock(&sp->lock);
+    }
 fail:
+    if (b) av_buffer_unref(&b->pool_ref);
     av_free(b);
     av_frame_free(&mapped);
     av_frame_free(&tmp);
