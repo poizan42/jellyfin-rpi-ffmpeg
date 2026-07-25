@@ -36,6 +36,13 @@ int decode_q_in_q(const req_decode_ent * const d)
 void decode_q_add(req_decode_q * const q, req_decode_ent * const d)
 {
     pthread_mutex_lock(&q->q_lock);
+    if (d->in_q) {
+        /* Already queued: re-adding a live node would corrupt the list (a
+         * later remove of a non-head node neither fixes head nor signals
+         * waiters). Must never happen; refuse rather than deadlock/UAF. */
+        pthread_mutex_unlock(&q->q_lock);
+        return;
+    }
     if (!q->head) {
         q->head = d;
         q->tail = d;

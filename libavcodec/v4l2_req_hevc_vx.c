@@ -751,8 +751,6 @@ static int v4l2_request_hevc_start_frame(AVCodecContext *avctx,
     V4L2MediaReqDescriptor *const rd = (V4L2MediaReqDescriptor *)h->cur_frame->f->data[0];
 
 //    av_log(NULL, AV_LOG_INFO, "%s\n", __func__);
-    decode_q_add(&ctx->decode_q, &rd->decode_ent);
-
     rd->num_slices = 0;
     ctx->timestamp++;
     rd->timestamp = cvt_timestamp_to_dpb(ctx->timestamp);
@@ -770,6 +768,15 @@ static int v4l2_request_hevc_start_frame(AVCodecContext *avctx,
             return AVERROR(ENOMEM);
         }
     }
+
+    /* Enqueue only once start_frame has fully succeeded. The decode_q entry is
+     * removed exclusively by end_frame/abort_frame; if we added it before a
+     * fallible step above (e.g. the dst-buffer alloc), a failure here would
+     * orphan it — hevc_frame_start's error path nulls cur_frame, so the
+     * subsequent abort_frame becomes a no-op and never removes it, and every
+     * later end_frame (and the next uninit's decode_q_wait(NULL)) then blocks
+     * forever behind the stranded head entry. */
+    decode_q_add(&ctx->decode_q, &rd->decode_ent);
 
     // ff_thread_finish_setup by caller
 
