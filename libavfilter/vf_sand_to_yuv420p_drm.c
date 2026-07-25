@@ -143,6 +143,8 @@ typedef struct BridgeContext {
  * caller to fall back to av_hwframe_map (cache full / mmap failed). */
 static void *map_cached(BridgeContext *s, int fd, size_t size)
 {
+    if (fd < 0 || size == 0)   /* degenerate descriptor (e.g. a frame whose dma-buf never allocated) */
+        return NULL;
     for (int i = 0; i < s->mcache_n; i++)
         if (s->mcache[i].fd == fd && s->mcache[i].size == size)
             return s->mcache[i].addr;
@@ -182,6 +184,13 @@ static int map_input_cached(BridgeContext *s, const AVFrame *in, AVFrame *mapped
             plane++;
         }
     }
+    /* A descriptor can carry an object but no layers — e.g. a frame the decoder
+     * emitted after its dma-buf allocation failed under CMA pressure. The plane
+     * loop then leaves data[] NULL, and the SAND fixup below would still stamp
+     * plausible-looking strides onto it, so the unpack would read from NULL.
+     * Reject it here and let the caller fail the frame cleanly. */
+    if (plane < 2 || !mapped->data[0] || !mapped->data[1])
+        return -1;
     if (av_rpi_is_sand_frame(mapped)) {
         int mod_stride = fourcc_mod_broadcom_param(desc->objects[0].format_modifier);
         if (mod_stride == 0) {
@@ -1521,6 +1530,18 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
             av_log(avctx, AV_LOG_ERROR, "hwframe_map(READ) failed: %s\n", av_err2str(rv));
             goto fail;
         }
+    }
+    /* Both mapping paths must yield a usable two-plane SAND view. A decoder that
+     * hit a dma-buf allocation failure (CMA exhaustion, e.g. a second concurrent
+     * 4K session) can still emit a frame whose backing buffer never materialised;
+     * unpacking that would read from a NULL/short mapping and segfault. Fail the
+     * frame instead — the caller drops it and the transcode continues or exits
+     * cleanly. */
+    if (!mapped->data[0] || !mapped->data[1] || mapped->linesize[0] <= 0) {
+        av_log(avctx, AV_LOG_ERROR,
+               "input frame has no usable mapping (decoder buffer allocation failed?)\n");
+        rv = AVERROR(EINVAL);
+        goto fail;
     }
     mapped->crop_top = in->crop_top;   mapped->crop_bottom = in->crop_bottom;
     mapped->crop_left = in->crop_left;  mapped->crop_right = in->crop_right;
