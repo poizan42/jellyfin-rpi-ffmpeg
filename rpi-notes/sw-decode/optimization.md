@@ -1,13 +1,13 @@
 # Software-decode path — optimization log & experiments (RPi 4, aarch64)
 
 Scope: the **software HEVC decode** transcode path — the inputs the hardware pipeline
-can't handle (see [`README.jellyfin-rpi.md`](README.jellyfin-rpi.md)): **4:2:2 / 4:4:4**, **12-bit**, or **>4K**.
+can't handle (see [`README.jellyfin-rpi.md`](../../README.jellyfin-rpi.md)): **4:2:2 / 4:4:4**, **12-bit**, or **>4K**.
 These fall back to CPU HEVC decode → swscale (downscale + convert to 8-bit 4:2:0) →
 `h264_v4l2m2m` (HW 8-bit encode). They are **offline / sub-real-time** and always will be
 (CABAC is the serial wall); this log tracks attempts to shrink the CPU cost and — equally
 useful — the ones that didn't pan out, with the reasons.
 
-Companion docs: [`README.jellyfin-rpi.md`](README.jellyfin-rpi.md) (§ perf tables), [`CABAC-SIMD-analysis.md`](CABAC-SIMD-analysis.md) (the
+Companion docs: [`README.jellyfin-rpi.md`](../../README.jellyfin-rpi.md) (§ perf tables), [`cabac-simd.md`](cabac-simd.md) (the
 entropy-decode deep dive). Measure with `perf -e task-clock` on the unstripped `ffmpeg_g`
 (the installed `ffmpeg` is stripped); validate decode changes bit-exact with `-f framemd5`.
 
@@ -36,15 +36,15 @@ Decode the per-subgroup bypass run (sign flags + `coeff_abs_level_remaining`) as
 reciprocal-multiply peek instead of per-bin. Adapted from rpi-ffmpeg (LGPL). Bit-exact on
 16 clips; `residual_coding` self-time −10–14% relative on bypass-heavy content, but only
 **~1–2% whole-decode** (near noise) — `get_cabac` dominates. Full write-up:
-[`CABAC-SIMD-analysis.md` §8](CABAC-SIMD-analysis.md#8-by22-prototype--implemented--measured-bit-exact-modest-win). Files: `libavcodec/cabac.h`, `libavcodec/hevc/cabac.c`.
+[`cabac-simd.md` §8](cabac-simd.md#8-by22-prototype--implemented--measured-bit-exact-modest-win). Files: `libavcodec/cabac.h`, `libavcodec/hevc/cabac.c`.
 
 ### CABAC CLZ renorm — correct, neutral-to-marginal
 The per-bin renorm shift in the aarch64 `get_cabac` asm was a dependent table load;
 replaced with `clz` (`norm_shift[x]==clz32(x)−23`). Bit-exact; `get_cabac` self-time
 9.17%→8.64% (10-bit 4:4:4); wall-clock neutral (below ~1% noise). Kept as a correct,
-load-removing, compounding change. [`CABAC-SIMD-analysis.md` §9a](CABAC-SIMD-analysis.md#9a-clz-renorm--shipped-bit-exact-neutral-to-marginal). File:
+load-removing, compounding change. [`cabac-simd.md` §9a](cabac-simd.md#9a-clz-renorm--shipped-bit-exact-neutral-to-marginal). File:
 `libavcodec/aarch64/cabac.h`. (Dequant-hoist checked and dropped — dequant is ~0.8% of
-decode, not a lever; [§9b](CABAC-SIMD-analysis.md#9b-dequant-hoist--not-pursued-the-4-opusfable-dispute-resolved). Remaining CABAC levers deferred as high-effort/marginal; [§9c](CABAC-SIMD-analysis.md#9c-remaining-levers--declined-the-clz-result-predicts-they-wont-help).)
+decode, not a lever; [§9b](cabac-simd.md#9b-dequant-hoist--not-pursued-the-4-opusfable-dispute-resolved). Remaining CABAC levers deferred as high-effort/marginal; [§9c](cabac-simd.md#9c-remaining-levers--declined-the-clz-result-predicts-they-wont-help).)
 
 ## Dropped / negative results (with the why)
 
@@ -53,7 +53,7 @@ Was the original target (only 8-bit SAO NEON exists; 10/12 fell back to C). A pr
 first: on both a 10-bit and a 12-bit clip the SAO **filter** measured **<0.1%** of decode
 (`sao_*_filter` never even sampled; only `hls_sao_param` header parsing showed, ~0.06%).
 Not worth widening the kernels. Pivoted to the 12-bit IDCT instead. (Full CABAC/entropy
-serial-wall analysis in [`CABAC-SIMD-analysis.md`](CABAC-SIMD-analysis.md).)
+serial-wall analysis in [`cabac-simd.md`](cabac-simd.md).)
 
 ### ISP downscale offload for the SW path — measured no-go (for format-conversion cases)
 Idea: since the target is 8-bit 4:2:0 anyway, do the 10/12→8-bit + 4:4:4/4:2:2→4:2:0
@@ -99,7 +99,7 @@ The format-driven SW cases (4:2:2/4:4:4/12-bit) are near their practical floor o
 board: decode transform/entropy levers are shipped or exhausted, the scaler is irreducible
 here (no HW ingests the source format), and encode is already HW. The one live lever is the
 **resolution-only (>4K 8-bit 4:2:0) ISP-resize offload** above — conditional and unmeasured.
-Otherwise these formats remain batch/offline on the Pi 4, as [`README.jellyfin-rpi.md`](README.jellyfin-rpi.md) states.
+Otherwise these formats remain batch/offline on the Pi 4, as [`README.jellyfin-rpi.md`](../../README.jellyfin-rpi.md) states.
 
 ## Parked threads (investigate later)
 

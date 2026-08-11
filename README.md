@@ -35,15 +35,15 @@ on a 1080p transcode the pipeline is limited by the single-threaded rpivid decod
 
 - **[README.jellyfin-rpi.md](README.jellyfin-rpi.md)** — full design, build, usage, the
   supported-input matrix, and the performance tables (HW and software-decode paths).
-- **[SW-DECODE-OPTIMIZATION.md](SW-DECODE-OPTIMIZATION.md)** — optimization log for the
+- **[rpi-notes/sw-decode/optimization.md](rpi-notes/sw-decode/optimization.md)** — optimization log for the
   software-decode path (the 4:2:2 / 4:4:4 / 12-bit / >4K formats hardware can't do):
   shipped wins (12-bit IDCT NEON, CABAC), measured-and-dropped experiments with the reasons,
   and parked future threads.
-- **[CABAC-SIMD-analysis.md](CABAC-SIMD-analysis.md)** — deep dive on whether HEVC CABAC /
+- **[rpi-notes/sw-decode/cabac-simd.md](rpi-notes/sw-decode/cabac-simd.md)** — deep dive on whether HEVC CABAC /
   entropy decode can be SIMD-ised, and the micro-optimisations that came out of it.
-- **[TODO-rpi-input-support.md](TODO-rpi-input-support.md)** — roadmap for widening the
+- **[rpi-notes/pipeline/input-support.md](rpi-notes/pipeline/input-support.md)** — roadmap for widening the
   input formats the transcode path accepts.
-- **[TODO-rpi-tonemap.md](TODO-rpi-tonemap.md)** — deferred follow-ups for the SAND→YU12
+- **[rpi-notes/pipeline/tonemap.md](rpi-notes/pipeline/tonemap.md)** — deferred follow-ups for the SAND→YU12
   HDR tone-map filter.
 
 ---

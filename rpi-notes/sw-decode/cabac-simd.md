@@ -343,4 +343,4 @@ software CABAC lever left that clears the noise floor on this microarchitecture.
 win there (CLZ renorm) is taken and the rest are high-effort/marginal. **The CABAC thread is
 exhausted** at the practical level. Larger levers remain elsewhere (the swscale resize
 ~17–23%, already NEON, and only ISP-offloadable in the >4K-8-bit-4:2:0 case — see
-[`SW-DECODE-OPTIMIZATION.md`](SW-DECODE-OPTIMIZATION.md); and thread-level parallelism).
+[`optimization.md`](optimization.md); and thread-level parallelism).

@@ -191,7 +191,29 @@ over a private fork patch. Tooling on this box: `perf` (paranoid must be ≤1 �
 attribution incl. CABAC. Profile `ffmpeg_g` (unstripped) for symbols.
 
 ## Not in scope (hard limits, for the record)
-- **Non-HEVC codecs** (H.264 / VP9 / AV1) — rpivid is HEVC-only; out of this pipeline entirely.
+- **Non-HEVC codecs** (H.264 / VP9 / AV1) — rpivid is HEVC-only, so none of them ever produce a
+  SAND frame; out of the HW-decode pipeline entirely. The encode + ISP tail still applies (software
+  decode → `sand_to_yuv420p_drm` SW-input → `scale_v4l2m2m` → `h264_v4l2m2m`), so they transcode —
+  just software-decode-bound.
+  - **H.264 specifically:** the Pi 4 *does* have a separate legacy H.264 hardware decoder
+    (`bcm2835-codec`, `/dev/video10`), but its coded-input format range is **`H264 32×32 – 1920×1920`**
+    (verified: `v4l2-ctl -d /dev/video10 --list-formats-out-ext`). So it can HW-decode **≤1080p** H.264
+    but **not 4K** — 3840 exceeds 1920 on both axes. 4K H.264 therefore falls to **software** decode.
+  - **4K H.264 is not real-time and can't be made so.** Measured on this Pi 4B (`ffmpeg -threads 0`,
+    20 s steady-state, `samples/kodi/high-bitrate/{jellyfish,test-videos}/`):
+
+    | source | decode-only ceiling | full → 720p | full → 1080p |
+    |---|---:|---:|---:|
+    | 4K30 H.264 High @120 Mbit (jellyfish) | **0.50×** (15 fps) | 0.42× | 0.40× |
+    | 4K60 H.264 High @40 Mbit (Test AVC) | **0.47×** (28 fps) | 0.34× | — |
+
+    The wall is **decode-only at ~0.5×** — before any scale/encode — so no amount of tuning our HW
+    scale/encode side reaches 1.0×. The decode itself is unmovable: ffmpeg's H.264 decoder is already
+    NEON + frame-threaded (all 4 cores), there is no ≥1080p H.264 HW block to offload to, and
+    inter-frame prediction forbids frame-skipping. **4K H.264 → transcode is offline/batch only; the
+    only real-time answer is client direct-play (no transcode).** In practice 4K distribution is almost
+    all HEVC, so this is rare. (rpivid HEVC on `/dev/video19` goes to 4K — the limit is codec-specific,
+    not a general 4K-decode limit.)
 - **Output beyond 8-bit 4:2:0 H.264 ≤1080p** — fixed by the bcm2835 encoder (level 4.0, one stream).
 - **DV profile 7 dual-layer** — expected to decode its HDR10 base only (EL/RPU ignored); untested, no
   P7 sample in the corpus. Add a P7 sample and verify if it ever matters.

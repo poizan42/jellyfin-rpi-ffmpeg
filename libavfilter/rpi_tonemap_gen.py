@@ -11,7 +11,7 @@
 # -> the "ff_rpi_tm_*_hlg" set. Both use the identical hable chain + grid; only the
 # input transfer tag differs, so the first zscale linearizes from the correct EOTF.
 #
-# Assumptions baked in (see TODO-rpi-tonemap.md for making these tunable):
+# Assumptions baked in (see rpi-notes/pipeline/tonemap.md for making these tunable):
 #   operator=hable, source peak=1000 nits (npl=100), fast chroma sat-gain=1.5,
 #   3D LUT grid N=33 (limited-range 10-bit domain).
 import sys, subprocess
