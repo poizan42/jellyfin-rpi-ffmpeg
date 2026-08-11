@@ -101,6 +101,11 @@ here (no HW ingests the source format), and encode is already HW. The one live l
 **resolution-only (>4K 8-bit 4:2:0) ISP-resize offload** above — conditional and unmeasured.
 Otherwise these formats remain batch/offline on the Pi 4, as [`README.jellyfin-rpi.md`](../../README.jellyfin-rpi.md) states.
 
+Separately, **4K H.264** is software-decoded (a different codec — the firmware H.264 block is
+1080p-class, not HEVC's 4K Argon) and is also ~0.5× / offline; offloading its serial entropy
+stage to the VideoCore's hardware CABAC engine was **ruled out** (Amdahl + VPU-side read-back
++ 1080p silicon): [`hw-cabac-offload.md`](hw-cabac-offload.md).
+
 ## Parked threads (investigate later)
 
 These are not pursued yet; recorded so they aren't lost or re-derived.

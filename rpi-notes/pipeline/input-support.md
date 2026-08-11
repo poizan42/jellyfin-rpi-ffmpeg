@@ -213,7 +213,10 @@ attribution incl. CABAC. Profile `ffmpeg_g` (unstripped) for symbols.
     frame-threaded, but on this 4-core Pi it tops out at ~3–3.6 cores busy and won't saturate all four
     — `-threads 0` → 302 % CPU / 0.44×, explicit `-threads 4` → 356 % CPU / **0.52×**, `-threads 1` →
     0.17× — because frame-dependency + per-slice entropy decode serialize it. There is also no ≥1080p
-    H.264 HW block to offload to, and inter-frame prediction forbids frame-skipping. **4K H.264 → transcode is offline/batch only; the
+    H.264 HW block to offload to (the firmware H.264 codec is Level-4.0 / 1080p; and offloading just the
+    serial entropy stage to the VideoCore's hardware CABAC engine was **ruled out** — Amdahl-capped at
+    ~0.6–0.73× even free: [`../sw-decode/hw-cabac-offload.md`](../sw-decode/hw-cabac-offload.md)), and
+    inter-frame prediction forbids frame-skipping. **4K H.264 → transcode is offline/batch only; the
     only real-time answer is client direct-play (no transcode).** In practice 4K distribution is almost
     all HEVC, so this is rare. (rpivid HEVC on `/dev/video19` goes to 4K — the limit is codec-specific,
     not a general 4K-decode limit.)
