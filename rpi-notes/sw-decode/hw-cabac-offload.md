@@ -23,17 +23,23 @@ not speculation:
   software, orchestrates the command ring, and runs **reconstruction (MC / transform /
   deblock) on the VPU vector unit**. The ARM only ships buffers in via the MMAL/VCHIQ
   mailbox (`bcm2835-codec`).
-- **It is not ARM-visible.** Unlike the HEVC/Argon block (an ARM-MMIO peripheral at
-  `0x7eb00000`, in the device tree, driven directly by `rpivid`), the H.264 hardware "lives
-  behind the VPU and is reached only via the mailbox." (Structural symmetry noted in §3 of
-  that doc: both are command/bit-FIFO-fed fixed-function CABAC engines — the *only* difference
-  is who drives them, ARM vs VPU firmware.)
+- **No ARM driver reaches it; it's driven only via the mailbox today.** Unlike the HEVC/Argon
+  block (an ARM-MMIO peripheral at `0x7eb00000`, in the device tree, driven directly from the
+  ARM by `rpivid`), the H.264 hardware has no device-tree node and is reached only via the
+  MMAL/VCHIQ mailbox to the VPU firmware. (Structural symmetry noted in §3 of that doc: both
+  are command/bit-FIFO-fed fixed-function CABAC engines — the difference is *who drives them*,
+  ARM vs VPU firmware.)
 
-So the answer to "could a custom device tree expose it?" is **no — architecturally
-impossible.** A DT node hands an ARM-addressable MMIO range to a Linux driver; the H.264
-CABAC registers are VPU-side peripherals the ARM cannot address. The only way to reach the
-engine is **from the VPU** — either extending the firmware, or `EXECUTE_CODE` custom VPU code
-(proven in `~/rpi-hacking`, but **root**, and it can **wedge the board** to a hard reset).
+So "could a custom device tree expose it?" — **unknown, and not how it's driven today.** Its
+registers sit in the VPU peripheral space (`0x7f00*`); whether the ARM can be made to address
+that region at all is **not established** — we have *not* reversed how (or whether) the VPU
+maps its peripheral space into an ARM-visible physical window, so this is an open question, not
+a proven "no." A DT-overlay + driver route therefore can't be assumed possible *or* impossible;
+at minimum it would need (1) establishing ARM addressability of `0x7f00*`, then (2) a driver
+reimplementing the firmware's command-ring orchestration. The only route we *know* works is
+**from the VPU** — extending the firmware, or `EXECUTE_CODE` custom VPU code (proven in
+`~/rpi-hacking`, but **root**, and it can **wedge the board** to a hard reset). The verdict
+below does not hinge on this: even with the engine perfectly in hand, Amdahl rules it out.
 
 ## Why it can't reach real-time anyway — Amdahl
 
@@ -85,8 +91,9 @@ Every property we reversed points the wrong way, on top of the Amdahl ceiling:
 
 **Do not pursue HW CABAC offload for 4K H.264.** A *free* offload is Amdahl-capped at
 ~0.6–0.73×; then the VPU-side read-back, the non-separable firmware coupling, and the
-1080p-class engine each independently sink it — and it's only reachable via root-only,
-board-wedging VPU code in the first place. 4K H.264 stays **offline / batch, or client
+1080p-class engine each independently sink it — and the only route we *know* reaches it is
+root-only, board-wedging VPU code (whether an ARM-driven route is even possible is
+unestablished, but moot given the above). 4K H.264 stays **offline / batch, or client
 direct-play** (in practice 4K distribution is almost all HEVC, which *does* hardware-decode to
 4K via `rpivid`).
 
