@@ -205,15 +205,24 @@ attribution incl. CABAC. Profile `ffmpeg_g` (unstripped) for symbols.
     2.84× @5 Mbit — its mem2mem overhead outweighs cheap SW decode). **Not bit-exact vs software:**
     chroma identical, luma ~**75 dB** (±1 LSB on ~0.2 % of samples — a HW rounding corner). Fine for
     transcode (far below the downscale+re-encode noise floor) but it **can't back a framemd5 gate** —
-    which is why this repo's SAND/tonemap validation always references *software* decode. We don't route
-    to it anyway: the shim's `hw_decodable` is HEVC-only, and its output is planar YUV (not SAND, so it
-    can't feed `sand_to_yuv420p_drm`). Its draw is **CPU offload, and that draw is large** — SW 1080p
-    decode costs **~2.8 cores** (282 % CPU @20 Mbit, 274 % @5 Mbit — most of the 4-core chip), while HW
-    decode is nearly free at **~0.1–0.4 cores** (13–35 % CPU), freeing **~2.5 cores** (300-frame
-    `/usr/bin/time`). It wouldn't make 1080p H.264 *faster* (both already real-time), but it would nearly
-    eliminate its CPU cost — a real concurrency/thermal lever if a future path ever runs 1080p-H.264
-    sessions alongside the CPU-bound SAND/tonemap work. The blocker to using it is the planar-YUV-vs-SAND
-    path split, not the CPU math.
+    which is why this repo's SAND/tonemap validation always references *software* decode. Its draw is
+    **CPU offload, and that draw is large** — SW 1080p decode costs **~2.8 cores** (282 % CPU @20 Mbit,
+    274 % @5 Mbit — most of the 4-core chip), while HW decode is nearly free.
+  - **SHIPPED (zero-copy): the orchestrator now routes ≤1080p 8-bit 4:2:0 progressive H.264 to the
+    hardware decoder.** The earlier "blocker is planar-YUV-vs-SAND" was wrong: the H.264 decoder doesn't
+    need `sand_to_yuv420p_drm` — `scale_v4l2m2m` (the ISP) accepts a DRM_PRIME frame directly
+    (`FILTER_SINGLE_PIXFMT(DRM_PRIME)`; NV12/YUV420/P030 descriptor), and the stateful `v4l2_m2m` decoder
+    *can* emit DRM_PRIME (`output_drm`). The only catch is the trigger: its DRM_PRIME config is
+    `HW_CONFIG_INTERNAL`, which `-hwaccel drm` **skips** — the flag that selects it is **`-no_cvt_hw`**
+    (as in John-Cox's own `pi-util/testfilt.py`). So the whole chain
+    `-no_cvt_hw -c:v h264_v4l2m2m -i F -vf scale_v4l2m2m=W:H -c:v h264_v4l2m2m` is fully hardware,
+    zero-copy (decode `/dev/video10` → ISP `/dev/video12` → encode `/dev/video11`), **no ffmpeg code
+    change**. Measured full 1080p→720p transcode: **~0.2–0.4 cores** (0.18× @5 Mbit, 0.41× @20 Mbit) vs
+    ~2.9 software and ~1.1 through the sand bridge — the bridge's ~1 core was a CPU copy this path avoids.
+    The orchestrator shim gates this as `h264_hw_decodable` (h264, 8-bit, 4:2:0, ≤1920, progressive,
+    non-HDR) and emits exactly that graph; 4K/10-bit/4:2:2/4:4:4/interlaced fall back to software.
+    Verified: engages live at 0.37 cores, and runs concurrently with a 4K-HEVC rpivid session (different
+    engine, no shared admission slot).
   - **4K H.264 is not real-time and can't be made so.** Measured on this Pi 4B (`ffmpeg -threads 0`,
     20 s steady-state, `samples/kodi/high-bitrate/{jellyfish,test-videos}/`):
 
