@@ -222,7 +222,10 @@ attribution incl. CABAC. Profile `ffmpeg_g` (unstripped) for symbols.
     The orchestrator shim gates this as `h264_hw_decodable` (h264, 8-bit, 4:2:0, ≤1920, progressive,
     non-HDR) and emits exactly that graph; 4K/10-bit/4:2:2/4:4:4/interlaced fall back to software.
     Verified: engages live at 0.37 cores, and runs concurrently with a 4K-HEVC rpivid session (different
-    engine, no shared admission slot).
+    engine, no shared admission slot). **No bitrate gate** — the decoder is not gated on average bitrate
+    or the SPS level tag (it works frame-by-frame): measured 1080p decode at 20 / 50 / 80 / 110 Mbps
+    (level tags 4.0 / 4.2 / 5.0 / 5.0) all succeed; the only bound is the 1920×1920 coded-size cap. (The
+    "≤25 Mbps / Level-4.0" figure elsewhere is the *encoder's* HRD ceiling, not a decode limit.)
   - **4K H.264 is not real-time and can't be made so.** Measured on this Pi 4B (`ffmpeg -threads 0`,
     20 s steady-state, `samples/kodi/high-bitrate/{jellyfish,test-videos}/`):
 
