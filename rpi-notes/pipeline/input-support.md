@@ -207,8 +207,13 @@ attribution incl. CABAC. Profile `ffmpeg_g` (unstripped) for symbols.
     transcode (far below the downscale+re-encode noise floor) but it **can't back a framemd5 gate** —
     which is why this repo's SAND/tonemap validation always references *software* decode. We don't route
     to it anyway: the shim's `hw_decodable` is HEVC-only, and its output is planar YUV (not SAND, so it
-    can't feed `sand_to_yuv420p_drm`); its only draw is CPU offload, and 1080p H.264 SW decode is already
-    ~2× real-time, so there is little to gain.
+    can't feed `sand_to_yuv420p_drm`). Its draw is **CPU offload, and that draw is large** — SW 1080p
+    decode costs **~2.8 cores** (282 % CPU @20 Mbit, 274 % @5 Mbit — most of the 4-core chip), while HW
+    decode is nearly free at **~0.1–0.4 cores** (13–35 % CPU), freeing **~2.5 cores** (300-frame
+    `/usr/bin/time`). It wouldn't make 1080p H.264 *faster* (both already real-time), but it would nearly
+    eliminate its CPU cost — a real concurrency/thermal lever if a future path ever runs 1080p-H.264
+    sessions alongside the CPU-bound SAND/tonemap work. The blocker to using it is the planar-YUV-vs-SAND
+    path split, not the CPU math.
   - **4K H.264 is not real-time and can't be made so.** Measured on this Pi 4B (`ffmpeg -threads 0`,
     20 s steady-state, `samples/kodi/high-bitrate/{jellyfish,test-videos}/`):
 
