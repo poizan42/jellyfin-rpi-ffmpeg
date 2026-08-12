@@ -199,6 +199,16 @@ attribution incl. CABAC. Profile `ffmpeg_g` (unstripped) for symbols.
     (`bcm2835-codec`, `/dev/video10`), but its coded-input format range is **`H264 32×32 – 1920×1920`**
     (verified: `v4l2-ctl -d /dev/video10 --list-formats-out-ext`). So it can HW-decode **≤1080p** H.264
     but **not 4K** — 3840 exceeds 1920 on both axes. 4K H.264 therefore falls to **software** decode.
+  - **≤1080p H.264 *does* hardware-decode** (`h264_v4l2m2m` decoder on `/dev/video10`), measured
+    real-time with margin (jellyfish 1080p: **2.7–3.0×**). HW beats SW at high bitrate (2.95× vs 2.04×
+    @20 Mbit — the fixed-function block ignores coefficient count) but *loses* at low bitrate (2.69× vs
+    2.84× @5 Mbit — its mem2mem overhead outweighs cheap SW decode). **Not bit-exact vs software:**
+    chroma identical, luma ~**75 dB** (±1 LSB on ~0.2 % of samples — a HW rounding corner). Fine for
+    transcode (far below the downscale+re-encode noise floor) but it **can't back a framemd5 gate** —
+    which is why this repo's SAND/tonemap validation always references *software* decode. We don't route
+    to it anyway: the shim's `hw_decodable` is HEVC-only, and its output is planar YUV (not SAND, so it
+    can't feed `sand_to_yuv420p_drm`); its only draw is CPU offload, and 1080p H.264 SW decode is already
+    ~2× real-time, so there is little to gain.
   - **4K H.264 is not real-time and can't be made so.** Measured on this Pi 4B (`ffmpeg -threads 0`,
     20 s steady-state, `samples/kodi/high-bitrate/{jellyfish,test-videos}/`):
 
