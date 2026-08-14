@@ -1880,6 +1880,26 @@ static int mpegts_write_packet_internal(AVFormatContext *s, AVPacket *pkt)
     int opus_samples = 0;
     size_t side_data_size;
     uint8_t *side_data = NULL;
+
+    /* Some encoders only learn their extradata after encoding the first frame
+     * (hardware wrappers such as v4l2_m2m and mediacodec), i.e. after the muxer
+     * has already snapshotted codecpar in write_header. They pass it out of band
+     * on the first packet instead. Pick it up so that the H.26x paths below can
+     * prefix parameter sets to key frames; without it they emit an AUD and a
+     * bare IDR slice and the output is undecodable. Mirrors segment.c. */
+    if (!st->codecpar->extradata_size) {
+        size_t new_extradata_size;
+        const uint8_t *new_extradata = av_packet_get_side_data(pkt, AV_PKT_DATA_NEW_EXTRADATA,
+                                                               &new_extradata_size);
+
+        if (new_extradata && new_extradata_size > 0) {
+            if (ff_alloc_extradata(st->codecpar, new_extradata_size) < 0)
+                av_log(s, AV_LOG_WARNING,
+                       "Unable to add extradata to stream; output may be undecodable.\n");
+            else
+                memcpy(st->codecpar->extradata, new_extradata, new_extradata_size);
+        }
+    }
     int stream_id = -1;
 
     side_data = av_packet_get_side_data(pkt,
