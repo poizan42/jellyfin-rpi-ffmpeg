@@ -249,10 +249,33 @@ static av_cold int init(AVFilterContext *avctx)
         s->cb64_hlg[i] = ff_rpi_tm_cb1d_hlg[i * 16];
         s->cr64_hlg[i] = ff_rpi_tm_cr1d_hlg[i * 16];
     }
-    s->heap_fd = open("/dev/dma_heap/linux,cma", O_RDWR | O_CLOEXEC);
-    if (s->heap_fd < 0) {
-        av_log(avctx, AV_LOG_ERROR, "Cannot open /dev/dma_heap/linux,cma: %s\n", strerror(errno));
-        return AVERROR(errno);
+    /* The CMA dma-heap node name is not stable across kernels: it is
+     * "linux,cma" when the region comes from that device-tree node (RPi 6.1),
+     * but "default_cma_region" when it comes from the `cma=` cmdline / default
+     * region (RPi 6.18 -- CONFIG_DMABUF_HEAPS_CMA_LEGACY only re-adds the old
+     * name for a DT-named region). Try the known names in order. */
+    {
+        static const char *const heap_names[] = {
+            "/dev/dma_heap/linux,cma",
+            "/dev/dma_heap/default_cma_region",
+            "/dev/dma_heap/reserved",
+        };
+        unsigned int i;
+
+        s->heap_fd = -1;
+        for (i = 0; i < FF_ARRAY_ELEMS(heap_names); i++) {
+            s->heap_fd = open(heap_names[i], O_RDWR | O_CLOEXEC);
+            if (s->heap_fd >= 0) {
+                av_log(avctx, AV_LOG_VERBOSE, "Using CMA dma-heap %s\n", heap_names[i]);
+                break;
+            }
+        }
+        if (s->heap_fd < 0) {
+            av_log(avctx, AV_LOG_ERROR,
+                   "Cannot open a CMA dma-heap (tried linux,cma / "
+                   "default_cma_region / reserved): %s\n", strerror(errno));
+            return AVERROR(errno);
+        }
     }
     return 0;
 }
