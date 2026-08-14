@@ -208,8 +208,10 @@ libsvtav1/libtheora/libzvbi/libopenmpt/chromaprint.
 > iteration-speed choice, never a design one, and it leaked into production when the shim
 > started redirecting real Jellyfin command lines at the fork: a `-codec:a:0 libmp3lame`
 > transcode died with `Encoder not found` ("Source error" in the client). **Iterate lean,
-> deploy full.** The shim now also carries an inert encoder-availability guard that
-> passes through rather than failing hard if this ever regresses.
+> deploy full.** `transcode-orchestrator/check-encoders.sh` now diffs this build's encoder
+> list against the stock jellyfin-ffmpeg's and `install.sh` refuses to deploy on an
+> unexplained gap — the check belongs at deploy time, not at transcode time, where routing
+> around a missing encoder would just hide the build defect behind a slow transcode.
 
 ### Minimal configure (fast iteration on the video kernels only)
 
