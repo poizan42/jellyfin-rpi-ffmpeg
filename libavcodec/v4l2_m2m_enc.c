@@ -598,17 +598,30 @@ dequeue:
             goto fail_no_mem;
 
         memcpy(data, avpkt->data, len);
+        memset(data + len, 0, AV_INPUT_BUFFER_PADDING_SIZE);
         av_packet_unref(avpkt);
 
-        // We need to copy the header, but keep local if not global
+        // We need to copy the header, and when it is also passed out of band we
+        // need a 2nd copy as ownership of the 1st passes to avctx.
+        //
+        // The local copy is *always* needed: this encoder can only produce the
+        // header after the first frame is encoded, which is too late for muxers
+        // that snapshot codecpar at init (mpegts, in particular via hlsenc, which
+        // sets AVFMT_GLOBALHEADER regardless of -hls_segment_type). Those muxers
+        // would then emit keyframes with no SPS/PPS at all, giving undecodable
+        // output, so the header must also be repeated in-band on every key frame.
         if ((avctx->flags & AV_CODEC_FLAG_GLOBAL_HEADER) != 0) {
             avctx->extradata = data;
             avctx->extradata_size = len;
+
+            if ((data = av_malloc(len + AV_INPUT_BUFFER_PADDING_SIZE)) == NULL)
+                goto fail_no_mem;
+            memcpy(data, avctx->extradata, len);
+            memset(data + len, 0, AV_INPUT_BUFFER_PADDING_SIZE);
         }
-        else {
-            s->extdata_data = data;
-            s->extdata_size = len;
-        }
+
+        s->extdata_data = data;
+        s->extdata_size = len;
 
         ret = ff_v4l2_context_dequeue_packet(capture, avpkt, 0);
         ff_v4l2_dq_all(output, 0);
