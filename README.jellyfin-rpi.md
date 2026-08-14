@@ -179,7 +179,39 @@ usable HDR reference here is the CPU `zscale+tonemap` chain.
 
 ## Building
 
-Baseline configure used for this fork (Pi 4, aarch64, Debian bookworm):
+### Production configure (Pi 4, aarch64, Debian bookworm)
+
+This is what the deployed binary is built with — it must be **feature-complete enough to run
+any command line Jellyfin would have handed to the stock jellyfin-ffmpeg**, because the
+[transcode-orchestrator](../transcode-orchestrator/README.md) shim rewrites only the *video*
+side of the graph and passes everything else (notably `-codec:a`) through untouched:
+
+```sh
+./configure --disable-doc --enable-gpl --enable-version3 \
+  --enable-sand --enable-v4l2-request --enable-libdrm --enable-libudev \
+  --enable-libzimg --enable-libplacebo --enable-vulkan \
+  --enable-libx264 --enable-libx265 --enable-libdav1d --enable-libvpx --enable-libwebp \
+  --enable-libmp3lame --enable-libopus --enable-libvorbis \
+  --enable-libass --enable-libfreetype --enable-libfontconfig --enable-libfribidi --enable-libharfbuzz \
+  --enable-gnutls --enable-libxml2 --enable-libbluray \
+  --extra-cflags=-I<path>/vulkan-1.4-headers/include
+make -j4                                    # ~23 min from clean
+```
+
+Deliberate departures from stock jellyfin-ffmpeg: **static, not `--enable-shared`** (so
+`/opt/rpi-ffmpeg-orchestrator/ffmpeg-real` is one self-contained binary that `install.sh`
+can just copy), no LTO, and no cuda/nvenc/rkmpp (wrong platform), libfdk_aac (nonfree),
+libsvtav1/libtheora/libzvbi/libopenmpt/chromaprint.
+
+> **Lesson (2026-08-14):** for most of this work the fork was built *lean* — purely to keep
+> the edit→rebuild loop short while iterating on the SAND/de-tile kernels. That was an
+> iteration-speed choice, never a design one, and it leaked into production when the shim
+> started redirecting real Jellyfin command lines at the fork: a `-codec:a:0 libmp3lame`
+> transcode died with `Encoder not found` ("Source error" in the client). **Iterate lean,
+> deploy full.** The shim now also carries an inert encoder-availability guard that
+> passes through rather than failing hard if this ever regresses.
+
+### Minimal configure (fast iteration on the video kernels only)
 
 ```sh
 ./configure --disable-doc --enable-libdrm --enable-libudev --enable-sand --enable-v4l2-request \
@@ -187,6 +219,8 @@ Baseline configure used for this fork (Pi 4, aarch64, Debian bookworm):
             --extra-cflags="-I<path>/vulkan-1.4-headers/include"
 make -j4
 ```
+
+**Do not deploy this build** — see the lesson above.
 
 - `--enable-sand` + `--enable-v4l2-request` are required for the SAND filter and rpivid decode.
 - `--enable-libzimg`/`--enable-libplacebo`/`--enable-vulkan` are only needed for the HDR
