@@ -2011,7 +2011,6 @@ EXTERNAL_LIBRARY_GPL_LIST="
 
 EXTERNAL_LIBRARY_NONFREE_LIST="
     decklink
-    libfdk_aac
     libmpeghdec
 "
 
@@ -2052,6 +2051,7 @@ EXTERNAL_LIBRARY_LIST="
     libcodec2
     libdav1d
     libdc1394
+    libfdk_aac
     libdrm
     libflite
     libfontconfig
