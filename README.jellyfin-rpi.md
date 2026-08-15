@@ -191,7 +191,7 @@ side of the graph and passes everything else (notably `-codec:a`) through untouc
   --enable-sand --enable-v4l2-request --enable-libdrm --enable-libudev \
   --enable-libzimg --enable-libplacebo --enable-vulkan \
   --enable-libx264 --enable-libx265 --enable-libdav1d --enable-libvpx --enable-libwebp \
-  --enable-libmp3lame --enable-libopus --enable-libvorbis \
+  --enable-libmp3lame --enable-libopus --enable-libvorbis --enable-libfdk-aac \
   --enable-libass --enable-libfreetype --enable-libfontconfig --enable-libfribidi --enable-libharfbuzz \
   --enable-gnutls --enable-libxml2 --enable-libbluray \
   --enable-libzvbi --enable-chromaprint --enable-libopenmpt --enable-gmp \
@@ -201,7 +201,18 @@ make -j4                                    # ~25 min from clean
 
 The last line of enables closes gaps against the stock build: `libzvbi`
 (teletext subtitles), `chromaprint` (fingerprint muxer), `libopenmpt` (tracker
-modules), `gmp` (encrypted RTMP: `rtmpe`/`rtmpte`/`ffrtmpcrypt`). Two things the
+modules), `gmp` (encrypted RTMP: `rtmpe`/`rtmpte`/`ffrtmpcrypt`).
+
+**`--enable-libfdk-aac` is not optional in practice.** Jellyfin *prefers*
+`libfdk_aac` for AAC output when its startup probe finds it, so a fork without it
+fails a real transcode with `Unknown encoder 'libfdk_aac'`. FFmpeg upstream
+classes fdk-aac as nonfree (needing `--enable-nonfree`, which would make the
+binary non-redistributable), but **jellyfin-ffmpeg's patch
+`0026-remove-fdk-aac-from-nonfree` moves it to the free library list** — which is
+how their own .deb ships it. That patch is applied here (by hand: its second hunk
+misses on context drift, though the change is just moving one line between two
+lists), so `CONFIG_LIBFDK_AAC=yes` with no `CONFIG_NONFREE` and the build stays
+GPLv3. Needs `libfdk-aac-dev` (Debian main). Two things the
 stock build has cannot be matched — `pp` (libpostproc) and the `hls` *protocol*
 were both removed in FFmpeg 8.0, and this fork is 8.x while the packaged
 jellyfin-ffmpeg is 7.x. The hls muxer/demuxer, which is what Jellyfin uses, are
