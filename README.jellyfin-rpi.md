@@ -194,8 +194,41 @@ side of the graph and passes everything else (notably `-codec:a`) through untouc
   --enable-libmp3lame --enable-libopus --enable-libvorbis \
   --enable-libass --enable-libfreetype --enable-libfontconfig --enable-libfribidi --enable-libharfbuzz \
   --enable-gnutls --enable-libxml2 --enable-libbluray \
+  --enable-libzvbi --enable-chromaprint --enable-libopenmpt --enable-gmp \
   --extra-cflags=-I<path>/vulkan-1.4-headers/include
-make -j4                                    # ~23 min from clean
+make -j4                                    # ~25 min from clean
+```
+
+The last line of enables closes gaps against the stock build: `libzvbi`
+(teletext subtitles), `chromaprint` (fingerprint muxer), `libopenmpt` (tracker
+modules), `gmp` (encrypted RTMP: `rtmpe`/`rtmpte`/`ffrtmpcrypt`). Two things the
+stock build has cannot be matched — `pp` (libpostproc) and the `hls` *protocol*
+were both removed in FFmpeg 8.0, and this fork is 8.x while the packaged
+jellyfin-ffmpeg is 7.x. The hls muxer/demuxer, which is what Jellyfin uses, are
+present.
+
+### The jellyfin-ffmpeg patch series is applied in-tree
+
+jellyfin-ffmpeg ships its features as a **quilt series in `debian/patches/`,
+applied at Debian build time** — not in the git tree. Building this fork straight
+from the tree therefore produced a binary with *none* of them: no `tonemapx` (the
+filter Jellyfin puts in its software HDR chains), no `alphasrc`, no AC-4 decoder,
+no `0027-pass-dovi-sidedata-to-hlsenc-and-mpegtsenc` — which sits directly on top
+of the Dolby Vision and SPS/PPS work here.
+
+Since 2026-08-15 the series is **applied as one commit on `jellyfin-rpi`** (94 of
+96; `0026-remove-fdk-aac-from-nonfree` and the Rockchip RK3588 patch are skipped
+deliberately and also do not apply). The series is jellyfin's own and current for
+this base, so it is written against exactly this tree and applies without rejects.
+
+**Rebasing onto a newer jellyfin-ffmpeg:** revert that commit, merge the new base,
+re-apply the series, commit again:
+
+```sh
+git revert --no-commit <series-commit>
+git merge jellyfin-upstream/jellyfin          # or the new tag
+while read -r p; do patch -p1 --forward -i "debian/patches/$p"; done < debian/patches/series
+git add -u && git commit
 ```
 
 Deliberate departures from stock jellyfin-ffmpeg: **static, not `--enable-shared`** (so
