@@ -221,7 +221,14 @@ OBJS-$(CONFIG_BOXBLUR_FILTER)                += vf_boxblur.o boxblur.o
 OBJS-$(CONFIG_BOXBLUR_OPENCL_FILTER)         += vf_avgblur_opencl.o opencl.o \
                                                 opencl/avgblur.o boxblur.o
 OBJS-$(CONFIG_BWDIF_FILTER)                  += vf_bwdif.o bwdifdsp.o yadif_common.o
+OBJS-$(CONFIG_BWDIF_D3D11_FILTER)            += vf_yadif_d3d11.o yadif_common.o d3d11/deint.o d3d11_filter.o
 OBJS-$(CONFIG_BWDIF_CUDA_FILTER)             += vf_bwdif_cuda.o vf_bwdif_cuda.ptx.o \
+                                                yadif_common.o
+OBJS-$(CONFIG_BWDIF_OPENCL_FILTER)           += vf_bwdif_opencl.o opencl.o opencl/bwdif.o \
+                                                yadif_common.o
+OBJS-$(CONFIG_BWDIF_VIDEOTOOLBOX_FILTER)     += vf_bwdif_videotoolbox.o \
+                                                metal/vf_bwdif_videotoolbox.metallib.o \
+                                                metal/utils.o \
                                                 yadif_common.o
 OBJS-$(CONFIG_BWDIF_VULKAN_FILTER)           += vf_bwdif_vulkan.o yadif_common.o vulkan.o vulkan_filter.o
 OBJS-$(CONFIG_CAS_FILTER)                    += vf_cas.o
@@ -356,6 +363,7 @@ OBJS-$(CONFIG_HUESATURATION_FILTER)          += vf_huesaturation.o
 OBJS-$(CONFIG_HWDOWNLOAD_FILTER)             += vf_hwdownload.o
 OBJS-$(CONFIG_HWMAP_FILTER)                  += vf_hwmap.o
 OBJS-$(CONFIG_HWUPLOAD_CUDA_FILTER)          += vf_hwupload_cuda.o
+OBJS-$(CONFIG_HWUPLOAD_VAAPI_FILTER)         += vf_hwupload_vaapi.o
 OBJS-$(CONFIG_HWUPLOAD_FILTER)               += vf_hwupload.o
 OBJS-$(CONFIG_HYSTERESIS_FILTER)             += vf_hysteresis.o framesync.o
 OBJS-$(CONFIG_ICCDETECT_FILTER)              += vf_iccdetect.o fflcms2.o
@@ -421,12 +429,16 @@ OBJS-$(CONFIG_OCV_FILTER)                    += vf_libopencv.o
 OBJS-$(CONFIG_OCIO_FILTER)                   += vf_opencolorio.o ocio_wrapper.o
 OBJS-$(CONFIG_OSCILLOSCOPE_FILTER)           += vf_datascope.o
 OBJS-$(CONFIG_OVERLAY_FILTER)                += vf_overlay.o framesync.o
+OBJS-$(CONFIG_OVERLAY_D3D11_FILTER)          += vf_overlay_d3d11.o framesync.o d3d11/overlay.o d3d11_filter.o
 OBJS-$(CONFIG_OVERLAY_CUDA_FILTER)           += vf_overlay_cuda.o framesync.o vf_overlay_cuda.ptx.o \
                                                 cuda/load_helper.o
 OBJS-$(CONFIG_OVERLAY_OPENCL_FILTER)         += vf_overlay_opencl.o opencl.o \
                                                 opencl/overlay.o framesync.o
 OBJS-$(CONFIG_OVERLAY_QSV_FILTER)            += vf_overlay_qsv.o framesync.o
 OBJS-$(CONFIG_OVERLAY_VAAPI_FILTER)          += vf_overlay_vaapi.o framesync.o vaapi_vpp.o
+OBJS-$(CONFIG_OVERLAY_VIDEOTOOLBOX_FILTER)   += vf_overlay_videotoolbox.o framesync.o \
+                                                metal/vf_overlay_videotoolbox.metallib.o \
+                                                metal/utils.o
 OBJS-$(CONFIG_OVERLAY_VULKAN_FILTER)         += vf_overlay_vulkan.o vulkan.o vulkan_filter.o
 OBJS-$(CONFIG_OWDENOISE_FILTER)              += vf_owdenoise.o
 OBJS-$(CONFIG_PAD_FILTER)                    += vf_pad.o
@@ -472,11 +484,12 @@ OBJS-$(CONFIG_ROBERTS_OPENCL_FILTER)         += vf_convolution_opencl.o opencl.o
 OBJS-$(CONFIG_ROTATE_FILTER)                 += vf_rotate.o
 OBJS-$(CONFIG_SAB_FILTER)                    += vf_sab.o
 OBJS-$(CONFIG_SCALE_FILTER)                  += vf_scale.o scale_eval.o framesync.o
-OBJS-$(CONFIG_SCALE_D3D11_FILTER)            += vf_scale_d3d11.o scale_eval.o
+OBJS-$(CONFIG_SCALE_D3D11_FILTER)            += vf_scale_d3d11.o scale_eval.o d3d11/scale.o d3d11_filter.o
 OBJS-$(CONFIG_SCALE_D3D12_FILTER)            += vf_scale_d3d12.o scale_eval.o
 OBJS-$(CONFIG_SCALE_CUDA_FILTER)             += vf_scale_cuda.o scale_eval.o \
                                                 vf_scale_cuda.ptx.o cuda/load_helper.o
 OBJS-$(CONFIG_SCALE_NPP_FILTER)              += vf_scale_npp.o scale_eval.o
+OBJS-$(CONFIG_SCALE_OPENCL_FILTER)           += vf_scale_opencl.o opencl.o opencl/scale.o scale_eval.o
 OBJS-$(CONFIG_SCALE_QSV_FILTER)              += vf_vpp_qsv.o
 OBJS-$(CONFIG_SCALE_VAAPI_FILTER)            += vf_scale_vaapi.o scale_eval.o vaapi_vpp.o
 OBJS-$(CONFIG_SCALE_VT_FILTER)               += vf_scale_vt.o scale_eval.o
@@ -542,11 +555,21 @@ OBJS-$(CONFIG_TMEDIAN_FILTER)                += vf_xmedian.o framesync.o
 OBJS-$(CONFIG_TMIDEQUALIZER_FILTER)          += vf_tmidequalizer.o
 OBJS-$(CONFIG_TMIX_FILTER)                   += vf_mix.o framesync.o
 OBJS-$(CONFIG_TONEMAP_FILTER)                += vf_tonemap.o
+OBJS-$(CONFIG_TONEMAPX_FILTER)               += vf_tonemapx.o
+OBJS-$(CONFIG_TONEMAP_CUDA_FILTER)           += vf_tonemap_cuda.o cuda/tonemap.ptx.o \
+                                                cuda/host_util.o cuda/load_helper.o
+OBJS-$(CONFIG_TONEMAP_D3D11_FILTER)           += vf_tonemap_d3d11.o d3d11/tonemap.o d3d11_filter.o
 OBJS-$(CONFIG_TONEMAP_OPENCL_FILTER)         += vf_tonemap_opencl.o opencl.o \
                                                 opencl/tonemap.o opencl/colorspace_common.o
 OBJS-$(CONFIG_TONEMAP_VAAPI_FILTER)          += vf_tonemap_vaapi.o vaapi_vpp.o
+OBJS-$(CONFIG_TONEMAP_VIDEOTOOLBOX_FILTER)   += vf_tonemap_videotoolbox.o \
+                                                metal/vf_tonemap_videotoolbox.metallib.o \
+                                                metal/utils.o
 OBJS-$(CONFIG_TPAD_FILTER)                   += vf_tpad.o
 OBJS-$(CONFIG_TRANSPOSE_FILTER)              += vf_transpose.o
+OBJS-$(CONFIG_TRANSPOSE_D3D11_FILTER)        += vf_transpose_d3d11.o
+OBJS-$(CONFIG_TRANSPOSE_CUDA_FILTER)         += vf_transpose_cuda.o vf_transpose_cuda.ptx.o \
+                                                cuda/load_helper.o
 OBJS-$(CONFIG_TRANSPOSE_NPP_FILTER)          += vf_transpose_npp.o
 OBJS-$(CONFIG_TRANSPOSE_OPENCL_FILTER)       += vf_transpose_opencl.o opencl.o opencl/transpose.o
 OBJS-$(CONFIG_TRANSPOSE_VAAPI_FILTER)        += vf_transpose_vaapi.o vaapi_vpp.o
@@ -589,8 +612,11 @@ OBJS-$(CONFIG_XMEDIAN_FILTER)                += vf_xmedian.o framesync.o
 OBJS-$(CONFIG_XPSNR_FILTER)                  += vf_xpsnr.o framesync.o psnr.o
 OBJS-$(CONFIG_XSTACK_FILTER)                 += vf_stack.o framesync.o
 OBJS-$(CONFIG_YADIF_FILTER)                  += vf_yadif.o yadif_common.o
+OBJS-$(CONFIG_YADIF_D3D11_FILTER)            += vf_yadif_d3d11.o yadif_common.o d3d11/deint.o d3d11_filter.o
 OBJS-$(CONFIG_YADIF_CUDA_FILTER)             += vf_yadif_cuda.o vf_yadif_cuda.ptx.o \
                                                 yadif_common.o cuda/load_helper.o
+OBJS-$(CONFIG_YADIF_OPENCL_FILTER)           += vf_yadif_opencl.o opencl.o opencl/yadif.o \
+                                                yadif_common.o
 OBJS-$(CONFIG_YADIF_VIDEOTOOLBOX_FILTER)     += vf_yadif_videotoolbox.o \
                                                 metal/vf_yadif_videotoolbox.metallib.o \
                                                 metal/utils.o \
@@ -610,6 +636,7 @@ OBJS-$(CONFIG_DRAWBOX_VAAPI_FILTER)          += vf_drawbox_vaapi.o vaapi_vpp.o
 
 OBJS-$(CONFIG_ALLRGB_FILTER)                 += vsrc_testsrc.o
 OBJS-$(CONFIG_ALLYUV_FILTER)                 += vsrc_testsrc.o
+OBJS-$(CONFIG_ALPHASRC_FILTER)               += vsrc_alphasrc.o
 OBJS-$(CONFIG_CELLAUTO_FILTER)               += vsrc_cellauto.o
 OBJS-$(CONFIG_COLOR_FILTER)                  += vsrc_testsrc.o
 OBJS-$(CONFIG_COLORCHART_FILTER)             += vsrc_testsrc.o
@@ -697,10 +724,16 @@ TOOLS-$(CONFIG_LIBZMQ) += zmqsend
 
 clean::
 	$(RM) $(CLEANSUFFIXES:%=libavfilter/dnn/%) $(CLEANSUFFIXES:%=libavfilter/opencl/%) \
-              $(CLEANSUFFIXES:%=libavfilter/metal/%)
+              $(CLEANSUFFIXES:%=libavfilter/metal/%) $(CLEANSUFFIXES:%=libavfilter/d3d11/%)
 
 OPENCL = $(subst $(SRC_PATH)/,,$(wildcard $(SRC_PATH)/libavfilter/opencl/*.cl))
 .SECONDARY: $(OPENCL:.cl=.c)
 libavfilter/opencl/%.c: TAG = OPENCL
 libavfilter/opencl/%.c: $(SRC_PATH)/libavfilter/opencl/%.cl
+	$(M)$(SRC_PATH)/tools/source2c $< $@
+
+HLSL = $(subst $(SRC_PATH)/,,$(wildcard $(SRC_PATH)/libavfilter/d3d11/*.hlsl))
+.SECONDARY: $(HLSL:.hlsl=.c)
+libavfilter/d3d11/%.c: TAG = HLSL
+libavfilter/d3d11/%.c: $(SRC_PATH)/libavfilter/d3d11/%.hlsl
 	$(M)$(SRC_PATH)/tools/source2c $< $@

@@ -21,7 +21,14 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include <windows.h>
+#ifndef COBJMACROS
+#define COBJMACROS
+#endif
+#include <d3d11.h>
+
 #include "libavutil/opt.h"
+#include "libavutil/mem.h"
 #include "libavutil/pixdesc.h"
 #include "compat/w32dlfcn.h"
 
@@ -31,6 +38,17 @@
 #include "filters.h"
 #include "scale_eval.h"
 #include "video.h"
+#include "d3d11_source.h"
+#include "d3d11_filter.h"
+
+#define SCALE_D3D11_TGX 16
+#define SCALE_D3D11_TGY 16
+typedef struct ScaleD3D11Params {
+    int src_w;
+    int src_h;
+    int dst_w;
+    int dst_h;
+} ScaleD3D11Params;
 
 typedef struct ScaleD3D11Context {
     const AVClass *classCtx;
@@ -47,12 +65,27 @@ typedef struct ScaleD3D11Context {
     ID3D11VideoProcessorOutputView *outputView;
     ID3D11VideoProcessorInputView *inputView;
 
+    HMODULE d3dcompiler;
+    FFD3DCompileProc D3DCompile;
+    ID3D11ComputeShader *cs_y;
+    ID3D11ComputeShader *cs_uv;
+    ID3D11Buffer *params_buf;
+    ID3D11Texture2D *src_tex;
+    ID3D11Texture2D *work_tex;
+    int src_tex_w, src_tex_h;
+    int work_w, work_h;
+    int shader_fallback;
+    int direct_input_srv;
+    int direct_output_uav;
+    int force_output_copy;
+
     ///< Buffer references
     AVBufferRef *hw_device_ctx;
     AVBufferRef *hw_frames_ctx_out;
 
     ///< Dimensions and formats
     int width, height;
+    enum AVPixelFormat in_format;
     int inputWidth, inputHeight;
     DXGI_FORMAT input_format;
     DXGI_FORMAT output_format;
@@ -83,6 +116,181 @@ static void release_d3d11_resources(ScaleD3D11Context *s) {
         s->videoDevice->lpVtbl->Release(s->videoDevice);
         s->videoDevice = NULL;
     }
+
+    FF_D3D11_RELEASE(s->cs_y);
+    FF_D3D11_RELEASE(s->cs_uv);
+    FF_D3D11_RELEASE(s->params_buf);
+    FF_D3D11_RELEASE(s->src_tex);
+    FF_D3D11_RELEASE(s->work_tex);
+    s->src_tex_w = s->src_tex_h = 0;
+    s->work_w = s->work_h = 0;
+}
+
+static int scale_d3d11_compile_shader(AVFilterContext *ctx, const char *entry,
+                                      ID3D11ComputeShader **shader)
+{
+    ScaleD3D11Context *s = ctx->priv;
+
+    return ff_d3d11_compile_shader(ctx, s->device, s->D3DCompile,
+                                   ff_source_scale_hlsl, NULL, entry,
+                                   "cs_5_0", "D3D11 scale", shader);
+}
+
+static int scale_d3d11_ensure_shader(AVFilterContext *ctx)
+{
+    ScaleD3D11Context *s = ctx->priv;
+    int ret;
+
+    ret = ff_d3d11_load_shader_compiler(ctx, &s->d3dcompiler, &s->D3DCompile);
+    if (ret < 0)
+        return ret;
+
+    if (!s->params_buf) {
+        ret = ff_d3d11_create_const_buffer(ctx, s->device, sizeof(ScaleD3D11Params),
+                                           "D3D11 scale", &s->params_buf);
+        if (ret < 0)
+            return ret;
+    }
+
+    if (!s->cs_y) {
+        ret = scale_d3d11_compile_shader(ctx, "scale_y", &s->cs_y);
+        if (ret < 0)
+            return ret;
+    }
+    if (!s->cs_uv) {
+        ret = scale_d3d11_compile_shader(ctx, "scale_uv", &s->cs_uv);
+        if (ret < 0)
+            return ret;
+    }
+
+    return 0;
+}
+
+static int scale_d3d11_ensure_texture(AVFilterContext *ctx, ID3D11Texture2D **tex,
+                                      int *cur_w, int *cur_h, int w, int h,
+                                      enum AVPixelFormat fmt, UINT bind_flags)
+{
+    ScaleD3D11Context *s = ctx->priv;
+
+    return ff_d3d11_ensure_texture(ctx, s->device, tex, cur_w, cur_h, NULL,
+                                   w, h, ff_d3d11_texture_format(fmt), bind_flags,
+                                   "D3D11 scale");
+}
+
+static int scale_d3d11_create_srv(AVFilterContext *ctx, ID3D11Texture2D *tex,
+                                  UINT subresource, enum AVPixelFormat fmt, int plane,
+                                  int log_level, ID3D11ShaderResourceView **srv)
+{
+    ScaleD3D11Context *s = ctx->priv;
+
+    return ff_d3d11_create_srv(ctx, s->device, tex, subresource,
+                               ff_d3d11_plane_format(fmt, plane),
+                               log_level, "D3D11 scale", srv);
+}
+
+static int scale_d3d11_create_uav(AVFilterContext *ctx, ID3D11Texture2D *tex,
+                                  UINT subresource, enum AVPixelFormat fmt, int plane,
+                                  int log_level, ID3D11UnorderedAccessView **uav)
+{
+    ScaleD3D11Context *s = ctx->priv;
+
+    return ff_d3d11_create_uav(ctx, s->device, tex, subresource,
+                               ff_d3d11_plane_format(fmt, plane),
+                               log_level, "D3D11 scale", uav);
+}
+
+static int scale_d3d11_create_frame_srvs(AVFilterContext *ctx, AVFrame *frame,
+                                         ID3D11ShaderResourceView **srvs)
+{
+    ScaleD3D11Context *s = ctx->priv;
+    ID3D11Texture2D *tex = (ID3D11Texture2D *)frame->data[0];
+    UINT subresource = (UINT)(uintptr_t)frame->data[1];
+    int ret;
+
+    ret = scale_d3d11_create_srv(ctx, tex, subresource, s->in_format, 0, AV_LOG_DEBUG, &srvs[0]);
+    if (ret < 0)
+        return ret;
+    ret = scale_d3d11_create_srv(ctx, tex, subresource, s->in_format, 1, AV_LOG_DEBUG, &srvs[1]);
+    if (ret < 0)
+        FF_D3D11_RELEASE(srvs[0]);
+    return ret;
+}
+
+static int scale_d3d11_prepare_input_srvs(AVFilterContext *ctx, AVFrame *input,
+                                          ID3D11ShaderResourceView **srvs)
+{
+    ScaleD3D11Context *s = ctx->priv;
+    int ret;
+
+    if (s->direct_input_srv) {
+        ret = scale_d3d11_create_frame_srvs(ctx, input, srvs);
+        if (ret >= 0) {
+            if (s->direct_input_srv < 0) {
+                av_log(ctx, AV_LOG_DEBUG, "D3D11 shader input: direct SRV\n");
+                s->direct_input_srv = 1;
+            }
+            return 0;
+        }
+        if (s->direct_input_srv < 0)
+            av_log(ctx, AV_LOG_DEBUG, "D3D11 shader input: copied to internal SRV texture\n");
+        s->direct_input_srv = 0;
+    }
+
+    ret = scale_d3d11_ensure_texture(ctx, &s->src_tex, &s->src_tex_w, &s->src_tex_h,
+                                     input->width, input->height, s->in_format,
+                                     D3D11_BIND_SHADER_RESOURCE);
+    if (ret < 0)
+        return ret;
+    ff_d3d11_copy_frame_to_texture(s->context, input, s->src_tex);
+    ret = scale_d3d11_create_srv(ctx, s->src_tex, 0, s->in_format, 0, AV_LOG_ERROR, &srvs[0]);
+    if (ret < 0)
+        return ret;
+    ret = scale_d3d11_create_srv(ctx, s->src_tex, 0, s->in_format, 1, AV_LOG_ERROR, &srvs[1]);
+    if (ret < 0)
+        FF_D3D11_RELEASE(srvs[0]);
+    return ret;
+}
+
+static int scale_d3d11_prepare_output_uavs(AVFilterContext *ctx, AVFrame *dst,
+                                           ID3D11UnorderedAccessView **uavs, int *direct)
+{
+    ScaleD3D11Context *s = ctx->priv;
+    ID3D11Texture2D *tex = (ID3D11Texture2D *)dst->data[0];
+    UINT subresource = (UINT)(uintptr_t)dst->data[1];
+    int ret;
+
+    *direct = 0;
+    if (s->direct_output_uav) {
+        ret = scale_d3d11_create_uav(ctx, tex, subresource, s->format, 0, AV_LOG_DEBUG, &uavs[0]);
+        if (ret >= 0)
+            ret = scale_d3d11_create_uav(ctx, tex, subresource, s->format, 1, AV_LOG_DEBUG, &uavs[1]);
+        if (ret >= 0) {
+            if (s->direct_output_uav < 0) {
+                av_log(ctx, AV_LOG_DEBUG, "D3D11 shader output: direct UAV\n");
+                s->direct_output_uav = 1;
+            }
+            *direct = 1;
+            return 0;
+        }
+        FF_D3D11_RELEASE(uavs[0]);
+        FF_D3D11_RELEASE(uavs[1]);
+        if (s->direct_output_uav < 0)
+            av_log(ctx, AV_LOG_DEBUG, "D3D11 shader output: copied from internal UAV texture\n");
+        s->direct_output_uav = 0;
+    }
+
+    ret = scale_d3d11_ensure_texture(ctx, &s->work_tex, &s->work_w, &s->work_h,
+                                     dst->width, dst->height, s->format,
+                                     D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS);
+    if (ret < 0)
+        return ret;
+    ret = scale_d3d11_create_uav(ctx, s->work_tex, 0, s->format, 0, AV_LOG_ERROR, &uavs[0]);
+    if (ret < 0)
+        return ret;
+    ret = scale_d3d11_create_uav(ctx, s->work_tex, 0, s->format, 1, AV_LOG_ERROR, &uavs[1]);
+    if (ret < 0)
+        FF_D3D11_RELEASE(uavs[0]);
+    return ret;
 }
 
 static int scale_d3d11_configure_processor(ScaleD3D11Context *s, AVFilterContext *ctx) {
@@ -144,6 +352,152 @@ static int scale_d3d11_configure_processor(ScaleD3D11Context *s, AVFilterContext
     return 0;
 }
 
+
+static int scale_d3d11_probe_output_uav_pool(AVFilterContext *ctx, AVBufferRef *frames_ref)
+{
+    ScaleD3D11Context *s = ctx->priv;
+    AVD3D11VAFramesContext *frames_hwctx = ((AVHWFramesContext *)frames_ref->data)->hwctx;
+    AVFrame *frame = NULL;
+    ID3D11Texture2D *tex;
+    ID3D11UnorderedAccessView *uavs[2] = { NULL, NULL };
+    UINT subresource;
+    int ret;
+
+    if (frames_hwctx->texture) {
+        tex = frames_hwctx->texture;
+        subresource = 0;
+    } else {
+        frame = av_frame_alloc();
+        if (!frame)
+            return AVERROR(ENOMEM);
+        ret = av_hwframe_get_buffer(frames_ref, frame, 0);
+        if (ret < 0)
+            goto done;
+        tex = (ID3D11Texture2D *)frame->data[0];
+        subresource = (UINT)(uintptr_t)frame->data[1];
+    }
+
+    ret = scale_d3d11_create_uav(ctx, tex, subresource, s->format, 0, AV_LOG_DEBUG, &uavs[0]);
+    if (ret >= 0)
+        ret = scale_d3d11_create_uav(ctx, tex, subresource, s->format, 1, AV_LOG_DEBUG, &uavs[1]);
+
+done:
+    FF_D3D11_RELEASE(uavs[0]);
+    FF_D3D11_RELEASE(uavs[1]);
+    av_frame_free(&frame);
+    return ret;
+}
+
+static int scale_d3d11_filter_frame_shader(AVFilterLink *inlink, AVFrame *in)
+{
+    AVFilterContext *ctx = inlink->dst;
+    ScaleD3D11Context *s = ctx->priv;
+    AVFilterLink *outlink = ctx->outputs[0];
+    AVFrame *out = NULL;
+    ID3D11ShaderResourceView *srvs[2] = { NULL, NULL };
+    ID3D11ShaderResourceView *null_srvs[2] = { NULL, NULL };
+    ID3D11UnorderedAccessView *uavs[2] = { NULL, NULL };
+    ID3D11UnorderedAccessView *null_uavs[2] = { NULL, NULL };
+    ID3D11Buffer *null_cb[1] = { NULL };
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    ScaleD3D11Params params;
+    int direct_output = 0;
+    HRESULT hr;
+    int ret;
+
+    out = av_frame_alloc();
+    if (!out) {
+        ret = AVERROR(ENOMEM);
+        goto fail;
+    }
+
+    ret = av_hwframe_get_buffer(s->hw_frames_ctx_out, out, 0);
+    if (ret < 0) {
+        av_log(ctx, AV_LOG_ERROR, "Failed to get output frame from pool\n");
+        goto fail;
+    }
+
+    ret = av_frame_copy_props(out, in);
+    if (ret < 0) {
+        av_log(ctx, AV_LOG_ERROR, "Failed to copy frame properties\n");
+        goto fail;
+    }
+
+    out->width = s->width;
+    out->height = s->height;
+    out->format = AV_PIX_FMT_D3D11;
+
+    ret = scale_d3d11_prepare_input_srvs(ctx, in, srvs);
+    if (ret < 0)
+        goto fail;
+    ret = scale_d3d11_prepare_output_uavs(ctx, out, uavs, &direct_output);
+    if (ret < 0)
+        goto fail;
+    ret = scale_d3d11_ensure_shader(ctx);
+    if (ret < 0)
+        goto fail;
+
+    params.src_w = in->width;
+    params.src_h = in->height;
+    params.dst_w = s->width;
+    params.dst_h = s->height;
+
+    hr = s->context->lpVtbl->Map(s->context, (ID3D11Resource *)s->params_buf,
+                                 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+    if (FAILED(hr)) {
+        av_log(ctx, AV_LOG_ERROR, "Failed mapping D3D11 scale constant buffer: HRESULT 0x%lX\n",
+               (unsigned long)hr);
+        ret = AVERROR_EXTERNAL;
+        goto fail;
+    }
+    memcpy(mapped.pData, &params, sizeof(params));
+    s->context->lpVtbl->Unmap(s->context, (ID3D11Resource *)s->params_buf, 0);
+
+    s->context->lpVtbl->CSSetConstantBuffers(s->context, 0, 1, &s->params_buf);
+    s->context->lpVtbl->CSSetShaderResources(s->context, 0, 2, srvs);
+    s->context->lpVtbl->CSSetUnorderedAccessViews(s->context, 0, 2, uavs, NULL);
+
+    s->context->lpVtbl->CSSetShader(s->context, s->cs_y, NULL, 0);
+    s->context->lpVtbl->Dispatch(s->context,
+                                 (params.dst_w + SCALE_D3D11_TGX - 1) / SCALE_D3D11_TGX,
+                                 (params.dst_h + SCALE_D3D11_TGY - 1) / SCALE_D3D11_TGY,
+                                 1);
+
+    s->context->lpVtbl->CSSetShader(s->context, s->cs_uv, NULL, 0);
+    s->context->lpVtbl->Dispatch(s->context,
+                                 (((params.dst_w + 1) >> 1) + SCALE_D3D11_TGX - 1) / SCALE_D3D11_TGX,
+                                 (((params.dst_h + 1) >> 1) + SCALE_D3D11_TGY - 1) / SCALE_D3D11_TGY,
+                                 1);
+
+    s->context->lpVtbl->CSSetShader(s->context, NULL, NULL, 0);
+    s->context->lpVtbl->CSSetShaderResources(s->context, 0, 2, null_srvs);
+    s->context->lpVtbl->CSSetUnorderedAccessViews(s->context, 0, 2, null_uavs, NULL);
+    s->context->lpVtbl->CSSetConstantBuffers(s->context, 0, 1, null_cb);
+
+    if (!direct_output)
+        ff_d3d11_copy_texture_to_frame(s->context, s->work_tex, out);
+
+    FF_D3D11_RELEASE(srvs[0]);
+    FF_D3D11_RELEASE(srvs[1]);
+    FF_D3D11_RELEASE(uavs[0]);
+    FF_D3D11_RELEASE(uavs[1]);
+    av_frame_free(&in);
+    return ff_filter_frame(outlink, out);
+
+fail:
+    s->context->lpVtbl->CSSetShader(s->context, NULL, NULL, 0);
+    s->context->lpVtbl->CSSetShaderResources(s->context, 0, 2, null_srvs);
+    s->context->lpVtbl->CSSetUnorderedAccessViews(s->context, 0, 2, null_uavs, NULL);
+    s->context->lpVtbl->CSSetConstantBuffers(s->context, 0, 1, null_cb);
+    FF_D3D11_RELEASE(srvs[0]);
+    FF_D3D11_RELEASE(srvs[1]);
+    FF_D3D11_RELEASE(uavs[0]);
+    FF_D3D11_RELEASE(uavs[1]);
+    av_frame_free(&in);
+    av_frame_free(&out);
+    return ret;
+}
+
 static int scale_d3d11_filter_frame(AVFilterLink *inlink, AVFrame *in)
 {
     AVFilterContext *ctx = inlink->dst;
@@ -185,6 +539,9 @@ static int scale_d3d11_filter_frame(AVFilterLink *inlink, AVFrame *in)
         return AVERROR(EINVAL);
     }
 
+    if (s->shader_fallback)
+        return scale_d3d11_filter_frame_shader(inlink, in);
+
     ///< Allocate output frame
     out = av_frame_alloc();
     if (!out) {
@@ -206,8 +563,12 @@ static int scale_d3d11_filter_frame(AVFilterLink *inlink, AVFrame *in)
         ID3D11Texture2D *input_texture = (ID3D11Texture2D *)in->data[0];
         input_texture->lpVtbl->GetDesc(input_texture, &textureDesc);
 
-        s->inputWidth = textureDesc.Width;
-        s->inputHeight = textureDesc.Height;
+        /* D3D11 decoder textures may be padded (for example 1920x1152
+         * for a visible 1920x1080 frame).  Configure and sample only the
+         * visible frame area, otherwise the VP may scale uninitialized
+         * padding and show a green strip at the bottom. */
+        s->inputWidth = in->width;
+        s->inputHeight = in->height;
         s->input_format = textureDesc.Format;
 
         ret = scale_d3d11_configure_processor(s, ctx);
@@ -263,6 +624,15 @@ static int scale_d3d11_filter_frame(AVFilterLink *inlink, AVFrame *in)
         av_log(ctx, AV_LOG_ERROR, "Failed to get video context: HRESULT 0x%lX\n", hr);
         ret = AVERROR_EXTERNAL;
         goto fail;
+    }
+
+    {
+        RECT srcRect = { 0, 0, in->width, in->height };
+        RECT dstRect = { 0, 0, s->width, s->height };
+        videoContext->lpVtbl->VideoProcessorSetStreamSourceRect(videoContext, s->processor,
+                                                                0, TRUE, &srcRect);
+        videoContext->lpVtbl->VideoProcessorSetStreamDestRect(videoContext, s->processor,
+                                                              0, TRUE, &dstRect);
     }
 
     ///< Process the frame
@@ -331,6 +701,10 @@ static int scale_d3d11_config_props(AVFilterLink *outlink)
         return ret;
     }
 
+    ret = ff_scale_adjust_dimensions(inlink, &s->width, &s->height, 0, 1, 1.f);
+    if (ret < 0)
+        return ret;
+
     outlink->w = s->width;
     outlink->h = s->height;
 
@@ -338,13 +712,6 @@ static int scale_d3d11_config_props(AVFilterLink *outlink)
     if (!inl->hw_frames_ctx) {
         av_log(ctx, AV_LOG_ERROR, "No hw_frames_ctx available on input link\n");
         return AVERROR(EINVAL);
-    }
-
-    ///< Propagate hw_frames_ctx to output
-    outl->hw_frames_ctx = av_buffer_ref(inl->hw_frames_ctx);
-    if (!outl->hw_frames_ctx) {
-        av_log(ctx, AV_LOG_ERROR, "Failed to propagate hw_frames_ctx to output\n");
-        return AVERROR(ENOMEM);
     }
 
     ///< Initialize filter's hardware device context
@@ -369,6 +736,29 @@ static int scale_d3d11_config_props(AVFilterLink *outlink)
         return AVERROR(EINVAL);
     }
 
+    {
+        AVHWFramesContext *in_frames_ctx = (AVHWFramesContext *)inl->hw_frames_ctx->data;
+        s->in_format = in_frames_ctx->sw_format;
+    }
+
+    if (s->in_format != AV_PIX_FMT_NV12 && s->in_format != AV_PIX_FMT_P010) {
+        av_log(ctx, AV_LOG_ERROR, "Unsupported input format: %s\n",
+               av_get_pix_fmt_name(s->in_format));
+        return AVERROR(ENOSYS);
+    }
+    if (s->format == AV_PIX_FMT_NONE)
+        s->format = s->in_format;
+    if (s->format != AV_PIX_FMT_NV12 && s->format != AV_PIX_FMT_P010) {
+        av_log(ctx, AV_LOG_ERROR, "Unsupported output format: %s\n",
+               av_get_pix_fmt_name(s->format));
+        return AVERROR(ENOSYS);
+    }
+
+    s->shader_fallback = s->format == AV_PIX_FMT_P010;
+    s->direct_input_srv = -1;
+    s->direct_output_uav = -1;
+    av_buffer_unref(&s->hw_frames_ctx_out);
+
     ///< Create new hardware frames context for output
     s->hw_frames_ctx_out = av_hwframe_ctx_alloc(s->hw_device_ctx);
     if (!s->hw_frames_ctx_out)
@@ -386,14 +776,43 @@ static int scale_d3d11_config_props(AVFilterLink *outlink)
 
     AVD3D11VAFramesContext *frames_hwctx = frames_ctx->hwctx;
     frames_hwctx->MiscFlags = 0;
-    frames_hwctx->BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_VIDEO_ENCODER;
+    if (s->shader_fallback) {
+        frames_hwctx->BindFlags = D3D11_BIND_RENDER_TARGET |
+                                  D3D11_BIND_SHADER_RESOURCE;
+        if (!s->force_output_copy)
+            frames_hwctx->BindFlags |= D3D11_BIND_UNORDERED_ACCESS;
+    } else {
+        frames_hwctx->BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        if (frames_ctx->sw_format == AV_PIX_FMT_NV12)
+            frames_hwctx->BindFlags |= D3D11_BIND_VIDEO_ENCODER;
+    }
 
     ret = av_hwframe_ctx_init(s->hw_frames_ctx_out);
     if (ret < 0) {
         av_buffer_unref(&s->hw_frames_ctx_out);
         return ret;
     }
+    if (s->shader_fallback && !s->force_output_copy) {
+        ret = scale_d3d11_probe_output_uav_pool(ctx, s->hw_frames_ctx_out);
+        if (ret < 0) {
+            av_buffer_unref(&s->hw_frames_ctx_out);
+            return ret;
+        }
+        s->direct_output_uav = 1;
+    } else if (s->shader_fallback) {
+        s->direct_output_uav = 0;
+    }
 
+
+    if (s->shader_fallback) {
+        av_log(ctx, AV_LOG_VERBOSE, "D3D11 scale: using P010 output path\n");
+        if (s->direct_output_uav > 0)
+            av_log(ctx, AV_LOG_DEBUG, "D3D11 shader output: direct UAV\n");
+        else if (s->force_output_copy)
+            av_log(ctx, AV_LOG_DEBUG, "D3D11 shader output: forced copy from internal UAV texture\n");
+    }
+
+    av_buffer_unref(&outl->hw_frames_ctx);
     outl->hw_frames_ctx = av_buffer_ref(s->hw_frames_ctx_out);
     if (!outl->hw_frames_ctx)
         return AVERROR(ENOMEM);
@@ -408,6 +827,8 @@ static av_cold void scale_d3d11_uninit(AVFilterContext *ctx) {
 
     ///< Release D3D11 resources
     release_d3d11_resources(s);
+
+    ff_d3d11_unload_shader_compiler(&s->d3dcompiler, &s->D3DCompile);
 
     ///< Free the hardware device context reference
     av_buffer_unref(&s->hw_frames_ctx_out);
@@ -438,9 +859,12 @@ static const AVFilterPad scale_d3d11_outputs[] = {
 #define FLAGS (AV_OPT_FLAG_FILTERING_PARAM | AV_OPT_FLAG_VIDEO_PARAM)
 
 static const AVOption scale_d3d11_options[] = {
+    { "w",      "Output video width",  OFFSET(w_expr), AV_OPT_TYPE_STRING, {.str = "iw"}, .flags = FLAGS },
     { "width",  "Output video width",  OFFSET(w_expr), AV_OPT_TYPE_STRING, {.str = "iw"}, .flags = FLAGS },
+    { "h",      "Output video height", OFFSET(h_expr), AV_OPT_TYPE_STRING, {.str = "ih"}, .flags = FLAGS },
     { "height", "Output video height", OFFSET(h_expr), AV_OPT_TYPE_STRING, {.str = "ih"}, .flags = FLAGS },
     { "format", "Output video pixel format", OFFSET(format), AV_OPT_TYPE_PIXEL_FMT, { .i64 = AV_PIX_FMT_NONE }, INT_MIN, INT_MAX, .flags=FLAGS },
+    { "force_output_copy", "Force P010 shader output through an internal unordered-access texture", OFFSET(force_output_copy), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, .flags=FLAGS },
     { NULL }
 };
 
@@ -448,7 +872,7 @@ AVFILTER_DEFINE_CLASS(scale_d3d11);
 
 const FFFilter ff_vf_scale_d3d11 = {
     .p.name           = "scale_d3d11",
-    .p.description    = NULL_IF_CONFIG_SMALL("Scale video using Direct3D11"),
+    .p.description    = NULL_IF_CONFIG_SMALL("Scale D3D11 video"),
     .priv_size        = sizeof(ScaleD3D11Context),
     .p.priv_class     = &scale_d3d11_class,
     .init             = scale_d3d11_init,

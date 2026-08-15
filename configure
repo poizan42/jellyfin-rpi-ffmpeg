@@ -2469,6 +2469,9 @@ HEADERS_LIST="
 INTRINSICS_LIST="
     intrinsics_neon
     intrinsics_sse2
+    intrinsics_sse42
+    intrinsics_fma3
+    intrinsics_avx2
 "
 
 MATH_FUNCS="
@@ -2695,6 +2698,7 @@ HAVE_LIST="
     xmllint
     zlib_gzip
     openvino2
+    libvpl_legacy_mfxinit
 "
 
 # options emitted with CONFIG_ prefix but not available on the command line
@@ -2927,6 +2931,9 @@ armv8_deps="aarch64"
 neon_deps_any="aarch64 arm"
 intrinsics_neon_deps="neon"
 intrinsics_sse2_deps="sse2"
+intrinsics_sse42_deps="sse42"
+intrinsics_fma3_deps="fma3"
+intrinsics_avx2_deps="avx2"
 vfp_deps="arm"
 vfpv3_deps="vfp"
 setend_deps="arm"
@@ -3082,6 +3089,8 @@ ac3_decoder_select="ac3_parser ac3dsp bswapdsp fmtconvert"
 ac3_fixed_decoder_select="ac3_parser ac3dsp bswapdsp"
 ac3_encoder_select="ac3dsp audiodsp me_cmp"
 ac3_fixed_encoder_select="ac3dsp audiodsp me_cmp"
+ac4_decoder_select="ac4_parser"
+ac4_decoder_deps="gplv3"
 acelp_kelvin_decoder_select="audiodsp celp_math"
 adpcm_circus_decoder_deps="lgpl_gpl"
 adpcm_g722_decoder_select="g722dsp"
@@ -3540,6 +3549,11 @@ scale_cuda_filter_deps="ffnvcodec"
 scale_cuda_filter_deps_any="cuda_nvcc cuda_llvm"
 thumbnail_cuda_filter_deps="ffnvcodec"
 thumbnail_cuda_filter_deps_any="cuda_nvcc cuda_llvm"
+tonemap_cuda_filter_deps="ffnvcodec const_nan"
+tonemap_d3d11_filter_deps="d3d11va const_nan d3dcompiler_h"
+tonemap_cuda_filter_deps_any="cuda_nvcc cuda_llvm"
+transpose_cuda_filter_deps="ffnvcodec"
+transpose_cuda_filter_deps_any="cuda_nvcc cuda_llvm"
 transpose_npp_filter_deps="ffnvcodec libnpp"
 overlay_cuda_filter_deps="ffnvcodec"
 overlay_cuda_filter_deps_any="cuda_nvcc cuda_llvm"
@@ -3550,7 +3564,11 @@ sharpen_npp_filter_deps="ffnvcodec libnpp"
 ddagrab_filter_deps="d3d11va IDXGIOutput1 DXGI_OUTDUPL_FRAME_INFO"
 gfxcapture_filter_deps="cxx17 threads d3d11va IGraphicsCaptureItemInterop __x_ABI_CWindows_CGraphics_CCapture_CIGraphicsCaptureSession3"
 gfxcapture_filter_extralibs="-lstdc++"
-scale_d3d11_filter_deps="d3d11va"
+scale_d3d11_filter_deps="d3d11va ID3D11VideoProcessor d3dcompiler_h"
+overlay_d3d11_filter_deps="d3d11va d3dcompiler_h"
+transpose_d3d11_filter_deps="d3d11va ID3D11VideoContext1 ID3D11VideoProcessor"
+bwdif_d3d11_filter_deps="d3d11va d3dcompiler_h"
+yadif_d3d11_filter_deps="d3d11va d3dcompiler_h"
 scale_d3d12_filter_deps="d3d12va ID3D12VideoProcessor"
 deinterlace_d3d12_filter_deps="d3d12va ID3D12VideoProcessor"
 mestimate_d3d12_filter_deps="d3d12va ID3D12VideoMotionEstimator d3d12_motion_estimator"
@@ -3696,6 +3714,7 @@ vvc_qsv_decoder_select="vvc_mp4toannexb_bsf qsvdec"
 
 # parsers
 aac_parser_select="adts_header mpeg4audio"
+ac4_parser_deps="gplv3"
 ahx_parser_deps="lgpl_gpl"
 apv_parser_select="cbs_apv"
 av1_parser_select="cbs_av1"
@@ -3773,6 +3792,8 @@ h264_videotoolbox_encoder_deps="pthreads"
 h264_videotoolbox_encoder_select="atsc_a53 videotoolbox_encoder"
 hevc_videotoolbox_encoder_deps="pthreads"
 hevc_videotoolbox_encoder_select="atsc_a53 videotoolbox_encoder"
+mjpeg_videotoolbox_encoder_deps="pthreads"
+mjpeg_videotoolbox_encoder_select="videotoolbox_encoder"
 prores_videotoolbox_encoder_deps="pthreads"
 prores_videotoolbox_encoder_select="videotoolbox_encoder"
 libaom_av1_decoder_deps="libaom"
@@ -4119,6 +4140,8 @@ boxblur_opencl_filter_deps="opencl gpl"
 bs2b_filter_deps="libbs2b"
 bwdif_cuda_filter_deps="ffnvcodec"
 bwdif_cuda_filter_deps_any="cuda_nvcc cuda_llvm"
+bwdif_opencl_filter_deps="opencl"
+bwdif_videotoolbox_filter_deps="metal corevideo videotoolbox"
 bwdif_vulkan_filter_deps="vulkan spirv_compiler"
 chromaber_vulkan_filter_deps="vulkan spirv_library"
 color_vulkan_filter_deps="vulkan spirv_library"
@@ -4164,6 +4187,7 @@ gblur_vulkan_filter_deps="vulkan spirv_library"
 hflip_vulkan_filter_deps="vulkan spirv_library"
 histeq_filter_deps="gpl"
 hqdn3d_filter_deps="gpl"
+hwupload_vaapi_filter_deps="vaapi"
 iccdetect_filter_deps="lcms2"
 iccgen_filter_deps="lcms2"
 identity_filter_select="scene_sad"
@@ -4199,6 +4223,7 @@ overlay_opencl_filter_deps="opencl"
 overlay_qsv_filter_deps="libmfx"
 overlay_qsv_filter_select="qsvvpp"
 overlay_vaapi_filter_deps="vaapi VAProcPipelineCaps_blend_flags"
+overlay_videotoolbox_filter_deps="metal corevideo coreimage videotoolbox"
 overlay_vulkan_filter_deps="vulkan spirv_library"
 owdenoise_filter_deps="gpl"
 pad_opencl_filter_deps="opencl"
@@ -4220,6 +4245,7 @@ scale2ref_filter_deps="swscale"
 scale_filter_deps="swscale"
 sr_amf_filter_deps="amf"
 vpp_amf_filter_deps="amf"
+scale_opencl_filter_deps="opencl const_nan"
 scale_qsv_filter_deps="libmfx"
 scale_qsv_filter_select="qsvvpp"
 scdet_filter_select="scene_sad"
@@ -4244,11 +4270,13 @@ tinterlace_filter_deps="gpl"
 tinterlace_merge_test_deps="tinterlace_filter"
 tinterlace_pad_test_deps="tinterlace_filter"
 tonemap_filter_deps="const_nan"
+tonemapx_filter_deps="const_nan"
 tonemap_vaapi_filter_deps="vaapi VAProcFilterParameterBufferHDRToneMapping"
+tonemap_videotoolbox_filter_deps="metal corevideo videotoolbox const_nan"
 tonemap_opencl_filter_deps="opencl const_nan"
 transpose_opencl_filter_deps="opencl"
 transpose_vaapi_filter_deps="vaapi VAProcPipelineCaps_rotation_flags"
-transpose_vt_filter_deps="videotoolbox VTPixelRotationSessionCreate"
+transpose_vt_filter_deps="coreimage videotoolbox"
 transpose_vulkan_filter_deps="vulkan spirv_library"
 unsand_filter_select="sand"
 sand_to_yuv420p_drm_filter_select="sand"
@@ -4273,6 +4301,7 @@ xfade_opencl_filter_deps="opencl"
 xfade_vulkan_filter_deps="vulkan spirv_library"
 yadif_cuda_filter_deps="ffnvcodec"
 yadif_cuda_filter_deps_any="cuda_nvcc cuda_llvm"
+yadif_opencl_filter_deps="opencl"
 yadif_videotoolbox_filter_deps="metal corevideo videotoolbox"
 hstack_vaapi_filter_deps="vaapi_1"
 vstack_vaapi_filter_deps="vaapi_1"
@@ -5013,6 +5042,15 @@ if enabled cuda_nvcc; then
     if $nvcc $nvccflags_default 2>&1 | grep -qi unsupported; then
         nvccflags_default="-gencode arch=compute_75,code=sm_75 -O2"
     fi
+else
+    clang_version=$($nvcc -dumpversion 2>/dev/null || echo 0)
+    # clang-11+ allows disabling reassociate with progma when fast-math is enabled
+    test ${clang_version%%[!0-9]*} -ge 11 && append nvccflags_default "-ffast-math"
+
+    # clang-20 emits ptx60 instruction 'brx.idx' even for ptx32 target (llvm/llvm-project@ccc3127)
+    # default to ptx60/sm_30 to follow the changes made in clang-16+ (llvm/llvm-project@d677505)
+    # '--cuda-feature=+ptx*' option is not available before clang-15
+    test ${clang_version%%[!0-9]*} -ge 15 && append nvccflags_default "--cuda-feature=+ptx60"
 fi
 
 set_default arch cc cxx doxygen pkg_config ranlib strip sysinclude \
@@ -5927,7 +5965,7 @@ elif enabled x86; then
         ;;
         # everything else should support nopl and conditional mov (cmov)
         *)
-            cpuflags="-march=$cpu"
+            # there is no -march=generic option
             enable i686
             enable fast_cmov
         ;;
@@ -6828,6 +6866,19 @@ EOF
 
     check_cc intrinsics_sse2 emmintrin.h "__m128i test = _mm_setzero_si128()"
 
+    disable intrinsics_sse42 && test_cc -msse4.2 <<EOF && enable intrinsics_sse42
+#include <immintrin.h>
+int main(void) { __m128i t = _mm_cmpgt_epi64(_mm_setzero_si128(), _mm_setzero_si128()); return 0; }
+EOF
+    disable intrinsics_fma3 && test_cc -mfma <<EOF && enable intrinsics_fma3
+#include <immintrin.h>
+int main(void) { __m256 t = _mm256_fmadd_ps(_mm256_setzero_ps(), _mm256_setzero_ps(), _mm256_setzero_ps()); return 0; }
+EOF
+    disable intrinsics_avx2 && test_cc -mavx2 <<EOF && enable intrinsics_avx2
+#include <immintrin.h>
+int main(void) { __m256i t = _mm256_abs_epi32(_mm256_setzero_si256()); return 0; }
+EOF
+
 elif enabled loongarch; then
     enabled lsx && check_inline_asm lsx '"vadd.b $vr0, $vr1, $vr2"' '-mlsx' && append LSXFLAGS '-mlsx'
     enabled lasx && check_inline_asm lasx '"xvadd.b $xr0, $xr1, $xr2"' '-mlasx' && append LASXFLAGS '-mlasx'
@@ -7001,6 +7052,7 @@ enabled epoxy &&
 check_headers direct.h
 check_headers dirent.h
 check_headers dxgidebug.h
+check_headers d3dcompiler.h
 check_headers dxva.h
 check_headers dxva2api.h -D_WIN32_WINNT=0x0600
 check_headers io.h
@@ -7109,6 +7161,8 @@ check_type "windows.h dxgi1_2.h" "IDXGIOutput1"
 check_type "windows.h dxgi1_5.h" "IDXGIOutput5"
 check_type "windows.h d3d11.h" "ID3D11VideoDecoder"
 check_type "windows.h d3d11.h" "ID3D11VideoContext"
+check_type "windows.h d3d11.h" "ID3D11VideoProcessor"
+check_type "windows.h d3d11.h d3d11_1.h" "ID3D11VideoContext1"
 check_type "windows.h d3d12.h" "ID3D12Device"
 check_type "windows.h d3d12video.h" "ID3D12VideoDecoder"
 check_type "windows.h d3d12video.h" "ID3D12VideoEncoder"
@@ -7149,7 +7203,7 @@ fi
 if enabled cuda_nvcc; then
     nvccflags="$nvccflags -ptx"
 else
-    nvccflags="$nvccflags -S -nocudalib -nocudainc --cuda-device-only -Wno-c++11-narrowing -include ${source_link}/compat/cuda/cuda_runtime.h"
+    nvccflags="$nvccflags -S -nocudalib -nocudainc --cuda-device-only -Wno-c++11-narrowing -std=c++14 -include ${source_link}/compat/cuda/cuda_runtime.h"
     check_nvcc cuda_llvm
 fi
 
@@ -7347,6 +7401,9 @@ elif enabled libvpl; then
             die "ERROR: libvpl >= 2.6 not found"
     add_cppflags -DMFX_DEPRECATED_OFF
     check_type "vpl/mfxdefs.h vpl/mfxvideo.h" "struct mfxConfigInterface"
+# Ancient Intel driver on Windows still require the legacy init functions.
+# No compiler option is changed if the test fails, just needs to add back the disabled libmfx.
+    { test_pkg_config libmfx "vpl >= 2.6" "mfxvideo.h mfxdispatcher.h" "MFXInit MFXInitEx" && enable libvpl_legacy_mfxinit; } || enable libmfx
 fi
 
 if enabled libmfx; then
@@ -7847,7 +7904,7 @@ if enabled x86; then
     esac
 elif enabled_any aarch64 ppc64 && ! enabled bigendian; then
     case $target_os in
-        linux)
+        linux|mingw32*|mingw64*|win32|win64)
             ;;
         *)
             disable ffnvcodec cuvid nvdec nvenc
@@ -7877,7 +7934,7 @@ fi
 
 enabled amf &&
     check_cpp_condition amf "AMF/core/Version.h" \
-        "(AMF_VERSION_MAJOR << 48 | AMF_VERSION_MINOR << 32 | AMF_VERSION_RELEASE << 16 | AMF_VERSION_BUILD_NUM) >= 0x0001000400240000"
+        "(AMF_VERSION_MAJOR << 48 | AMF_VERSION_MINOR << 32 | AMF_VERSION_RELEASE << 16 | AMF_VERSION_BUILD_NUM) >= 0x1000500000000"
 
 # Funny iconv installations are not unusual, so check it after all flags have been set
 if enabled libc_iconv; then
@@ -8084,8 +8141,8 @@ if enabled icc; then
 elif enabled gcc; then
     gcc_version=$($cc -dumpversion)
     major_version=${gcc_version%%[!0-9]*}
-    if [ $major_version -lt 13 ]; then
-        # Disable tree-vectorize for GCC <13 - it has historically been buggy.
+    if [ $major_version -lt 11 ]; then
+        # Disable tree-vectorize for GCC <11 - it has historically been buggy.
         check_optflags -fno-tree-vectorize
     else
         case $arch in
@@ -8117,6 +8174,16 @@ elif enabled gcc; then
             # function calls. Library entry points that might call assembly
             # functions align the stack. (The parameter means 2^4 bytes.)
             check_allcflags -mpreferred-stack-boundary=4
+            ;;
+        esac
+    elif enabled x86_64; then
+        case $target_os in
+        mingw*|win*|cygwin*)
+            # GCC on Windows cannot guarantee a 32-byte aligned stack
+            # Such alignment is required by certain AVX instructions
+            # Force GCC to use the unaligned equivalents instead
+            check_cflags -Wa,-muse-unaligned-vector-move
+            check_cxxflags -Wa,-muse-unaligned-vector-move
             ;;
         esac
     fi
