@@ -110,12 +110,10 @@ eating ~1.2 CPU cores as swscale. Properly `configure`-integrated
 - **Input mmap-cache** — the decoder recycles a fixed set of SAND dma-bufs, so map them once
   instead of `mmap`+invalidate+`munmap` of ~16 MB per frame via `av_hwframe_map`. Keyed on the
   dma-buf **inode** (fd numbers get recycled and would alias a freed buffer), LRU-evicted, and it
-  handles a frame described by **any number of objects** — the RPi decoder uses one object per
-  frame on a 6.1 kernel and two (luma, chroma) on 6.18. Requiring exactly one silently disabled
-  the cache on 6.18 and cost ~15 ms/frame; see
-  [`investigations/dv-6.18-filter-regression.md`](../investigations/dv-6.18-filter-regression.md)
-  in the research repo. `SAND_PROF=1` prints `[mmaps=N]`, which must plateau — `mmaps=0` means the
-  cache is being bypassed.
+  handles a frame described by **any number of objects** — the RPi decoder splits luma and chroma
+  into separate objects on some kernels, and a cache that insists on one object silently falls
+  back to per-frame mapping, which costs ~15 ms/frame at 4K. `SAND_PROF=1` prints `[mmaps=N]`,
+  which must plateau; `mmaps=0` means the cache is being bypassed.
 - **Thread cap** (`nb_threads-1`) — leaves a core for the decode/encode threads (the memory-bound
   unpack over-subscribes the 4-core chip otherwise).
 - Pooled CMA dma-bufs (dma-heap) for the output; DRM_PRIME → zero-copy into the encoder.
@@ -142,8 +140,7 @@ directly from that chain** into embedded LUTs (`libavfilter/rpi_tonemap_gen.py` 
   makes it the unpack-only baseline for measurement — and wrong output for any HDR source, since
   a 10→8 truncation cannot fit a wide dynamic range into SDR. On DV P5 it is *badly* wrong
   rather than merely flat (the base layer is Dolby's reshaped IPT-PQ), so the filter logs a
-  one-shot warning. Until 2026-08-16 it silently reconstructed P5 anyway, which made `tm=none`
-  the most expensive tier and useless as a baseline.
+  one-shot warning.
 
 Both tiers select their tone LUTs by the frame's transfer: **PQ/HDR10** (SMPTE2084) uses the
 `ff_rpi_tm_*` set, **HLG** (ARIB_STD_B67, incl. DV P8.4's HLG base) uses a separately baked
@@ -239,10 +236,11 @@ filter Jellyfin puts in its software HDR chains), no `alphasrc`, no AC-4 decoder
 no `0027-pass-dovi-sidedata-to-hlsenc-and-mpegtsenc` — which sits directly on top
 of the Dolby Vision and SPS/PPS work here.
 
-Since 2026-08-15 the series is **applied as one commit on `jellyfin-rpi`** (94 of
-96; `0026-remove-fdk-aac-from-nonfree` and the Rockchip RK3588 patch are skipped
-deliberately and also do not apply). The series is jellyfin's own and current for
-this base, so it is written against exactly this tree and applies without rejects.
+The series is **applied as one commit on `jellyfin-rpi`** (94 of 96; the Rockchip
+RK3588 patch is skipped as the wrong platform, and `0026-remove-fdk-aac-from-nonfree`
+is applied by hand — see the libfdk-aac note above). It is jellyfin's own series and
+current for this base, so it is written against exactly this tree and applies without
+rejects.
 
 **Rebasing onto a newer jellyfin-ffmpeg:** revert that commit, merge the new base,
 re-apply the series, commit again:
@@ -259,15 +257,12 @@ Deliberate departures from stock jellyfin-ffmpeg: **static, not `--enable-shared
 can just copy), no LTO, and no cuda/nvenc/rkmpp (wrong platform), libfdk_aac (nonfree),
 libsvtav1/libtheora/libzvbi/libopenmpt/chromaprint.
 
-> **Lesson (2026-08-14):** for most of this work the fork was built *lean* — purely to keep
-> the edit→rebuild loop short while iterating on the SAND/de-tile kernels. That was an
-> iteration-speed choice, never a design one, and it leaked into production when the shim
-> started redirecting real Jellyfin command lines at the fork: a `-codec:a:0 libmp3lame`
-> transcode died with `Encoder not found` ("Source error" in the client). **Iterate lean,
-> deploy full.** `transcode-orchestrator/check-encoders.sh` now diffs this build's encoder
-> list against the stock jellyfin-ffmpeg's and `install.sh` refuses to deploy on an
-> unexplained gap — the check belongs at deploy time, not at transcode time, where routing
-> around a missing encoder would just hide the build defect behind a slow transcode.
+**Build full-featured for anything you deploy.** The orchestrator shim rewrites only the
+video side of a Jellyfin command line and passes the rest — notably `-codec:a` — through to
+this binary, so a missing encoder is a hard `Encoder not found` at playback rather than a
+slow transcode. `transcode-orchestrator/check-capabilities.sh` diffs this build against the
+stock jellyfin-ffmpeg and `install.sh` refuses to deploy on an unexplained gap. The lean
+configure below is for fast iteration only.
 
 ### Minimal configure (fast iteration on the video kernels only)
 
@@ -278,7 +273,7 @@ libsvtav1/libtheora/libzvbi/libopenmpt/chromaprint.
 make -j4
 ```
 
-**Do not deploy this build** — see the lesson above.
+**Do not deploy this build** — see the capability requirement above.
 
 - `--enable-sand` + `--enable-v4l2-request` are required for the SAND filter and rpivid decode.
 - `--enable-libzimg`/`--enable-libplacebo`/`--enable-vulkan` are only needed for the HDR
@@ -322,22 +317,18 @@ downscale into the tone-map and emits 1080p directly (no `scale_v4l2m2m`), which
 
 ## Performance (Pi 4B, 600-frame steady-state, → 720p)
 
-Re-measured 2026-08-16 on kernel 6.18.44 after the multi-object mmap-cache fix
-(see "Input mmap-cache" above); the previous figures, in parentheses, were taken
-before it. The fix lifted every 4K row by 5–9%, because the cache had been
-bypassed whenever the decoder described a frame with more than one dma-buf
-object — always on 6.18, sometimes on 6.1.
+Measured on kernel 6.18.44.
 
 | source | speed | notes |
 |---|---:|---|
 | 10-bit HEVC SDR 1080p | ~2.0–2.7× | decode-thread-bound, not CPU-bound |
-| 10-bit HEVC SDR 4K scope (3840×1608) | **1.64×** (1.42) | slice-thread + prefetch + map-cache + thread-cap. With `out=half` first: **2.11×** |
-| 10-bit HEVC HDR10 4K (3840×2160), `tm=none` | **1.23×** (1.16) | truncation — wrong colour, and no tone-map work: this is the unpack-only baseline |
-| 10-bit HEVC HDR10 4K (3840×2160), `tm=fast` | **1.27×** (1.17) | **real-time, correct colour** (single-pass tone-map fold) |
-| 10-bit HEVC HDR10 4K (3840×2160), `tm=accurate` | **1.02×** (0.94) | quality tier (NEON tetrahedral 3D-LUT) — now real-time |
-| 10-bit HEVC Dolby Vision **profile 5** 4K (3840×2160), default/`tm=accurate` | **0.69×** (0.60) | correct colour via per-RPU 3D LUT + NEON tetrahedral (luma is a full 3D lookup); scalar was 0.15× |
-| 10-bit HEVC Dolby Vision **profile 5** 4K (3840×2160), `tm=fast` | **1.03×** (1.0) | **real-time**; 1D neutral-chroma luma approx + full 3D chroma; luma ~45–51 dB vs accurate, chroma identical |
-| 10-bit HEVC Dolby Vision **profile 5** 4K (3840×2160), `tm=veryfast` | **1.11×** (1.06) | **real-time + headroom**; fast luma + ordered-dithered nearest-cell 3D chroma; dither de-bands the grid-snapping into grain (perceptually ~63 dB vs tetrahedral, deterministic) |
+| 10-bit HEVC SDR 4K scope (3840×1608) | **1.64×** | slice-thread + prefetch + map-cache + thread-cap. With `out=half` first: **2.11×** |
+| 10-bit HEVC HDR10 4K (3840×2160), `tm=none` | **1.23×** | truncation — wrong colour, and no tone-map work: this is the unpack-only baseline |
+| 10-bit HEVC HDR10 4K (3840×2160), `tm=fast` | **1.27×** | **real-time, correct colour** (single-pass tone-map fold) |
+| 10-bit HEVC HDR10 4K (3840×2160), `tm=accurate` | **1.02×** | quality tier (NEON tetrahedral 3D-LUT), real-time |
+| 10-bit HEVC Dolby Vision **profile 5** 4K (3840×2160), default/`tm=accurate` | **0.69×** | correct colour via per-RPU 3D LUT + NEON tetrahedral (luma is a full 3D lookup) |
+| 10-bit HEVC Dolby Vision **profile 5** 4K (3840×2160), `tm=fast` | **1.03×** | **real-time**; 1D neutral-chroma luma approx + full 3D chroma; luma ~45–51 dB vs accurate, chroma identical |
+| 10-bit HEVC Dolby Vision **profile 5** 4K (3840×2160), `tm=veryfast` | **1.11×** | **real-time + headroom**; fast luma + ordered-dithered nearest-cell 3D chroma; dither de-bands the grid-snapping into grain (perceptually ~63 dB vs tetrahedral, deterministic) |
 
 At a **720p target the shim uses `out=half`** (4K ≥ 2× the target), which is faster
 still than every row above: DV P5 `tm=veryfast` **1.46×**, HDR10 `tm=veryfast`
@@ -358,16 +349,15 @@ This both shrinks the per-sample apply ~4× *and* removes the ISP's ~15.5 MB/fra
 which was *contending* with the memory-latency-bound unpack (the identical filter runs ~27 ms/frame
 alone but ~40 ms in-pipeline). Net: it turns the whole 4K→1080p DV/HDR path real-time.
 
-Re-measured 2026-08-16 on kernel 6.18.44 after the multi-object mmap-cache fix,
-600 frames (SDR: She-Hulk bt709 scope, half = 1920×804; HDR10: Agatha S01E01;
-DV P5: Agatha S01E05). Previous figures in parentheses.
+Measured on kernel 6.18.44, 600 frames (SDR: She-Hulk bt709 scope, half = 1920×804;
+HDR10: Agatha S01E01; DV P5: Agatha S01E05).
 
 | source (4K → 1080p) | 4K apply + ISP scale | **`out=half`** (fused, no ISP) |
 |---|---:|---:|
-| SDR, `tm=none` | **1.38×** (1.26) | **1.84×** (~1.3+) |
-| HDR10, `tm=fast` | **1.07×** (1.01) | **1.37×** (1.3) |
-| HDR10, `tm=accurate` | **0.91×** (0.89) | **1.28×** (1.26) |
-| DV **profile 5**, default/`tm=accurate` | **0.64×** (0.66) | **1.16×** (1.12) |
+| SDR, `tm=none` | **1.38×** | **1.84×** |
+| HDR10, `tm=fast` | **1.07×** | **1.37×** |
+| HDR10, `tm=accurate` | **0.91×** | **1.28×** |
+| DV **profile 5**, default/`tm=accurate` | **0.64×** | **1.16×** |
 | DV **profile 5**, `tm=veryfast` | **0.96×** (0.90–0.93) | **1.32×** (1.19–1.25) |
 
 `out=half` uses **tetrahedral chroma at half-res for every P5 tier** (4× fewer chroma sites make it
@@ -377,7 +367,7 @@ Quality vs the accurate reference downscaled: ordering error is negligible (Y/Cb
 codes — downscale-then-tone-map is the same order libplacebo/mpv use); box 2×2 gives a slight softening
 vs the ISP's polyphase. Output is deterministic and NEON==scalar bit-exact; `out=full` (default) is
 byte-identical to before. **So at 4K→1080p, even DV P5 `tm=accurate` (the quality default) is now
-real-time** — the earlier `dovi_tool` P5→P8.1 offline fallback is no longer needed for this ratio.
+real-time**.
 
 The dominant cost of the CPU filter is the **fixed 4K SAND unpack** (memory-latency-bound; unchanged
 by `out=half`, which is why the 4K→720p 3:1 case — non-integer, still full-res + ISP — keeps the
