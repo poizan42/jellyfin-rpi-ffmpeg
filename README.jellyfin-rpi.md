@@ -254,8 +254,11 @@ git add -u && git commit
 
 Deliberate departures from stock jellyfin-ffmpeg: **static, not `--enable-shared`** (so
 `/opt/rpi-ffmpeg-orchestrator/ffmpeg-real` is one self-contained binary that `install.sh`
-can just copy), no LTO, and no cuda/nvenc/rkmpp (wrong platform), libfdk_aac (nonfree),
-libsvtav1/libtheora/libzvbi/libopenmpt/chromaprint.
+can just copy), no LTO, and none of the other vendors' hardware —
+cuda/nvenc/cuvid/rkmpp/qsv/vaapi/amf/opencl, unusable on a Pi. The only codecs left out are
+`libsvtav1` (no AV1 encode target here), `libtheora`, and the experimental `sonic`/`sonicls`
+encoders. Everything else the stock build has is built, which
+`transcode-orchestrator/check-capabilities.sh` verifies.
 
 **Build full-featured for anything you deploy.** The orchestrator shim rewrites only the
 video side of a Jellyfin command line and passes the rest — notably `-codec:a` — through to
