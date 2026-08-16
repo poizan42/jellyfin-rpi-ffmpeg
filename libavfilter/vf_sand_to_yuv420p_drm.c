@@ -1679,11 +1679,17 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     /* Effective apply tier for this frame. On the out=half path the nn+dither chroma
      * bands (the ISP no longer averages it back), so veryfast collapses to the tetra
      * P5_FAST; SDR/passthrough (only routed through the scratch path when half) is TM_NONE. */
+    /* tm=none on a P5 source cannot mean "don't map": you cannot fit a wide
+     * dynamic range into SDR without some mapping, and P5's base layer is
+     * Dolby's reshaped IPT-PQ signal, so passing it through unmapped is simply
+     * wrong colour. Read "none" as "spend the least time on it" and give it the
+     * cheapest correct tier, rather than falling through to the tetrahedral
+     * TM_P5 -- which made tm=none the SLOWEST option (23.1 vs 18.9 ms/frame). */
     int eff_tm;
     if (!do_tm)      eff_tm = TM_NONE;
-    else if (is_p5)  eff_tm = half ? ((s->tm == TM_FAST || s->tm == TM_VERYFAST) ? TM_P5_FAST : TM_P5)
-                                   : (s->tm == TM_VERYFAST ? TM_P5_VERYFAST :
-                                      s->tm == TM_FAST     ? TM_P5_FAST     : TM_P5);
+    else if (is_p5)  eff_tm = half ? (s->tm == TM_ACCURATE ? TM_P5 : TM_P5_FAST)
+                                   : (s->tm == TM_ACCURATE ? TM_P5 :
+                                      s->tm == TM_VERYFAST ? TM_P5_VERYFAST : TM_P5_FAST);
     else             eff_tm = (s->tm == TM_VERYFAST) ? TM_FAST : s->tm;
 
     if (is_p5) {
