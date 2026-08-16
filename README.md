@@ -17,7 +17,7 @@ Full design, build instructions and usage: **[README.jellyfin-rpi.md](README.jel
 | source → H.264 720p (Pi 4B) | result |
 |---|---|
 | 10-bit HEVC **SDR** 1080p | **~2.0–2.7× real-time** — the tuned sweet spot |
-| 10-bit HEVC **SDR** 4K (2160p / scope) | **~1.4× real-time** — proven (slice-threaded NEON unpack + prefetch + map-cache + ISP scale) |
+| 10-bit HEVC **SDR** 4K (2160p / scope) | **~1.64× real-time**, or **~2.11×** when `out=half` does the first 2:1 (slice-threaded NEON unpack + prefetch + map-cache + ISP scale) |
 | 8-bit HEVC SDR | works (same bridge path) |
 | 10-bit HEVC **HDR10** 4K | **~1.27× real-time with correct colour** (`tm=fast`) — single-pass NEON HDR→SDR tone-map (PQ/BT.2020→BT.709). The higher-quality `tm=accurate` tier (3D-LUT, matches zscale) is now real-time too at ~1.02×. `tm=none` is ~1.23× but wrong colour (a truncation cannot fit HDR into SDR) — it exists as the unpack-only baseline. HLG sources handled too. |
 | Dolby Vision **profile 5** 4K | **supported** — reconstructed from the per-frame RPU to HDR10, then tone-mapped (`AV_FRAME_DATA_DOVI_METADATA` → per-scene 3D-LUT + NEON tetrahedral). `tm=fast` **~1.03× (real-time)**, `tm=veryfast` ~1.11× (headroom; ordered-dithered nearest chroma — de-banded), default full-3D path ~0.69×. **At 4K→1080p, `out=half` (fused 2×2 downscale, no ISP scale) makes even `tm=accurate` real-time (~1.16–1.32×)**, and at a 720p target `out=half` reaches **~1.46× on DV P5 / ~1.53× on HDR10**. |

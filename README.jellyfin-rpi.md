@@ -331,7 +331,7 @@ object — always on 6.18, sometimes on 6.1.
 | source | speed | notes |
 |---|---:|---|
 | 10-bit HEVC SDR 1080p | ~2.0–2.7× | decode-thread-bound, not CPU-bound |
-| 10-bit HEVC SDR 4K scope (3840×1608) | ~1.42× | slice-thread + prefetch + map-cache + thread-cap |
+| 10-bit HEVC SDR 4K scope (3840×1608) | **1.64×** (1.42) | slice-thread + prefetch + map-cache + thread-cap. With `out=half` first: **2.11×** |
 | 10-bit HEVC HDR10 4K (3840×2160), `tm=none` | **1.23×** (1.16) | truncation — wrong colour, and no tone-map work: this is the unpack-only baseline |
 | 10-bit HEVC HDR10 4K (3840×2160), `tm=fast` | **1.27×** (1.17) | **real-time, correct colour** (single-pass tone-map fold) |
 | 10-bit HEVC HDR10 4K (3840×2160), `tm=accurate` | **1.02×** (0.94) | quality tier (NEON tetrahedral 3D-LUT) — now real-time |
@@ -359,12 +359,12 @@ which was *contending* with the memory-latency-bound unpack (the identical filte
 alone but ~40 ms in-pipeline). Net: it turns the whole 4K→1080p DV/HDR path real-time.
 
 Re-measured 2026-08-16 on kernel 6.18.44 after the multi-object mmap-cache fix,
-600 frames (HDR10: Agatha S01E01; DV P5: Agatha S01E05). Previous figures in
-parentheses; the SDR row is the older measurement (She-Hulk bt709), not re-run.
+600 frames (SDR: She-Hulk bt709 scope, half = 1920×804; HDR10: Agatha S01E01;
+DV P5: Agatha S01E05). Previous figures in parentheses.
 
 | source (4K → 1080p) | 4K apply + ISP scale | **`out=half`** (fused, no ISP) |
 |---|---:|---:|
-| SDR, `tm=none` | ~1.26× | ~1.3×+ |
+| SDR, `tm=none` | **1.38×** (1.26) | **1.84×** (~1.3+) |
 | HDR10, `tm=fast` | **1.07×** (1.01) | **1.37×** (1.3) |
 | HDR10, `tm=accurate` | **0.91×** (0.89) | **1.28×** (1.26) |
 | DV **profile 5**, default/`tm=accurate` | **0.64×** (0.66) | **1.16×** (1.12) |
