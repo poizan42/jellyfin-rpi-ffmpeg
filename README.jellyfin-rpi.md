@@ -107,8 +107,15 @@ The core of the pipeline. Takes the decoder's SAND `DRM_PRIME` frame and emits a
 eating ~1.2 CPU cores as swscale. Properly `configure`-integrated
 (`CONFIG_SAND_TO_YUV420P_DRM_FILTER`, `sand_to_yuv420p_drm_filter_select="sand"`). Details:
 - **Slice-threaded** unpack (per-row-independent bands; `AVFILTER_FLAG_SLICE_THREADS`).
-- **Input mmap-cache** — the decoder recycles a fixed set of SAND dma-buf fds, so map them once
-  instead of `mmap`+invalidate+`munmap` of ~16 MB per frame via `av_hwframe_map`.
+- **Input mmap-cache** — the decoder recycles a fixed set of SAND dma-bufs, so map them once
+  instead of `mmap`+invalidate+`munmap` of ~16 MB per frame via `av_hwframe_map`. Keyed on the
+  dma-buf **inode** (fd numbers get recycled and would alias a freed buffer), LRU-evicted, and it
+  handles a frame described by **any number of objects** — the RPi decoder uses one object per
+  frame on a 6.1 kernel and two (luma, chroma) on 6.18. Requiring exactly one silently disabled
+  the cache on 6.18 and cost ~15 ms/frame; see
+  [`investigations/dv-6.18-filter-regression.md`](../investigations/dv-6.18-filter-regression.md)
+  in the research repo. `SAND_PROF=1` prints `[mmaps=N]`, which must plateau — `mmaps=0` means the
+  cache is being bypassed.
 - **Thread cap** (`nb_threads-1`) — leaves a core for the decode/encode threads (the memory-bound
   unpack over-subscribes the 4-core chip otherwise).
 - Pooled CMA dma-bufs (dma-heap) for the output; DRM_PRIME → zero-copy into the encoder.
@@ -315,16 +322,26 @@ downscale into the tone-map and emits 1080p directly (no `scale_v4l2m2m`), which
 
 ## Performance (Pi 4B, 600-frame steady-state, → 720p)
 
+Re-measured 2026-08-16 on kernel 6.18.44 after the multi-object mmap-cache fix
+(see "Input mmap-cache" above); the previous figures, in parentheses, were taken
+before it. The fix lifted every 4K row by 5–9%, because the cache had been
+bypassed whenever the decoder described a frame with more than one dma-buf
+object — always on 6.18, sometimes on 6.1.
+
 | source | speed | notes |
 |---|---:|---|
 | 10-bit HEVC SDR 1080p | ~2.0–2.7× | decode-thread-bound, not CPU-bound |
 | 10-bit HEVC SDR 4K scope (3840×1608) | ~1.42× | slice-thread + prefetch + map-cache + thread-cap |
-| 10-bit HEVC HDR10 4K (3840×2160), `tm=none` | ~1.16× | truncation, colour wrong |
-| 10-bit HEVC HDR10 4K (3840×2160), `tm=fast` | ~1.17× | **real-time, correct colour** (single-pass tone-map fold) |
-| 10-bit HEVC HDR10 4K (3840×2160), `tm=accurate` | ~0.94× | quality tier (NEON tetrahedral 3D-LUT); near real-time |
-| 10-bit HEVC Dolby Vision **profile 5** 4K (3840×2160), default/`tm=accurate` | ~0.60× | correct colour via per-RPU 3D LUT + NEON tetrahedral (luma is a full 3D lookup); scalar was 0.15× |
-| 10-bit HEVC Dolby Vision **profile 5** 4K (3840×2160), `tm=fast` | ~1.0× | **real-time**; 1D neutral-chroma luma approx + full 3D chroma; luma ~45–51 dB vs accurate, chroma identical |
-| 10-bit HEVC Dolby Vision **profile 5** 4K (3840×2160), `tm=veryfast` | ~1.06× | **real-time + headroom**; fast luma + ordered-dithered nearest-cell 3D chroma; +~6% over fast; dither de-bands the grid-snapping into grain (perceptually ~63 dB vs tetrahedral, deterministic) |
+| 10-bit HEVC HDR10 4K (3840×2160), `tm=none` | **1.23×** (1.16) | truncation — wrong colour, and no tone-map work: this is the unpack-only baseline |
+| 10-bit HEVC HDR10 4K (3840×2160), `tm=fast` | **1.27×** (1.17) | **real-time, correct colour** (single-pass tone-map fold) |
+| 10-bit HEVC HDR10 4K (3840×2160), `tm=accurate` | **1.02×** (0.94) | quality tier (NEON tetrahedral 3D-LUT) — now real-time |
+| 10-bit HEVC Dolby Vision **profile 5** 4K (3840×2160), default/`tm=accurate` | **0.69×** (0.60) | correct colour via per-RPU 3D LUT + NEON tetrahedral (luma is a full 3D lookup); scalar was 0.15× |
+| 10-bit HEVC Dolby Vision **profile 5** 4K (3840×2160), `tm=fast` | **1.03×** (1.0) | **real-time**; 1D neutral-chroma luma approx + full 3D chroma; luma ~45–51 dB vs accurate, chroma identical |
+| 10-bit HEVC Dolby Vision **profile 5** 4K (3840×2160), `tm=veryfast` | **1.11×** (1.06) | **real-time + headroom**; fast luma + ordered-dithered nearest-cell 3D chroma; dither de-bands the grid-snapping into grain (perceptually ~63 dB vs tetrahedral, deterministic) |
+
+At a **720p target the shim uses `out=half`** (4K ≥ 2× the target), which is faster
+still than every row above: DV P5 `tm=veryfast` **1.46×**, HDR10 `tm=veryfast`
+**1.53×**. The rows here isolate the tone-map tiers at full 4K apply + ISP scale.
 
 The 4K unpack is **memory-latency-bound** on the scattered SAND reads (same wall that made the
 V3D GPU offload lose). Threading reaches the shared-bus ceiling with ~2–3 cores; the levers above
@@ -341,15 +358,17 @@ This both shrinks the per-sample apply ~4× *and* removes the ISP's ~15.5 MB/fra
 which was *contending* with the memory-latency-bound unpack (the identical filter runs ~27 ms/frame
 alone but ~40 ms in-pipeline). Net: it turns the whole 4K→1080p DV/HDR path real-time.
 
-Measured on true-4K sources (SDR: She-Hulk bt709; HDR10: Echo; DV P5: Agatha), 500-frame single-tenant:
+Re-measured 2026-08-16 on kernel 6.18.44 after the multi-object mmap-cache fix,
+600 frames (HDR10: Agatha S01E01; DV P5: Agatha S01E05). Previous figures in
+parentheses; the SDR row is the older measurement (She-Hulk bt709), not re-run.
 
-| source (4K → 1080p) | current (4K apply + ISP scale) | **`out=half`** (fused, no ISP) |
+| source (4K → 1080p) | 4K apply + ISP scale | **`out=half`** (fused, no ISP) |
 |---|---:|---:|
 | SDR, `tm=none` | ~1.26× | ~1.3×+ |
-| HDR10, `tm=fast` | ~1.01× | ~1.3× |
-| HDR10, `tm=accurate` | ~0.89× | **~1.26×** |
-| DV **profile 5**, default/`tm=accurate` | ~0.66× | **~1.12×** |
-| DV **profile 5**, `tm=fast`/`veryfast` | ~0.90–0.93× | **~1.19–1.25×** |
+| HDR10, `tm=fast` | **1.07×** (1.01) | **1.37×** (1.3) |
+| HDR10, `tm=accurate` | **0.91×** (0.89) | **1.28×** (1.26) |
+| DV **profile 5**, default/`tm=accurate` | **0.64×** (0.66) | **1.16×** (1.12) |
+| DV **profile 5**, `tm=veryfast` | **0.96×** (0.90–0.93) | **1.32×** (1.19–1.25) |
 
 `out=half` uses **tetrahedral chroma at half-res for every P5 tier** (4× fewer chroma sites make it
 cheaper than the full-res nearest path *and* higher quality — so `fast`/`veryfast` collapse to the

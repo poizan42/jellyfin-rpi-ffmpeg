@@ -19,17 +19,22 @@ Full design, build instructions and usage: **[README.jellyfin-rpi.md](README.jel
 | 10-bit HEVC **SDR** 1080p | **~2.0–2.7× real-time** — the tuned sweet spot |
 | 10-bit HEVC **SDR** 4K (2160p / scope) | **~1.4× real-time** — proven (slice-threaded NEON unpack + prefetch + map-cache + ISP scale) |
 | 8-bit HEVC SDR | works (same bridge path) |
-| 10-bit HEVC **HDR10** 4K | **~1.17× real-time with correct colour** (`tm=fast`) — single-pass NEON HDR→SDR tone-map (PQ/BT.2020→BT.709). A higher-quality `tm=accurate` tier (3D-LUT, matches zscale) runs ~0.94× (near real-time). Without tone-mapping (`tm=none`) it's ~1.16× but washed-out. HLG sources handled too. |
-| Dolby Vision **profile 5** 4K | **supported** — reconstructed from the per-frame RPU to HDR10, then tone-mapped (`AV_FRAME_DATA_DOVI_METADATA` → per-scene 3D-LUT + NEON tetrahedral). `tm=fast` **~1.0× (real-time)**, `tm=veryfast` ~1.06× (headroom; ordered-dithered nearest chroma — de-banded), default full-3D path ~0.60×. **At 4K→1080p, `out=half` (fused 2×2 downscale, no ISP scale) makes even `tm=accurate` real-time (~1.12–1.26×).** |
+| 10-bit HEVC **HDR10** 4K | **~1.27× real-time with correct colour** (`tm=fast`) — single-pass NEON HDR→SDR tone-map (PQ/BT.2020→BT.709). The higher-quality `tm=accurate` tier (3D-LUT, matches zscale) is now real-time too at ~1.02×. `tm=none` is ~1.23× but wrong colour (a truncation cannot fit HDR into SDR) — it exists as the unpack-only baseline. HLG sources handled too. |
+| Dolby Vision **profile 5** 4K | **supported** — reconstructed from the per-frame RPU to HDR10, then tone-mapped (`AV_FRAME_DATA_DOVI_METADATA` → per-scene 3D-LUT + NEON tetrahedral). `tm=fast` **~1.03× (real-time)**, `tm=veryfast` ~1.11× (headroom; ordered-dithered nearest chroma — de-banded), default full-3D path ~0.69×. **At 4K→1080p, `out=half` (fused 2×2 downscale, no ISP scale) makes even `tm=accurate` real-time (~1.16–1.32×)**, and at a 720p target `out=half` reaches **~1.46× on DV P5 / ~1.53× on HDR10**. |
 | H.264 / VP9 / AV1 sources | outside this pipeline (rpivid decode is HEVC-only) |
 
 **The 10-bit HEVC → 8-bit H.264 downscale pipeline is proven to run above real-time through 4K,
 for SDR, HDR10, and Dolby Vision profile 5** — HDR10 and DV P5 get a single-pass NEON tone-map
 (`tm=fast`) that keeps them real-time with correct colour (DV P5 is reconstructed from its RPU
-first). Higher-quality tone-map tiers (`tm=accurate`, and the default full-3D DV path) trade a bit
-of speed for a closer match to the zscale reference (~0.94× / ~0.60×), and `tm=veryfast` gives DV P5
-extra headroom past real-time at coarser chroma. Validated on a real library (see the status doc);
-on a 1080p transcode the pipeline is limited by the single-threaded rpivid decode thread, not the CPU.
+first). Higher-quality tone-map tiers (`tm=accurate`, and the default full-3D DV path) trade speed
+for a closer match to the zscale reference (~1.02× / ~0.69×), and `tm=veryfast` gives DV P5 extra
+headroom at coarser chroma. Validated on a real library (see the status doc); on a 1080p transcode
+the pipeline is limited by the single-threaded rpivid decode thread, not the CPU.
+
+All 4K figures were re-measured 2026-08-16 on kernel 6.18.44 and are 5–9% above the previous ones,
+after fixing the bridge filter's input mmap cache: it required a frame to be described by exactly
+one dma-buf object, so it silently disabled itself whenever the decoder split luma and chroma into
+two — always on a 6.18 kernel, sometimes on 6.1.
 
 ## Documentation (this fork)
 
