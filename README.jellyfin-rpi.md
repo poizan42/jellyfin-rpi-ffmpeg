@@ -130,8 +130,13 @@ directly from that chain** into embedded LUTs (`libavfilter/rpi_tonemap_gen.py` 
   Quality tier, near real-time (~0.94× at 4K HDR after `TM_CHUNK`=4 L1-tiling). The apply is NEON (8 chroma
   samples/iter: branchless tetrahedron select + software gather); it's ultimately gather-latency
   bound, so it stays below the fast tier.
-- `tm=none` (default) — plain truncation, byte-for-byte unchanged. **Exception:** a Dolby Vision
-  profile 5 source always engages the DV path below (truncating it would corrupt colour).
+- `tm=none` (default) — plain truncation, byte-for-byte unchanged. It means what it says for
+  **every** source, Dolby Vision included: no tone-map, no P5 reconstruction, no LUT bake. That
+  makes it the unpack-only baseline for measurement — and wrong output for any HDR source, since
+  a 10→8 truncation cannot fit a wide dynamic range into SDR. On DV P5 it is *badly* wrong
+  rather than merely flat (the base layer is Dolby's reshaped IPT-PQ), so the filter logs a
+  one-shot warning. Until 2026-08-16 it silently reconstructed P5 anyway, which made `tm=none`
+  the most expensive tier and useless as a baseline.
 
 Both tiers select their tone LUTs by the frame's transfer: **PQ/HDR10** (SMPTE2084) uses the
 `ff_rpi_tm_*` set, **HLG** (ARIB_STD_B67, incl. DV P8.4's HLG base) uses a separately baked
@@ -151,7 +156,7 @@ full 3D lookup since P5 luma is cross-channel). Validated bit-close to libplaceb
 (luma 3D lookup is heavier than HDR10's 1D luma; gather-bound). P8 (HDR10-tagged) uses the
 HDR10 tonemap above. See [`rpi-notes/pipeline/tonemap.md`](rpi-notes/pipeline/tonemap.md).
 
-P5 honours the `tm=` knob: `tm=none`/`accurate` (default) → the full 3D luma+chroma path above;
+P5 honours the `tm=` knob: `accurate` (default) → the full 3D luma+chroma path above;
 **`tm=fast`** → a faster tier that approximates luma with a 1D neutral-chroma curve (baked per-RPU
 alongside the 3D LUT) while keeping chroma the full 3D path, so it drops the ~8.3M/frame 3D luma
 lookups. **~1.0× at 4K (real-time)**; luma within ~45–51 dB of the 3D path on real frames

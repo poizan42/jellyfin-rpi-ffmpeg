@@ -152,6 +152,7 @@ typedef struct BridgeContext {
     int      peak_opt;                     /* option: override source peak nits (0 = auto) */
     int      gen_peak;                     /* nits the g_* tables hold (0 = invalid / use baked) */
     int      warned_nopeak;                /* one-shot "no zscale" fallback warning */
+    int      warned_p5_none;               /* one-shot "P5 + tm=none is wrong colour" warning */
     uint8_t *g_luma1d, *g_cb1d, *g_cr1d, *g_lut3d;      /* runtime PQ 1D+3D tables */
     uint8_t  g_l64[64], g_cb64[64], g_cr64[64], g_l64_next[64];  /* derived 64-entry NEON tables */
 } BridgeContext;
@@ -1667,10 +1668,24 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     /* Dolby Vision profile 5: RPU present + base layer NOT HDR10-tagged. Its base
      * is Dolby's reshaped IPT-PQ signal, so it must be reconstructed to HDR10 (via
      * the per-RPU 3D LUT) before tone-mapping — the generic PQ path corrupts colour.
-     * Engage regardless of `tm` (even tm=none) so P5 never passes through wrong. */
+     *
+     * `tm=none` means none, including here. It used to force P5 reconstruction
+     * anyway, on the reasoning that P5 must never pass through wrong — but
+     * tm=none is already wrong output for *any* HDR source (a 10->8 truncation
+     * cannot fit a wide dynamic range into SDR), and overriding an explicit
+     * request silently made tm=none the most expensive tier and useless as the
+     * unpack-only baseline it exists to provide. Do what was asked and warn
+     * once instead; picking the tier is the caller's job. */
     const AVFrameSideData *dovi_sd = av_frame_get_side_data(in, AV_FRAME_DATA_DOVI_METADATA);
     const int is_p5 = dovi_sd && !frame_is_hdr(in);
-    const int do_tm = is_p5 || ((s->tm != TM_NONE) && frame_is_hdr(in));
+    const int do_tm = (s->tm != TM_NONE) && (is_p5 || frame_is_hdr(in));
+    if (is_p5 && !do_tm && !s->warned_p5_none) {
+        s->warned_p5_none = 1;
+        av_log(avctx, AV_LOG_WARNING,
+               "Dolby Vision P5 with tm=none: the base layer is reshaped IPT-PQ, so "
+               "the output colour will be badly wrong, not merely flat. Use tm=fast "
+               "or higher for correct output; tm=none is for measuring the unpack.\n");
+    }
     /* HLG (ARIB_STD_B67) uses a different transfer than PQ, so its tone-map LUTs are
      * baked separately (ff_rpi_tm_*_hlg). Select by the frame's transfer. (P5 never
      * reaches here as HLG — is_p5 requires !frame_is_hdr; and its own path uses p5_lut.) */
@@ -1679,12 +1694,6 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     /* Effective apply tier for this frame. On the out=half path the nn+dither chroma
      * bands (the ISP no longer averages it back), so veryfast collapses to the tetra
      * P5_FAST; SDR/passthrough (only routed through the scratch path when half) is TM_NONE. */
-    /* tm=none on a P5 source cannot mean "don't map": you cannot fit a wide
-     * dynamic range into SDR without some mapping, and P5's base layer is
-     * Dolby's reshaped IPT-PQ signal, so passing it through unmapped is simply
-     * wrong colour. Read "none" as "spend the least time on it" and give it the
-     * cheapest correct tier, rather than falling through to the tetrahedral
-     * TM_P5 -- which made tm=none the SLOWEST option (23.1 vs 18.9 ms/frame). */
     int eff_tm;
     if (!do_tm)      eff_tm = TM_NONE;
     else if (is_p5)  eff_tm = half ? (s->tm == TM_ACCURATE ? TM_P5 : TM_P5_FAST)
@@ -1692,7 +1701,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
                                       s->tm == TM_VERYFAST ? TM_P5_VERYFAST : TM_P5_FAST);
     else             eff_tm = (s->tm == TM_VERYFAST) ? TM_FAST : s->tm;
 
-    if (is_p5) {
+    if (is_p5 && do_tm) {
         const AVDOVIMetadata *meta = (const AVDOVIMetadata *)dovi_sd->data;
         uint64_t hash = p5_calc_hash(meta);
         if (!s->p5_valid || hash != s->p5_hash) {   /* rebuild on scene/RPU change */
