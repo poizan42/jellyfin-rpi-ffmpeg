@@ -200,17 +200,27 @@ static void *map_cached(BridgeContext *s, int fd, size_t size)
 
 /* Build a SAND `mapped` view of the input DRM_PRIME frame from the cached
  * mapping (replicates hwcontext_drm.c drm_map_frame's plane + stride rework).
- * Returns the fd to SYNC(END|READ) after use, or -1 to use the fallback path. */
-static int map_input_cached(BridgeContext *s, const AVFrame *in, AVFrame *mapped)
+ * Fills sync_fds[] with the object fds to SYNC(END|READ) after use and returns
+ * how many, or -1 to use the fallback path. */
+static int map_input_cached(BridgeContext *s, const AVFrame *in, AVFrame *mapped,
+                            int *sync_fds)
 {
     if (in->format != AV_PIX_FMT_DRM_PRIME || !in->hw_frames_ctx)
         return -1;
     const AVDRMFrameDescriptor *desc = (const AVDRMFrameDescriptor *)in->data[0];
-    if (!desc || desc->nb_objects != 1)
+    void *base[AV_DRM_MAX_PLANES];
+
+    /* One dma-buf object per plane is as normal as one object holding both: the
+     * RPi decoder emits a single object on a 6.1 kernel and TWO (luma, chroma)
+     * on 6.18. This used to bail out to the per-frame av_hwframe_map path when
+     * nb_objects != 1, which silently cost ~15 ms/frame on 6.18 -- a fresh mmap
+     * of the whole ~11 MB frame every frame, so the unpack then re-faulted it
+     * page by page. Map every object through the cache instead. */
+    if (!desc || desc->nb_objects < 1 || desc->nb_objects > AV_DRM_MAX_PLANES)
         return -1;
-    void *base = map_cached(s, desc->objects[0].fd, desc->objects[0].size);
-    if (!base)
-        return -1;
+    for (int i = 0; i < desc->nb_objects; i++)
+        if (!(base[i] = map_cached(s, desc->objects[i].fd, desc->objects[i].size)))
+            return -1;
 
     mapped->format = ((AVHWFramesContext *)in->hw_frames_ctx->data)->sw_format;
     mapped->width  = in->width;
@@ -219,7 +229,10 @@ static int map_input_cached(BridgeContext *s, const AVFrame *in, AVFrame *mapped
     for (int i = 0; i < desc->nb_layers; i++) {
         const AVDRMLayerDescriptor *layer = &desc->layers[i];
         for (int p = 0; p < layer->nb_planes; p++) {
-            mapped->data[plane]     = (uint8_t *)base + layer->planes[p].offset;
+            int obj = layer->planes[p].object_index;
+            if (obj < 0 || obj >= desc->nb_objects)
+                return -1;
+            mapped->data[plane]     = (uint8_t *)base[obj] + layer->planes[p].offset;
             mapped->linesize[plane] = layer->planes[p].pitch;
             plane++;
         }
@@ -243,7 +256,9 @@ static int map_input_cached(BridgeContext *s, const AVFrame *in, AVFrame *mapped
         mapped->linesize[0] = 128;
         mapped->linesize[1] = 128;
     }
-    return desc->objects[0].fd;
+    for (int i = 0; i < desc->nb_objects; i++)
+        sync_fds[i] = desc->objects[i].fd;
+    return desc->nb_objects;
 }
 
 /* Per-output-frame descriptor holder; owned by the frame's buf[0]. The dma-buf
@@ -295,6 +310,10 @@ static av_cold int init(AVFilterContext *avctx)
      * region (RPi 6.18 -- CONFIG_DMABUF_HEAPS_CMA_LEGACY only re-adds the old
      * name for a DT-named region). Try the known names in order. */
     {
+        /* RPI_SAND_HEAP overrides the search, for A/B-ing heaps: their memory
+         * attributes (cached vs write-combine) differ and that is worth being
+         * able to measure without a rebuild. */
+        const char *forced = getenv("RPI_SAND_HEAP");
         static const char *const heap_names[] = {
             "/dev/dma_heap/linux,cma",
             "/dev/dma_heap/default_cma_region",
@@ -303,7 +322,13 @@ static av_cold int init(AVFilterContext *avctx)
         unsigned int i;
 
         s->heap_fd = -1;
-        for (i = 0; i < FF_ARRAY_ELEMS(heap_names); i++) {
+        if (forced && *forced) {
+            s->heap_fd = open(forced, O_RDWR | O_CLOEXEC);
+            av_log(avctx, s->heap_fd >= 0 ? AV_LOG_VERBOSE : AV_LOG_WARNING,
+                   "RPI_SAND_HEAP=%s: %s\n", forced,
+                   s->heap_fd >= 0 ? "using it" : strerror(errno));
+        }
+        for (i = 0; s->heap_fd < 0 && i < FF_ARRAY_ELEMS(heap_names); i++) {
             s->heap_fd = open(heap_names[i], O_RDWR | O_CLOEXEC);
             if (s->heap_fd >= 0) {
                 av_log(avctx, AV_LOG_VERBOSE, "Using CMA dma-heap %s\n", heap_names[i]);
@@ -1568,7 +1593,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     AVFrame *mapped = NULL, *tmp = NULL, *out = NULL;
     OutBuf *b = NULL;
     int idx = -1, fd = -1;
-    int sync_fd = -1;
+    int sync_fds[AV_DRM_MAX_PLANES], n_sync = -1;
     void *map = NULL;
     int rv;
     int64_t _t0;
@@ -1582,10 +1607,11 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     _t0 = prof_on ? prof_now() : 0;
 
     if (!(mapped = av_frame_alloc())) { rv = AVERROR(ENOMEM); goto fail; }
-    sync_fd = map_input_cached(s, in, mapped);
-    if (sync_fd >= 0) {
+    n_sync = map_input_cached(s, in, mapped, sync_fds);
+    if (n_sync > 0) {
         /* cached fast path: persistent mmap, invalidate for this frame's read */
-        dmabuf_sync(sync_fd, DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ);
+        for (int i = 0; i < n_sync; i++)
+            dmabuf_sync(sync_fds[i], DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ);
     } else {
         /* fail-safe: fresh per-frame map (mmap + invalidate + munmap on free) */
         mapped->format = AV_PIX_FMT_NONE;
@@ -1795,7 +1821,8 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
         out->hw_frames_ctx = av_buffer_ref(in->hw_frames_ctx);
     PROF(3);
 
-    if (sync_fd >= 0) dmabuf_sync(sync_fd, DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ);
+    for (int i = 0; i < n_sync; i++)
+        dmabuf_sync(sync_fds[i], DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ);
     av_frame_free(&mapped);   /* cached: frees struct only (no buf); fallback: unmaps */
     PROF(4);
     av_frame_free(&tmp);
