@@ -19,6 +19,7 @@
 #include <time.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <linux/dma-buf.h>
 #include <drm.h>
 #include <libdrm/drm_fourcc.h>
@@ -102,13 +103,28 @@ typedef struct SandPool {
     PoolBuf pool[POOL_N];
 } SandPool;
 
-/* Lever 2: persistent fd-keyed mmap cache for the decoder's input SAND buffers.
- * The decoder recycles a fixed set of dma-buf fds, so mapping them once (instead
- * of a fresh mmap+munmap of ~16 MB per frame in av_hwframe_map) removes that
- * per-frame churn; only the mandatory cache-invalidate stays. filter_frame is
- * single-threaded, so the cache needs no lock. */
-#define MAP_CACHE_N 32
-typedef struct MapEnt { int fd; void *addr; size_t size; } MapEnt;
+/* Lever 2: persistent mmap cache for the decoder's input SAND buffers. Mapping
+ * each buffer once (instead of a fresh mmap+munmap of ~16 MB per frame in
+ * av_hwframe_map) removes that per-frame churn; only the mandatory
+ * cache-invalidate stays. filter_frame is single-threaded, so no lock.
+ *
+ * Keyed on the dma-buf's INODE, not the fd number: fd numbers are recycled by
+ * the kernel once a buffer is closed, so an fd-keyed entry could hand back a
+ * mapping of a *different*, already-freed buffer. A dma-buf's inode is stable
+ * for the buffer's life however many fds refer to it. On a miss with a full
+ * cache we evict the least recently used entry rather than giving up and
+ * degrading to the per-frame map/unmap path forever, as the old code did once
+ * 32 distinct buffers had been seen.
+ *
+ * NOTE: this is a correctness/robustness fix, NOT a fix for the 6.18 slowdown.
+ * Measured on 6.18.44: identical mmap counts (124 per 60 frames) and identical
+ * minor-fault counts (1.95M per 300 frames) before and after, because on that
+ * kernel every dequeued frame arrives as a genuinely NEW dma-buf -- the fd
+ * numbers cycle through a small set but the underlying objects differ, so no
+ * cache keyed on buffer identity can hit. See
+ * investigations/dv-6.18-filter-regression.md in the research repo. */
+#define MAP_CACHE_N 64
+typedef struct MapEnt { ino_t ino; void *addr; size_t size; uint64_t used; } MapEnt;
 
 typedef struct BridgeContext {
     const AVClass *class;
@@ -117,6 +133,7 @@ typedef struct BridgeContext {
     AVBufferRef *drm_device; /* lazily created for the software-input fallback path */
     MapEnt   mcache[MAP_CACHE_N];
     int      mcache_n;
+    uint64_t mcache_clock;   /* LRU stamp source for mcache[].used */
     unsigned mmap_count;   /* SAND_PROF: distinct input buffers mmap'd (should plateau) */
     int      tm;           /* TM_NONE / TM_FAST / TM_ACCURATE (option) */
     int      out_half;     /* out= option: 0 full, 1 half (emit input/2, drop ISP scale) */
@@ -143,17 +160,40 @@ typedef struct BridgeContext {
  * caller to fall back to av_hwframe_map (cache full / mmap failed). */
 static void *map_cached(BridgeContext *s, int fd, size_t size)
 {
+    struct stat st;
+    int slot;
+
     if (fd < 0 || size == 0)   /* degenerate descriptor (e.g. a frame whose dma-buf never allocated) */
         return NULL;
+    if (fstat(fd, &st) != 0)   /* no stable identity -> caller falls back */
+        return NULL;
+
     for (int i = 0; i < s->mcache_n; i++)
-        if (s->mcache[i].fd == fd && s->mcache[i].size == size)
+        if (s->mcache[i].ino == st.st_ino && s->mcache[i].size == size) {
+            s->mcache[i].used = ++s->mcache_clock;
             return s->mcache[i].addr;
-    if (s->mcache_n >= MAP_CACHE_N)
-        return NULL;
+        }
+
+    if (s->mcache_n < MAP_CACHE_N) {
+        slot = s->mcache_n++;
+    } else {
+        /* Evict the least recently used mapping. Dropping it is safe: a mapping
+         * is independent of the fd it came from, and any frame still using the
+         * old address has already finished with it (filter_frame is serial). */
+        slot = 0;
+        for (int i = 1; i < s->mcache_n; i++)
+            if (s->mcache[i].used < s->mcache[slot].used)
+                slot = i;
+        munmap(s->mcache[slot].addr, s->mcache[slot].size);
+    }
+
     void *m = mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
-    if (m == MAP_FAILED)
+    if (m == MAP_FAILED) {
+        if (slot == s->mcache_n - 1)
+            s->mcache_n--;     /* undo the slot we just claimed */
         return NULL;
-    s->mcache[s->mcache_n++] = (MapEnt){ fd, m, size };
+    }
+    s->mcache[slot] = (MapEnt){ st.st_ino, m, size, ++s->mcache_clock };
     s->mmap_count++;
     return m;
 }
