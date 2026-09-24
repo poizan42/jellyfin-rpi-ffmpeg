@@ -168,6 +168,7 @@ typedef struct DeintV4L2M2MContextShared {
     atomic_uint refcount;
 
     AVBufferRef *hw_frames_ctx;
+    AVBufferRef *drm_device;    // only when the input brings no frames context
 
     unsigned int field_order;
 
@@ -1486,6 +1487,7 @@ static void deint_v4l2m2m_destroy_context(DeintV4L2M2MContextShared *ctx)
         deint_v4l2m2m_unref_queued(output);
 
         av_buffer_unref(&ctx->hw_frames_ctx);
+        av_buffer_unref(&ctx->drm_device);
 
         if (capture->buffers)
             av_free(capture->buffers);
@@ -1595,6 +1597,78 @@ static int deint_v4l2m2m_dequeue_frame(V4L2Queue *queue, AVFrame* frame, int tim
     return 0;
 }
 
+/* Give the output link -- and every frame we emit -- a DRM frames context that
+ * describes what the capture queue really produces. Without one, libavfilter
+ * copies the INPUT's context onto the output link: the pre-scale size, and for a
+ * SAND input the wrong layout. A consumer that trusts it (hwdownload, hwmap)
+ * then either refuses the frames or mis-maps them, so e.g. burning subtitles in
+ * after a hardware scale was impossible.
+ *
+ * The label is only honest if the capture format is pinned to it, so when no
+ * format= was given we pin it to the input's (already the default capture
+ * format for linear YU12/NV12 input, so nothing changes on the wire). Inputs we
+ * cannot describe that way (SAND, or no input frames context and no format=)
+ * keep the old behaviour; pass format=yuv420p to get a downloadable output.
+ * Setting an output context at all requires FF_FILTER_FLAG_HWFRAME_AWARE, so the
+ * old pass-through is now done explicitly. */
+static int deint_v4l2m2m_config_hw_frames(AVFilterContext *avctx,
+                                          AVFilterLink *inlink, AVFilterLink *outlink)
+{
+    DeintV4L2M2MContext *priv      = avctx->priv;
+    DeintV4L2M2MContextShared *ctx = priv->shared;
+    FilterLink *inl  = ff_filter_link(inlink);
+    FilterLink *outl = ff_filter_link(outlink);
+    AVHWFramesContext *in_fc = inl->hw_frames_ctx ?
+        (AVHWFramesContext *)inl->hw_frames_ctx->data : NULL;
+    enum AVPixelFormat sw_format = ctx->output_format;
+    AVBufferRef *device_ref, *ref;
+    AVHWFramesContext *fc;
+    int ret;
+
+    av_buffer_unref(&outl->hw_frames_ctx);
+    if (sw_format == AV_PIX_FMT_NONE && in_fc)
+        sw_format = in_fc->sw_format;
+    if (sw_format != AV_PIX_FMT_YUV420P && sw_format != AV_PIX_FMT_NV12) {
+        /* Can't describe it: keep what libavfilter did for us before this
+         * filter was hwframe-aware -- pass the input's context through. */
+        if (inl->hw_frames_ctx &&
+            !(outl->hw_frames_ctx = av_buffer_ref(inl->hw_frames_ctx)))
+            return AVERROR(ENOMEM);
+        return 0;
+    }
+
+    if (in_fc) {
+        device_ref = in_fc->device_ref;
+    } else {
+        if (!ctx->drm_device &&
+            (ret = av_hwdevice_ctx_create(&ctx->drm_device, AV_HWDEVICE_TYPE_DRM,
+                                          NULL, NULL, 0)) < 0) {
+            av_log(avctx, AV_LOG_ERROR, "Cannot create DRM device: %s\n", av_err2str(ret));
+            return ret;
+        }
+        device_ref = ctx->drm_device;
+    }
+
+    if (!(ref = av_hwframe_ctx_alloc(device_ref)))
+        return AVERROR(ENOMEM);
+    fc = (AVHWFramesContext *)ref->data;
+    fc->format    = AV_PIX_FMT_DRM_PRIME;
+    fc->sw_format = sw_format;
+    fc->width     = outlink->w;
+    fc->height    = outlink->h;
+    if ((ret = av_hwframe_ctx_init(ref)) < 0) {
+        av_buffer_unref(&ref);
+        return ret;
+    }
+
+    ctx->output_format = sw_format;
+    av_buffer_unref(&ctx->hw_frames_ctx);
+    ctx->hw_frames_ctx = ref;
+    if (!(outl->hw_frames_ctx = av_buffer_ref(ref)))
+        return AVERROR(ENOMEM);
+    return 0;
+}
+
 static int deint_v4l2m2m_config_props(AVFilterLink *outlink)
 {
     AVFilterLink *inlink           = outlink->src->inputs[0];
@@ -1633,6 +1707,9 @@ static int deint_v4l2m2m_config_props(AVFilterLink *outlink)
         outlink->sample_aspect_ratio = av_mul_q((AVRational){outlink->h * inlink->w, outlink->w * inlink->h}, inlink->sample_aspect_ratio);
     else
         outlink->sample_aspect_ratio = inlink->sample_aspect_ratio;
+
+    if ((ret = deint_v4l2m2m_config_hw_frames(avctx, inlink, outlink)) < 0)
+        return ret;
 
     return deint_v4l2m2m_find_device(ctx);
 }
@@ -2085,6 +2162,7 @@ FFFilter ff_vf_deinterlace_v4l2m2m = {
     FILTER_OUTPUTS(deint_v4l2m2m_outputs),
     FILTER_SINGLE_PIXFMT(AV_PIX_FMT_DRM_PRIME),
     .activate       = deint_v4l2m2m_activate,
+    .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE,
 };
 
 FFFilter ff_vf_scale_v4l2m2m = {
@@ -2098,5 +2176,6 @@ FFFilter ff_vf_scale_v4l2m2m = {
     FILTER_OUTPUTS(deint_v4l2m2m_outputs),
     FILTER_SINGLE_PIXFMT(AV_PIX_FMT_DRM_PRIME),
     .activate       = deint_v4l2m2m_activate,
+    .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE,
 };
 

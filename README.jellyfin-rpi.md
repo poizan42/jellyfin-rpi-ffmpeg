@@ -179,7 +179,16 @@ tier; fast/accurate stay the defaults. On HDR10/HLG sources `tm=veryfast` is ide
 Deferred (see [`rpi-notes/pipeline/tonemap.md`](rpi-notes/pipeline/tonemap.md)): command-line-tunable peak/operator/saturation, a BT.2390
 operator (`op=bt2390`), non-1000-nit peaks, 32-bit ARM parity for the tone LUTs.
 
-### 4. Build enablement for the HDR reference
+### 4. `scale_v4l2m2m` output is downloadable  (`libavfilter/vf_deinterlace_v4l2m2m.c`)
+The ISP filters now publish an output **frames context** — DRM_PRIME, at the *output* size,
+`sw_format` YUV420P or NV12 — and attach it to every frame (the context field existed but was
+never set). Before, libavfilter copied the *input's* context onto the output link, so `hwdownload`
+passed configuration and then refused every frame ("Input frames must have hardware context").
+That made anything needing CPU frames after the hardware scale impossible — in practice, burning
+text subtitles in. The capture format is pinned to the label so it stays honest; inputs it can't
+describe that way (SAND, or no input context and no `format=`) keep the old pass-through.
+
+### 5. Build enablement for the HDR reference
 `--enable-libzimg` (`zscale`) gives a correct CPU HDR→SDR reference (`zscale+tonemap`).
 `--enable-libplacebo --enable-vulkan` link a **locally rebuilt** libplacebo 7.360 (Debian
 bookworm ships 4.208, too old for FFmpeg 8.x; its shaderc is also broken).
@@ -317,6 +326,16 @@ downscale into the tone-map and emits 1080p directly (no `scale_v4l2m2m`), which
 ```sh
        -vf sand_to_yuv420p_drm=tm=accurate:out=half
 ```
+
+**Burning in subtitles** (libass needs CPU frames): download *after* the hardware scale, so only
+output-size frames reach the CPU. 1080p 10-bit HEVC with dense ASS typesetting: 2.43× at 720p.
+
+```sh
+       -vf "sand_to_yuv420p_drm,scale_v4l2m2m=1280:720,hwdownload,format=yuv420p,subtitles=f='subs.ass'"
+```
+
+With no resize and an SDR source, let the decoder's NEON SAND download produce the CPU frames
+directly — `-hwaccel_output_format yuv420p -vf "subtitles=f='subs.ass'"` (2.02× vs 1.82× via the filter).
 
 ## Performance (Pi 4B, 600-frame steady-state, → 720p)
 
