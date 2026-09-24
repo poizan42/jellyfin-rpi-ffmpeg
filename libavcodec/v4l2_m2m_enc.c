@@ -161,6 +161,74 @@ static inline unsigned int v4l2_h264_profile_from_ff(int p)
     return AVERROR(ENOENT);
 }
 
+/* H.264 levels this encoder can be told about, with the Table A-1 limits that
+ * decide which one a stream needs: MaxMBPS (macroblocks/s) and MaxFS
+ * (macroblocks/frame). */
+static const struct h264_level {
+    int ff_level;               /* AVCodecContext.level: 10*major + minor */
+    unsigned int v4l2_val;
+    int64_t max_mbps;
+    int max_fs;
+} h264_levels[] = {
+    { 10, MPEG_VIDEO(H264_LEVEL_1_0),   1485,    99 },
+    { 11, MPEG_VIDEO(H264_LEVEL_1_1),   3000,   396 },
+    { 12, MPEG_VIDEO(H264_LEVEL_1_2),   6000,   396 },
+    { 13, MPEG_VIDEO(H264_LEVEL_1_3),  11880,   396 },
+    { 20, MPEG_VIDEO(H264_LEVEL_2_0),  11880,   396 },
+    { 21, MPEG_VIDEO(H264_LEVEL_2_1),  19800,   792 },
+    { 22, MPEG_VIDEO(H264_LEVEL_2_2),  20250,  1620 },
+    { 30, MPEG_VIDEO(H264_LEVEL_3_0),  40500,  1620 },
+    { 31, MPEG_VIDEO(H264_LEVEL_3_1), 108000,  3600 },
+    { 32, MPEG_VIDEO(H264_LEVEL_3_2), 216000,  5120 },
+    { 40, MPEG_VIDEO(H264_LEVEL_4_0), 245760,  8192 },
+    { 41, MPEG_VIDEO(H264_LEVEL_4_1), 245760,  8192 },
+    { 42, MPEG_VIDEO(H264_LEVEL_4_2), 522240,  8704 },
+    { 50, MPEG_VIDEO(H264_LEVEL_5_0), 589824, 22080 },
+    { 51, MPEG_VIDEO(H264_LEVEL_5_1), 983040, 36864 },
+};
+
+/* The level to request, or NULL to leave the driver's default alone.
+ *
+ * An explicit -level is honoured as given. Otherwise pick the lowest level
+ * that fits the stream -- but never below 4.0, the driver's default, so every
+ * stream that already worked keeps exactly the SPS it had.
+ *
+ * Why this matters: the firmware validates the DECLARED frame rate against the
+ * level, and refuses to stream (a bare ESRCH at STREAMON, "output set status ON
+ * failed") when it doesn't fit. At the default 4.0 that rejects every 1080p50/60
+ * encode: 8160 MB/frame x 60 = 489,600 > 245,760. */
+static const struct h264_level *v4l2_h264_level(AVCodecContext *avctx)
+{
+    int64_t mbs, mbps;
+    int i;
+
+    if (avctx->level != AV_LEVEL_UNKNOWN) {
+        for (i = 0; i < FF_ARRAY_ELEMS(h264_levels); i++)
+            if (h264_levels[i].ff_level == avctx->level)
+                return &h264_levels[i];
+        av_log(avctx, AV_LOG_WARNING, "h264 level %d not supported, using the "
+               "driver default\n", avctx->level);
+        return NULL;
+    }
+    if (avctx->width <= 0 || avctx->height <= 0 ||
+        avctx->framerate.num <= 0 || avctx->framerate.den <= 0)
+        return NULL;
+
+    mbs  = (int64_t)((avctx->width + 15) / 16) * ((avctx->height + 15) / 16);
+    mbps = av_rescale(mbs, avctx->framerate.num, avctx->framerate.den);
+    for (i = 0; i < FF_ARRAY_ELEMS(h264_levels); i++) {
+        const struct h264_level *l = &h264_levels[i];
+        if (l->ff_level < 40)
+            continue;
+        if (l->max_mbps >= mbps && l->max_fs >= mbs)
+            return l->ff_level == 40 ? NULL : l;
+    }
+    av_log(avctx, AV_LOG_WARNING, "%dx%d at %d/%d fps (%"PRId64" MB/s) exceeds "
+           "every H.264 level; the encoder will likely refuse it\n",
+           avctx->width, avctx->height, avctx->framerate.num, avctx->framerate.den, mbps);
+    return NULL;
+}
+
 static inline int v4l2_mpeg4_profile_from_ff(int p)
 {
     static const struct mpeg4_profile {
@@ -248,6 +316,14 @@ static int v4l2_prepare_encoder(V4L2m2mContext *s)
                 av_log(avctx, AV_LOG_WARNING, "h264 profile not found\n");
             else
                 v4l2_set_ext_ctrl(s, MPEG_CID(H264_PROFILE), val, "h264 profile", 1);
+        }
+        {
+            const struct h264_level *l = v4l2_h264_level(avctx);
+            if (l) {
+                av_log(avctx, AV_LOG_VERBOSE, "h264 level %d.%d\n",
+                       l->ff_level / 10, l->ff_level % 10);
+                v4l2_set_ext_ctrl(s, MPEG_CID(H264_LEVEL), l->v4l2_val, "h264 level", 1);
+            }
         }
         qmin_cid = MPEG_CID(H264_MIN_QP);
         qmax_cid = MPEG_CID(H264_MAX_QP);

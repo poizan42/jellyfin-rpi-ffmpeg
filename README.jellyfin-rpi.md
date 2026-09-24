@@ -188,7 +188,20 @@ That made anything needing CPU frames after the hardware scale impossible — in
 text subtitles in. The capture format is pinned to the label so it stays honest; inputs it can't
 describe that way (SAND, or no input context and no `format=`) keep the old pass-through.
 
-### 5. Build enablement for the HDR reference
+### 5. `h264_v4l2m2m` picks its H.264 level  (`libavcodec/v4l2_m2m_enc.c`)
+The encoder never set `V4L2_CID_MPEG_VIDEO_H264_LEVEL`, so every stream was level 4.0, and the
+firmware checks the **declared** frame rate against the level. Over it, it refuses to stream with a
+bare `ESRCH` at STREAMON ("output set status ON failed: err=No such process"). At 4.0 (245,760
+macroblocks/s) that rejects **every 1080p50/60 encode** (8160 MB × 60 = 489,600), and the boundary is
+exact: 1920×804 streams at 40 fps and fails at 41.
+
+Now an explicit `-level` is honoured, and otherwise the lowest level that fits is chosen — but never
+below 4.0, so anything that already worked keeps the SPS it had (no level control is issued at all).
+1080p50/60 gets 4.2 and runs 1.37× / 1.03× on a hardware-decoded 10-bit HEVC source. The driver
+notes the hardware is specified to 4.0 and that higher levels "may not be able to keep up with
+real-time"; the raw encoder ceiling measures ~72 fps at 1080p.
+
+### 6. Build enablement for the HDR reference
 `--enable-libzimg` (`zscale`) gives a correct CPU HDR→SDR reference (`zscale+tonemap`).
 `--enable-libplacebo --enable-vulkan` link a **locally rebuilt** libplacebo 7.360 (Debian
 bookworm ships 4.208, too old for FFmpeg 8.x; its shaderc is also broken).
