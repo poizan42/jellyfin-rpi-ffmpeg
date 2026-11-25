@@ -201,7 +201,22 @@ below 4.0, so anything that already worked keeps the SPS it had (no level contro
 notes the hardware is specified to 4.0 and that higher levels "may not be able to keep up with
 real-time"; the raw encoder ceiling measures ~72 fps at 1080p.
 
-### 6. Build enablement for the HDR reference
+### 6. `overlay` skips the transparent part of the overlay  (`libavfilter/vf_overlay.c`)
+Graphical subtitles (PGS, VobSub, DVB) are burned in by overlaying a **full-frame canvas** that is
+transparent but for a line or two of text, and often entirely transparent, onto every frame. Stock
+`overlay` blends every pixel of it, in plain C on aarch64 (only x86 has a `blend_row` asm). On a
+1080p PGS transcode that was **40% of all CPU samples**, more than the NEON SAND download.
+
+Now, for a planar overlay with straight alpha onto a main without alpha (every `yuv4xx[p10]`/`gbrp`
+`format=`, Jellyfin's case), `do_blend` first finds the bounding box of non-zero alpha and blends
+only that, or nothing at all when the canvas is empty. A zero-alpha pixel leaves the output
+unchanged, and the box is aligned to whole chroma units and grown by one more at the right and
+bottom so every chroma sample in it averages the same alpha neighbours as before: **bit-exact**
+(42 synthetic cases across all seven formats, at odd/negative/edge positions, against the previous
+build; 1500 real PGS frames; FATE `filter-overlay*`). 1080p 10-bit HEVC + PGS → 1080p, hardware
+decode: 1.62× / 2.7 cores → **1.85× / 2.0 cores**; → 720p via the ISP: 2.17× → 2.39×.
+
+### 7. Build enablement for the HDR reference
 `--enable-libzimg` (`zscale`) gives a correct CPU HDR→SDR reference (`zscale+tonemap`).
 `--enable-libplacebo --enable-vulkan` link a **locally rebuilt** libplacebo 7.360 (Debian
 bookworm ships 4.208, too old for FFmpeg 8.x; its shaderc is also broken).

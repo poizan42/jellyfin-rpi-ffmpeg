@@ -32,6 +32,7 @@
 #include "libavutil/avstring.h"
 #include "libavutil/pixdesc.h"
 #include "libavutil/imgutils.h"
+#include "libavutil/intreadwrite.h"
 #include "libavutil/mathematics.h"
 #include "libavutil/opt.h"
 #include "libavutil/timestamp.h"
@@ -842,6 +843,87 @@ static int init_slice_fn(AVFilterContext *ctx)
     return 0;
 }
 
+/**
+ * Shrink the overlay to the part that can change the output.
+ *
+ * Graphical subtitles (PGS, DVB, VobSub) arrive as a full-canvas picture that
+ * is transparent everywhere but a line or two of text, and usually transparent
+ * everywhere -- yet the blend visits every pixel of every frame. With a straight
+ * alpha overlay and no main alpha, a pixel whose alpha is 0 leaves the output
+ * unchanged, so blending only the bounding box of non-zero alpha is identical.
+ *
+ * The box is aligned to whole chroma units, and grown by one more at the right
+ * and bottom, so every chroma sample it contains sees the same alpha neighbours
+ * (blend_plane's "j+1 < src_hp" / "k+1 < src_wp" edge tests) as in the full
+ * picture: the result stays bit-exact.
+ *
+ * @return 0 if no pixel is visible (nothing to blend), 1 with *view set to a
+ *         borrowed (not ref-counted) window into src and *dx, *dy its offset.
+ */
+static int crop_to_visible(const OverlayContext *s, const AVPixFmtDescriptor *desc,
+                           const AVFrame *src, AVFrame *view, int *dx, int *dy)
+{
+    const int bpp  = s->overlay_pix_step[3];
+    const int wb   = src->width * bpp;
+    const int hs   = 1 << desc->log2_chroma_w, vs = 1 << desc->log2_chroma_h;
+    int top = -1, bottom = -1, left = wb, right = -1;
+    int x0, y0, x1, y1;
+
+    for (int j = 0; j < src->height; j++) {
+        const uint8_t *row = src->data[3] + j * src->linesize[3];
+        uint64_t any = 0;
+        int i = 0;
+        for (; i + 8 <= wb; i += 8)
+            any |= AV_RN64(row + i);
+        for (; i < wb; i++)
+            any |= row[i];
+        if (!any)
+            continue;
+        if (top < 0)
+            top = j;
+        bottom = j;
+        for (i = 0; i < left && !row[i]; i++)
+            ;
+        left = i;
+        for (i = wb - 1; i > right && !row[i]; i--)
+            ;
+        right = i;
+    }
+    if (top < 0)
+        return 0;
+
+    x0 = (left / bpp) & ~(hs - 1);
+    y0 = top & ~(vs - 1);
+    x1 = FFMIN(FFALIGN(right / bpp + 1 + hs, hs), src->width);
+    y1 = FFMIN(FFALIGN(bottom + 1 + vs, vs), src->height);
+
+    *view = *src;
+    view->width  = x1 - x0;
+    view->height = y1 - y0;
+    for (int p = 0; p < 4 && src->data[p]; p++) {
+        const int sh = (p == 1 || p == 2) ? desc->log2_chroma_w : 0;
+        const int sv = (p == 1 || p == 2) ? desc->log2_chroma_h : 0;
+        view->data[p] = src->data[p] + (y0 >> sv) * src->linesize[p] +
+                        (x0 >> sh) * s->overlay_pix_step[p];
+    }
+    *dx = x0;
+    *dy = y0;
+    return 1;
+}
+
+static int can_crop_to_visible(const AVFilterContext *ctx, const OverlayContext *s)
+{
+    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(ctx->inputs[OVERLAY]->format);
+
+    /* Planar overlay with its alpha in plane 3, straight alpha (zero alpha is
+     * then a no-op), and no main alpha to composite. */
+    return !s->main_has_alpha && !s->overlay_is_packed_rgb &&
+           (desc->flags & AV_PIX_FMT_FLAG_PLANAR) &&
+           (desc->flags & AV_PIX_FMT_FLAG_ALPHA) &&
+           desc->comp[3].plane == 3 &&
+           ctx->inputs[OVERLAY]->alpha_mode != AVALPHA_MODE_PREMULTIPLIED;
+}
+
 static int do_blend(FFFrameSync *fs)
 {
     AVFilterContext *ctx = fs->parent;
@@ -878,13 +960,27 @@ static int do_blend(FFFrameSync *fs)
     if (s->x < mainpic->width  && s->x + second->width  >= 0 &&
         s->y < mainpic->height && s->y + second->height >= 0) {
         ThreadData td;
+        AVFrame view;
+        const int x = s->x, y = s->y;
+        int dx = 0, dy = 0;
 
         init_slice_fn(ctx);
 
         td.dst = mainpic;
         td.src = second;
-        ff_filter_execute(ctx, s->blend_slice, &td, NULL, FFMIN(FFMAX(1, FFMIN3(s->y + second->height, FFMIN(second->height, mainpic->height), mainpic->height - s->y)),
+        if (can_crop_to_visible(ctx, s)) {
+            if (!crop_to_visible(s, av_pix_fmt_desc_get(ctx->inputs[OVERLAY]->format),
+                                 second, &view, &dx, &dy))
+                return ff_filter_frame(ctx->outputs[0], mainpic);
+            td.src = &view;
+        }
+        /* The slice functions read the position from the context. */
+        s->x = x + dx;
+        s->y = y + dy;
+        ff_filter_execute(ctx, s->blend_slice, &td, NULL, FFMIN(FFMAX(1, FFMIN3(s->y + td.src->height, FFMIN(td.src->height, mainpic->height), mainpic->height - s->y)),
                                                                 ff_filter_get_nb_threads(ctx)));
+        s->x = x;
+        s->y = y;
     }
     return ff_filter_frame(ctx->outputs[0], mainpic);
 }
