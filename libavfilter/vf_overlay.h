@@ -80,6 +80,12 @@ typedef struct OverlayContext {
     int (*blend_row[4])(uint8_t *d, uint8_t *da, uint8_t *s, uint8_t *a, int w,
                         ptrdiff_t alinesize);
     int (*blend_slice)(AVFilterContext *ctx, void *arg, int jobnr, int nb_jobs);
+
+    /* The visible box of the last overlay picture (see crop_to_visible()). */
+    AVBufferRef *vis_buf;       ///< its alpha plane's buffer, held
+    const uint8_t *vis_data;
+    int vis_linesize, vis_w, vis_h, vis_format;
+    int vis_visible, vis_box[4];
 } OverlayContext;
 
 void ff_overlay_init_x86(AVFilterContext *ctx);

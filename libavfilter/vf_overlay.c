@@ -83,6 +83,7 @@ static av_cold void uninit(AVFilterContext *ctx)
     OverlayContext *s = ctx->priv;
 
     ff_framesync_uninit(&s->fs);
+    av_buffer_unref(&s->vis_buf);
     av_expr_free(s->x_pexpr); s->x_pexpr = NULL;
     av_expr_free(s->y_pexpr); s->y_pexpr = NULL;
 }
@@ -857,17 +858,22 @@ static int init_slice_fn(AVFilterContext *ctx)
  * (blend_plane's "j+1 < src_hp" / "k+1 < src_wp" edge tests) as in the full
  * picture: the result stays bit-exact.
  *
+ * The box is remembered per overlay picture: sub2video re-sends the same canvas
+ * on every video frame while a subtitle is up, so it is found once per subtitle
+ * rather than once per frame. A later frame is that same picture when its alpha
+ * plane is the same buffer at the same place; the reference held to it means
+ * the buffer can't have been freed and handed out again, nor written to.
+ *
  * @return 0 if no pixel is visible (nothing to blend), 1 with *view set to a
  *         borrowed (not ref-counted) window into src and *dx, *dy its offset.
  */
-static int crop_to_visible(const OverlayContext *s, const AVPixFmtDescriptor *desc,
-                           const AVFrame *src, AVFrame *view, int *dx, int *dy)
+static int visible_box(const OverlayContext *s, const AVPixFmtDescriptor *desc,
+                       const AVFrame *src, int box[4])
 {
     const int bpp  = s->overlay_pix_step[3];
     const int wb   = src->width * bpp;
     const int hs   = 1 << desc->log2_chroma_w, vs = 1 << desc->log2_chroma_h;
     int top = -1, bottom = -1, left = wb, right = -1;
-    int x0, y0, x1, y1;
 
     for (int j = 0; j < src->height; j++) {
         const uint8_t *row = src->data[3] + j * src->linesize[3];
@@ -892,10 +898,39 @@ static int crop_to_visible(const OverlayContext *s, const AVPixFmtDescriptor *de
     if (top < 0)
         return 0;
 
-    x0 = (left / bpp) & ~(hs - 1);
-    y0 = top & ~(vs - 1);
-    x1 = FFMIN(FFALIGN(right / bpp + 1 + hs, hs), src->width);
-    y1 = FFMIN(FFALIGN(bottom + 1 + vs, vs), src->height);
+    box[0] = (left / bpp) & ~(hs - 1);
+    box[1] = top & ~(vs - 1);
+    box[2] = FFMIN(FFALIGN(right / bpp + 1 + hs, hs), src->width);
+    box[3] = FFMIN(FFALIGN(bottom + 1 + vs, vs), src->height);
+    return 1;
+}
+
+static int crop_to_visible(OverlayContext *s, const AVPixFmtDescriptor *desc,
+                           const AVFrame *src, AVFrame *view, int *dx, int *dy)
+{
+    AVBufferRef *abuf = av_frame_get_plane_buffer(src, 3);
+    int x0, y0, x1, y1;
+
+    if (!abuf || !s->vis_buf || abuf->buffer != s->vis_buf->buffer ||
+        src->data[3] != s->vis_data || src->linesize[3] != s->vis_linesize ||
+        src->width != s->vis_w || src->height != s->vis_h ||
+        src->format != s->vis_format) {
+        av_buffer_unref(&s->vis_buf);
+        s->vis_visible = visible_box(s, desc, src, s->vis_box);
+        if (abuf && (s->vis_buf = av_buffer_ref(abuf))) {
+            s->vis_data     = src->data[3];
+            s->vis_linesize = src->linesize[3];
+            s->vis_w        = src->width;
+            s->vis_h        = src->height;
+            s->vis_format   = src->format;
+        }
+    }
+    if (!s->vis_visible)
+        return 0;
+    x0 = s->vis_box[0];
+    y0 = s->vis_box[1];
+    x1 = s->vis_box[2];
+    y1 = s->vis_box[3];
 
     *view = *src;
     view->width  = x1 - x0;

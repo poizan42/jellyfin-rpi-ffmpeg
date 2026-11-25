@@ -174,6 +174,13 @@ typedef struct ScaleContext {
 
     int eval_mode;              ///< expression evaluation mode
 
+    /**
+     * Repeated-input reuse (see same_picture()). last_in is a reference to the
+     * previous input, held only when someone else also held it; last_out is the
+     * previous output, held only once a repeat has actually been seen.
+     */
+    AVFrame *last_in;
+    AVFrame *last_out;
 } ScaleContext;
 
 const FFFilter ff_vf_scale2ref;
@@ -438,9 +445,16 @@ static av_cold int init(AVFilterContext *ctx)
     return 0;
 }
 
+static void reset_reuse(ScaleContext *scale)
+{
+    av_frame_free(&scale->last_in);
+    av_frame_free(&scale->last_out);
+}
+
 static av_cold void uninit(AVFilterContext *ctx)
 {
     ScaleContext *scale = ctx->priv;
+    reset_reuse(scale);
     av_expr_free(scale->w_pexpr);
     av_expr_free(scale->h_pexpr);
     scale->w_pexpr = scale->h_pexpr = NULL;
@@ -630,6 +644,8 @@ static int config_props(AVFilterLink *outlink)
     double w_adj = 1.0;
     int ret;
 
+    reset_reuse(scale);         /* the conversion may be about to change */
+
     if ((ret = scale_eval_dimensions(ctx)) < 0)
         goto fail;
 
@@ -741,6 +757,110 @@ static int request_frame_ref(AVFilterLink *outlink)
 }
 
 /* Takes over ownership of *frame_in, passes ownership of *frame_out to caller */
+/**
+ * Whether b is the very picture a was: the same buffers at the same offsets,
+ * described the same way. Content equality follows because the caller holds a
+ * reference to a: its buffers can't be freed and handed out again while
+ * referenced, and a buffer with more than one reference is not writable.
+ *
+ * This is what sub2video produces: while a subtitle is displayed, every
+ * heartbeat re-sends the same canvas, and a scale converting it (e.g. RGBA to
+ * the YUVA the overlay wants) would otherwise redo a full-frame conversion of
+ * an unchanged picture on every video frame. Frames carrying side data are
+ * never treated as repeats, so nothing that could steer the conversion is
+ * ignored.
+ */
+static int same_picture(const AVFrame *a, const AVFrame *b)
+{
+    if (!a->buf[0] || a->format != b->format ||
+        a->width != b->width || a->height != b->height ||
+        a->nb_extended_buf || b->nb_extended_buf ||
+        a->nb_side_data || b->nb_side_data ||
+        a->flags != b->flags ||
+        a->colorspace != b->colorspace || a->color_range != b->color_range ||
+        a->color_primaries != b->color_primaries || a->color_trc != b->color_trc ||
+        a->chroma_location != b->chroma_location || a->alpha_mode != b->alpha_mode ||
+        av_cmp_q(a->sample_aspect_ratio, b->sample_aspect_ratio) ||
+        a->crop_top != b->crop_top || a->crop_bottom != b->crop_bottom ||
+        a->crop_left != b->crop_left || a->crop_right != b->crop_right)
+        return 0;
+    for (int i = 0; i < AV_NUM_DATA_POINTERS; i++) {
+        if (a->data[i] != b->data[i] || a->linesize[i] != b->linesize[i] ||
+            !a->buf[i] != !b->buf[i] ||
+            (a->buf[i] && a->buf[i]->buffer != b->buf[i]->buffer))
+            return 0;
+    }
+    return 1;
+}
+
+/** A new frame with the pixels of src and the properties of props. */
+static AVFrame *frame_with_pixels_of(const AVFrame *src, const AVFrame *props)
+{
+    AVFrame *f = av_frame_alloc();
+
+    if (!f || av_frame_copy_props(f, props) < 0)
+        goto fail;
+    f->format = src->format;
+    f->width  = src->width;
+    f->height = src->height;
+    for (int i = 0; i < AV_NUM_DATA_POINTERS; i++) {
+        f->data[i]     = src->data[i];
+        f->linesize[i] = src->linesize[i];
+        if (src->buf[i] && !(f->buf[i] = av_buffer_ref(src->buf[i])))
+            goto fail;
+    }
+    return f;
+fail:
+    av_frame_free(&f);
+    return NULL;
+}
+
+/**
+ * Convert in into out, or -- for a repeat of the previous input -- give out the
+ * previous output's pixels. Returns the frame to send on (out, or a
+ * replacement carrying out's properties) in *res.
+ */
+static int scale_or_reuse(ScaleContext *scale, AVFrame *out, AVFrame *in,
+                          AVFrame **res)
+{
+    const int repeat = scale->last_in && same_picture(scale->last_in, in);
+    int ret;
+
+    *res = out;
+    if (repeat && scale->last_out &&
+        scale->last_out->format == out->format &&
+        scale->last_out->width  == out->width  &&
+        scale->last_out->height == out->height) {
+        AVFrame *reused = frame_with_pixels_of(scale->last_out, out);
+        if (!reused)
+            return AVERROR(ENOMEM);
+        av_frame_free(&out);
+        *res = reused;
+        return 0;
+    }
+
+    ret = sws_scale_frame(scale->sws, out, in);
+    if (ret < 0) {
+        reset_reuse(scale);
+        return ret;
+    }
+
+    /* Hold the output only once repeats are actually happening: holding it
+     * makes every output frame non-writable, which would cost the ordinary,
+     * never-repeating case a copy wherever a later filter writes in place. */
+    av_frame_free(&scale->last_out);
+    if (repeat) {
+        scale->last_out = av_frame_clone(out);
+    } else {
+        /* Remember this input only if its producer keeps it too (sub2video
+         * does). A sole reference is released now, as it always was. */
+        av_frame_free(&scale->last_in);
+        if (av_buffer_get_ref_count(in->buf[0]) > 1)
+            scale->last_in = av_frame_clone(in);
+    }
+    return 0;
+}
+
 static int scale_frame(AVFilterLink *link, AVFrame **frame_in,
                        AVFrame **frame_out)
 {
@@ -883,7 +1003,12 @@ scale:
         avpriv_set_systematic_pal2((uint32_t*) out->data[1], out->format);
     }
 
-    ret = sws_scale_frame(scale->sws, out, in);
+    if (out->format == outlink->format && in->buf[0]) {
+        ret = scale_or_reuse(scale, out, in, &out);
+    } else {
+        reset_reuse(scale);
+        ret = sws_scale_frame(scale->sws, out, in);
+    }
     av_frame_free(&in);
     out->flags = flags_orig;
     out->format = outlink->format; /* undo PAL8 handling */
@@ -1027,6 +1152,8 @@ static int process_command(AVFilterContext *ctx, const char *cmd, const char *ar
         ret = scale_parse_expr(ctx, str_expr, pexpr_ptr, cmd, args);
     } else
         ret = AVERROR(ENOSYS);
+
+    reset_reuse(scale);
 
     if (ret < 0)
         av_log(ctx, AV_LOG_ERROR, "Failed to process command. Continuing with existing parameters.\n");

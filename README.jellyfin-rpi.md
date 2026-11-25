@@ -216,6 +216,28 @@ bottom so every chroma sample in it averages the same alpha neighbours as before
 build; 1500 real PGS frames; FATE `filter-overlay*`). 1080p 10-bit HEVC + PGS → 1080p, hardware
 decode: 1.62× / 2.7 cores → **1.85× / 2.0 cores**; → 720p via the ISP: 2.17× → 2.39×.
 
+**Repeated subtitle pictures are not reprocessed** (`vf_scale.c`, `vf_overlay.c`). While a subtitle
+is up, ffmpeg's sub2video re-sends the *same* canvas buffer whenever the overlay waits on it (a
+heartbeat), and each copy was converted again: `scale` redid a full-frame RGBA→YUVA swscale pass
+(~45 ms at 1080p), and `overlay` rescanned the alpha for the box above. Now both remember the last
+picture. A frame backed by the same buffer they still hold a reference to *is* that picture: a
+referenced buffer can't be freed and handed out again, and one with two references isn't writable.
+`overlay` reuses the box; `scale` reuses its previous output, with the new frame's properties.
+
+`scale` is used everywhere, so its reuse is fenced off from ordinary video. It keeps the previous
+input only when the producer still holds it too (sub2video does), and keeps its previous *output*
+only after a repeat has actually arrived, dropping it at the next new picture. Holding an output
+makes it non-writable, and an in-place filter downstream would then copy every frame. A repeat must
+match buffers, offsets, line sizes and every colour/field/crop property; frames carrying side data
+never count, and any reconfiguration (`config_props`, `process_command`) clears the cache. Bit-exact
+against the previous build on the real PGS episode (two graphs, 1500 frames each), 12 synthetic
+repeat cases (`fps=` duplication into converting/resizing/interlaced/PAL8 `scale`, then in-place
+`drawtext`; repeated overlays in five formats), and the sample-free FATE suite.
+
+On that episode, 900 frames: 75 conversions → 41 (the rest are new pictures, plus the first repeat of
+each, which the rule above converts), and the alpha scan from 5% of CPU samples to 0.2%. Jellyfin's
+graph, 1080p → 1080p, 1500 frames, two runs each: 1.92× on 66 core-seconds → **2.03× on 58**.
+
 ### 7. Build enablement for the HDR reference
 `--enable-libzimg` (`zscale`) gives a correct CPU HDR→SDR reference (`zscale+tonemap`).
 `--enable-libplacebo --enable-vulkan` link a **locally rebuilt** libplacebo 7.360 (Debian
