@@ -68,8 +68,7 @@ static int write_header(AVFormatContext *s)
                 ass->trailer = trailer;
         }
 
-        header_size = av_strnlen(par->extradata, header_size);
-        ffio_write_lines(s->pb, par->extradata, (int)header_size, NULL);
+        ffio_write_lines(s->pb, par->extradata, header_size, NULL);
 
         ass->ssa_mode = !strstr(par->extradata, "\n[V4+ Styles]");
         if (!strstr(par->extradata, "\n[Events]"))

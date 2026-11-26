@@ -99,9 +99,6 @@ typedef struct BenchmarkTimeStamps {
 
 static BenchmarkTimeStamps get_benchmark_time_stamps(void);
 static int64_t getmaxrss(void);
-static int64_t gettime_relative_minus_pause(void);
-static void pause_transcoding(void);
-static void unpause_transcoding(void);
 
 atomic_uint nb_output_dumped = 0;
 
@@ -119,9 +116,6 @@ int        nb_filtergraphs;
 
 Decoder     **decoders;
 int        nb_decoders;
-
-int64_t paused_start = 0;
-int64_t paused_time = 0;
 
 #if HAVE_TERMIOS_H
 
@@ -825,20 +819,6 @@ static void set_tty_echo(int on)
 #endif
 }
 
-static void pause_transcoding(void)
-{
-    if (!paused_start)
-        paused_start = av_gettime_relative();
-}
-
-static void unpause_transcoding(void)
-{
-    if (paused_start) {
-        paused_time += av_gettime_relative() - paused_start;
-        paused_start = 0;
-    }
-}
-
 static int check_keyboard_interaction(int64_t cur_time)
 {
     int i, key;
@@ -855,11 +835,6 @@ static int check_keyboard_interaction(int64_t cur_time)
     }
     if (key == '+') av_log_set_level(av_log_get_level()+10);
     if (key == '-') av_log_set_level(av_log_get_level()-10);
-    if (key == 'u' || key != -1) unpause_transcoding();
-    if (key == 'p'){
-        pause_transcoding();
-        fprintf(stderr, "\nTranscoding is paused. Press [u] to resume.\n");
-    }
     if (key == 'c' || key == 'C'){
         char buf[4096], target[64], command[256], arg[256] = {0};
         double time;
@@ -899,9 +874,7 @@ static int check_keyboard_interaction(int64_t cur_time)
                         "c      Send command to first matching filter supporting it\n"
                         "C      Send/Queue command to all matching filters\n"
                         "h      dump packets/hex press to cycle through the 3 states\n"
-                        "p      pause transcoding\n"
                         "q      quit\n"
-                        "u      unpause transcoding\n"
                         "s      Show QP histogram\n"
         );
     }
@@ -931,20 +904,15 @@ static int transcode(Scheduler *sch)
     timer_start = av_gettime_relative();
 
     while (!sch_wait(sch, stats_period, &transcode_ts)) {
-        int64_t cur_time= gettime_relative_minus_pause();
+        int64_t cur_time= av_gettime_relative();
 
-        if (received_nb_signals) {
-            unpause_transcoding();
+        if (received_nb_signals)
             break;
-        }
 
         /* if 'q' pressed, exits */
-        if (stdin_interaction) {
-            if (check_keyboard_interaction(av_gettime_relative()) < 0) {
-                paused_start = 0; // unpausing the input thread on exit
+        if (stdin_interaction)
+            if (check_keyboard_interaction(cur_time) < 0)
                 break;
-            }
-        }
 
         /* dump report by using the output first video and audio streams */
         print_report(0, timer_start, cur_time, transcode_ts);
@@ -961,15 +929,9 @@ static int transcode(Scheduler *sch)
     term_exit();
 
     /* dump report by using the first video and audio streams */
-    print_report(1, timer_start, gettime_relative_minus_pause(), transcode_ts);
+    print_report(1, timer_start, av_gettime_relative(), transcode_ts);
 
     return ret;
-}
-
-static int64_t gettime_relative_minus_pause(void)
-{
-    return av_gettime_relative() - paused_time -
-            (paused_start ? av_gettime_relative() - paused_start : 0);
 }
 
 static BenchmarkTimeStamps get_benchmark_time_stamps(void)

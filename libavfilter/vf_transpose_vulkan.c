@@ -49,8 +49,6 @@ static av_cold int init_filter(AVFilterContext *ctx, AVFrame *in)
     TransposeVulkanContext *s = ctx->priv;
     FFVulkanContext *vkctx = &s->vkctx;
 
-    const AVPixFmtDescriptor *pix_desc = av_pix_fmt_desc_get(s->vkctx.output_format);
-    const int is_422 = pix_desc->log2_chroma_w == 1 && !pix_desc->log2_chroma_h;
     const int planes = av_pix_fmt_count_planes(s->vkctx.output_format);
     FFVulkanShader *shd = &s->shd;
     FFVkSPIRVCompiler *spv;
@@ -102,24 +100,19 @@ static av_cold int init_filter(AVFilterContext *ctx, AVFrame *in)
     GLSLC(0, void main()                                               );
     GLSLC(0, {                                                         );
     GLSLC(1,     ivec2 size;                                           );
-    GLSLC(1,     ivec2 ipos;                                           );
     GLSLC(1,     ivec2 pos = ivec2(gl_GlobalInvocationID.xy);          );
     for (int i = 0; i < planes; i++) {
-        int is_422_uv = i && is_422;
         GLSLC(0,                                                       );
         GLSLF(1, size = imageSize(output_images[%i]);                ,i);
         GLSLC(1, if (IS_WITHIN(pos, size)) {                           );
         if (s->dir == TRANSPOSE_CCLOCK)
-            GLSLC(2, ipos = ivec2(size.y - 1 - pos.y, pos.x);          );
+            GLSLF(2, vec4 res = imageLoad(input_images[%i], ivec2(size.y - pos.y, pos.x)); ,i);
         else if (s->dir == TRANSPOSE_CLOCK_FLIP || s->dir == TRANSPOSE_CLOCK) {
-            GLSLC(2, ipos = ivec2(size.yx - 1 - pos.yx);               );
+            GLSLF(2, vec4 res = imageLoad(input_images[%i], ivec2(size.yx - pos.yx));      ,i);
             if (s->dir == TRANSPOSE_CLOCK)
-                GLSLC(2, pos = ivec2(pos.x, size.y - 1 - pos.y);       );
+                GLSLC(2, pos = ivec2(pos.x, size.y - pos.y);           );
         } else
-            GLSLC(2, ipos = pos.yx;                                    );
-        if (is_422_uv)
-            GLSLC(2, ipos = ivec2(ipos.x >> 1, ipos.y << 1);           );
-        GLSLF(2, vec4 res = imageLoad(input_images[%i], ipos);       ,i);
+            GLSLF(2, vec4 res = imageLoad(input_images[%i], pos.yx);  ,i);
         GLSLF(2,     imageStore(output_images[%i], pos, res);        ,i);
         GLSLC(1, }                                                     );
     }
@@ -168,9 +161,11 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
     RET(av_frame_copy_props(out, in));
 
     if (in->sample_aspect_ratio.num)
-        out->sample_aspect_ratio = av_inv_q(in->sample_aspect_ratio);
-    else
         out->sample_aspect_ratio = in->sample_aspect_ratio;
+    else {
+        out->sample_aspect_ratio.num = in->sample_aspect_ratio.den;
+        out->sample_aspect_ratio.den = in->sample_aspect_ratio.num;
+    }
 
     av_frame_free(&in);
 

@@ -152,8 +152,6 @@ static int config_input(AVFilterLink *link)
     if (pix_desc->flags & AV_PIX_FMT_FLAG_HWACCEL) {
         s->hsub = 1;
         s->vsub = 1;
-        if (ctx->nb_outputs > 0)
-            ctx->outputs[0]->fixed_pool_size = link->fixed_pool_size;
     } else {
         s->hsub = pix_desc->log2_chroma_w;
         s->vsub = pix_desc->log2_chroma_h;
@@ -240,9 +238,6 @@ static int config_output(AVFilterLink *link)
     if (desc->flags & AV_PIX_FMT_FLAG_HWACCEL) {
         // Hardware frames adjust the cropping regions rather than
         // changing the frame size.
-        AVFilterContext *ctx = link->src;
-        if (ctx->nb_inputs > 0)
-            link->fixed_pool_size = ctx->inputs[0]->fixed_pool_size;
     } else {
         link->w = s->w;
         link->h = s->h;

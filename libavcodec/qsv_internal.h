@@ -56,8 +56,6 @@
 
 #define QSV_MAX_FRAME_EXT_PARAMS 4
 
-#define QSV_PAYLOAD_SIZE 1024
-
 #define QSV_VERSION_ATLEAST(MAJOR, MINOR)   \
     (MFX_VERSION_MAJOR > (MAJOR) ||         \
      MFX_VERSION_MAJOR == (MAJOR) && MFX_VERSION_MINOR >= (MINOR))
@@ -100,7 +98,6 @@ typedef struct QSVFrame {
 
     int queued;
     int used;
-    int external_frame;
 
     struct QSVFrame *next;
 } QSVFrame;

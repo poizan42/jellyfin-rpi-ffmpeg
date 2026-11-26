@@ -804,9 +804,6 @@ extern int recast_media;
 
 extern FILE *vstats_file;
 
-extern int64_t paused_start;
-extern int64_t paused_time;
-
 void term_init(void);
 void term_exit(void);
 
