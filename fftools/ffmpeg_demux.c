@@ -549,7 +549,7 @@ static void readrate_sleep(Demuxer *d)
         d->resume_progress = progress;
 
         int64_t pts = FFMAX(slowest->first_dts, file_start) + progress;
-        av_log_once(slowest, AV_LOG_WARNING, AV_LOG_DEBUG, &resume_warn,
+        av_log_once(slowest, AV_LOG_VERBOSE, AV_LOG_DEBUG, &resume_warn,
                     "Resumed reading at pts %0.3f with rate %0.3f after a lag of %0.3fs\n",
                     (float)pts/AV_TIME_BASE, d->readrate_catchup, (float)lag/AV_TIME_BASE);
     }
@@ -760,6 +760,11 @@ static int input_thread(void *arg)
     while (1) {
         DemuxStream *ds;
         unsigned send_flags = 0;
+
+        if (paused_start) {
+            av_usleep(1000); // pausing the input thread
+            continue;
+        }
 
         ret = av_read_frame(f->ctx, dt.pkt_demux);
 
@@ -1765,23 +1770,59 @@ static int is_windows_reserved_device_name(const char *f)
 {
 #if HAVE_DOS_PATHS
     for (const char *p = f; p && *p; ) {
-        char stem[6], *s;
-        av_strlcpy(stem, p, sizeof(stem));
-        if ((s = strchr(stem, '.')))
-            *s = 0;
-        if ((s = strpbrk(stem, "123456789")))
-            *s = '1';
+        const char *next_slash;
+        const char *seg_end;
+        const char *dot;
+        size_t len;
 
-        if( !av_strcasecmp(stem, "AUX") ||
-            !av_strcasecmp(stem, "CON") ||
-            !av_strcasecmp(stem, "NUL") ||
-            !av_strcasecmp(stem, "PRN") ||
-            !av_strcasecmp(stem, "COM1") ||
-            !av_strcasecmp(stem, "LPT1")
-        )
+        next_slash = strchr(p, '/');
+        seg_end = next_slash ? next_slash : p + strlen(p);
+
+        /* Trim trailing spaces and dots of the current component */
+        while (seg_end > p && (*(seg_end - 1) == ' ' || *(seg_end - 1) == '.'))
+            seg_end--;
+
+        /* Discard extension if present (Windows stops checking at first dot) */
+        dot = p;
+        while (dot < seg_end && *dot != '.')
+            dot++;
+        if (dot < seg_end)
+            seg_end = dot;
+
+        /* Trim again after stripping extension */
+        while (seg_end > p && (*(seg_end - 1) == ' ' || *(seg_end - 1) == '.'))
+            seg_end--;
+
+        len = seg_end - p;
+
+        /* Match 6-byte and 7-byte console device names: CONIN$, CONOUT$ */
+        if ((len == 6 && !av_strncasecmp(p, "CONIN$",  6)) ||
+            (len == 7 && !av_strncasecmp(p, "CONOUT$", 7)))
             return 1;
 
-        p = strchr(p, '/');
+        /* Match 3-byte legacy device names: AUX, CON, NUL, PRN */
+        if (len == 3 && (!av_strncasecmp(p, "AUX", 3) ||
+                         !av_strncasecmp(p, "CON", 3) ||
+                         !av_strncasecmp(p, "NUL", 3) ||
+                         !av_strncasecmp(p, "PRN", 3)))
+            return 1;
+
+        /* Match COM1-9 / LPT1-9 and their UTF-8 superscript aliases */
+        if ((len == 4 || len == 5) && (!av_strncasecmp(p, "COM", 3) ||
+                                       !av_strncasecmp(p, "LPT", 3))) {
+            /* Standard ASCII digits 1-9 */
+            if (len == 4 && *(seg_end - 1) >= '1' && *(seg_end - 1) <= '9')
+                return 1;
+
+            /* UTF-8 superscripts (¹, ², ³) */
+            if (len == 5 && (unsigned char)*(seg_end - 2) == 0xC2 &&
+                ((unsigned char)*(seg_end - 1) == 0xB9 ||
+                 (unsigned char)*(seg_end - 1) == 0xB2 ||
+                 (unsigned char)*(seg_end - 1) == 0xB3))
+                return 1;
+        }
+
+        p = next_slash;
         if (p)
             p++;
     }
@@ -1789,26 +1830,66 @@ static int is_windows_reserved_device_name(const char *f)
     return 0;
 }
 
+static int valid_utf8_filename(const char *s)
+{
+    const uint8_t *p   = (const uint8_t *)s;
+    const uint8_t *end = p + strlen(s);
+
+    while (p < end) {
+        int32_t code;
+
+        if (av_utf8_decode(&code, &p, end,
+                           AV_UTF8_FLAG_ACCEPT_NON_CHARACTERS) < 0)
+            return 0;
+    }
+    return 1;
+}
+
 static int safe_filename(const char *f, int allow_subdir)
 {
     const char *start = f;
 
-    if (!*f || is_windows_reserved_device_name(f))
+    if (!*f || !valid_utf8_filename(f) ||
+        is_windows_reserved_device_name(f))
         return 0;
 
     for (; *f; f++) {
-        /* A-Za-z0-9_- */
-        if (!((unsigned)((*f | 32) - 'a') < 26 ||
-              (unsigned)(*f - '0') < 10 || *f == '_' || *f == '-')) {
-            if (f == start)
+        /* Non-ASCII bytes cannot be '/' or '.' */
+        if ((unsigned char)*f > 127)
+            continue;
+
+#if HAVE_DOS_PATHS
+        /* Reject Windows reserved filename punctuation */
+        if (strchr("<>\"|?*", *f))
+            return 0;
+#endif
+
+        /* Block control characters and dangerous path characters */
+        if ((unsigned char)*f < 32 || *f == '\\' || *f == ':')
+            return 0;
+        if (*f == '/') {
+            if (!allow_subdir || f == start)
                 return 0;
-            else if (allow_subdir && *f == '/')
-                start = f + 1;
-            else if (*f != '.')
+
+#if HAVE_DOS_PATHS
+            /* Reject intermediate dirs ending with trailing spaces or dots */
+            if (f > start && (*(f - 1) == ' ' || *(f - 1) == '.'))
                 return 0;
+#endif
+
+            start = f + 1;
+        } else if (*f == '.' && f == start) {
+            return 0;
         }
     }
-    return 1;
+
+#if HAVE_DOS_PATHS
+    /* Reject final filenames ending with trailing spaces or dots */
+    if (f > start && (*(f - 1) == ' ' || *(f - 1) == '.'))
+        return 0;
+#endif
+
+    return f != start;
 }
 
 static int dump_attachment(InputStream *ist, const char *filename)
@@ -1825,8 +1906,8 @@ static int dump_attachment(InputStream *ist, const char *filename)
     if (!*filename && (e = av_dict_get(st->metadata, "filename", NULL, 0))) {
         filename = e->value;
         if (!safe_filename(filename, 0)) {
-            av_log(ist, AV_LOG_ERROR, "Filename %s is unsafe\n", filename);
-            return AVERROR(EINVAL);
+            av_log(ist, AV_LOG_WARNING, "Filename %s is unsafe, skipping\n", filename);
+            return 0;
         }
     }
     if (!*filename) {

@@ -28,9 +28,20 @@ using subsample_function_t = T (*)(cudaTextureObject_t tex, int xo, int yo,
                                    int dst_width, int dst_height,
                                    int src_left, int src_top,
                                    int src_width, int src_height,
-                                   int bit_depth, float param,
-                                   const float *weights, const int *offsets,
-                                   int filter_size);
+                                   int bit_depth, float param);
+
+// --- DITHERING ---
+
+static inline __device__ float get_dithered_y(float y, float d, float dither_size, float dither_quantization, float factor)
+{
+    return floor(y / factor * dither_quantization + d + 0.5f / (dither_size * dither_size)) * 1.0f / dither_quantization * factor;
+}
+
+static inline __device__ float read_dither(cudaTextureObject_t dither_tex, float dither_size, int x, int y)
+{
+    float dither_size_recip = 1.0f / dither_size;
+    return tex2D<float>(dither_tex, (float)x * dither_size_recip, (float)y * dither_size_recip);
+}
 
 // --- CONVERSION LOGIC ---
 
@@ -93,15 +104,15 @@ static inline __device__ ushort conv_16to10pl(ushort in)
                                     int dst_width, int dst_height, int dst_pitch,              \
                                     int src_left, int src_top, int src_width, int src_height,  \
                                     float param, int mpeg_range,                               \
-                                    const float *weights, const int *offsets, int filter_size)
+                                    cudaTextureObject_t dither_tex,                            \
+                                    float dither_size, float dither_quantization)
 
 #define SUB_F(m, plane) \
     subsample_func_##m(src_tex[plane], xo, yo, \
                        dst_width, dst_height,  \
                        src_left, src_top,      \
                        src_width, src_height,  \
-                       in_bit_depth, param,    \
-                       weights, offsets, filter_size)
+                       in_bit_depth, param)
 
 // FFmpeg passes pitch in bytes, CUDA uses potentially larger types
 #define FIXED_PITCH \
@@ -252,7 +263,10 @@ struct Convert_planar10_planar8
 
     DEF_F(Convert, out_T)
     {
-        DEFAULT_DST(0) = conv_10to8pl(SUB_F(y, 0));
+        in_T res = SUB_F(y, 0);
+        res = (in_T)get_dithered_y((float)res, read_dither(dither_tex, dither_size, xo, yo),
+                                   dither_size, dither_quantization, (float)0x3FF);
+        DEFAULT_DST(0) = conv_10to8pl(res);
     }
 
     DEF_F(Convert_uv, out_T_uv)
@@ -312,7 +326,10 @@ struct Convert_planar10_semiplanar8
 
     DEF_F(Convert, out_T)
     {
-        DEFAULT_DST(0) = conv_10to8pl(SUB_F(y, 0));
+        in_T res = SUB_F(y, 0);
+        res = (in_T)get_dithered_y((float)res, read_dither(dither_tex, dither_size, xo, yo),
+                                   dither_size, dither_quantization, (float)0x3FF);
+        DEFAULT_DST(0) = conv_10to8pl(res);
     }
 
     DEF_F(Convert_uv, out_T_uv)
@@ -380,7 +397,10 @@ struct Convert_planar16_planar8
 
     DEF_F(Convert, out_T)
     {
-        DEFAULT_DST(0) = conv_16to8(SUB_F(y, 0));
+        in_T res = SUB_F(y, 0);
+        res = (in_T)get_dithered_y((float)res, read_dither(dither_tex, dither_size, xo, yo),
+                                   dither_size, dither_quantization, (float)mask_16bit);
+        DEFAULT_DST(0) = conv_16to8(res);
     }
 
     DEF_F(Convert_uv, out_T_uv)
@@ -400,7 +420,10 @@ struct Convert_planar16_planar10
 
     DEF_F(Convert, out_T)
     {
-        DEFAULT_DST(0) = conv_16to10pl(SUB_F(y, 0));
+        in_T res = SUB_F(y, 0);
+        res = (in_T)get_dithered_y((float)res, read_dither(dither_tex, dither_size, xo, yo),
+                                   dither_size, dither_quantization, (float)mask_16bit);
+        DEFAULT_DST(0) = conv_16to10pl(res);
     }
 
     DEF_F(Convert_uv, out_T_uv)
@@ -440,7 +463,10 @@ struct Convert_planar16_semiplanar8
 
     DEF_F(Convert, out_T)
     {
-        DEFAULT_DST(0) = conv_16to8(SUB_F(y, 0));
+        in_T res = SUB_F(y, 0);
+        res = (in_T)get_dithered_y((float)res, read_dither(dither_tex, dither_size, xo, yo),
+                                   dither_size, dither_quantization, (float)mask_16bit);
+        DEFAULT_DST(0) = conv_16to8(res);
     }
 
     DEF_F(Convert_uv, out_T_uv)
@@ -462,7 +488,10 @@ struct Convert_planar16_semiplanar10
 
     DEF_F(Convert, out_T)
     {
-        DEFAULT_DST(0) = conv_16to10(SUB_F(y, 0));
+        in_T res = SUB_F(y, 0);
+        res = (in_T)get_dithered_y((float)res, read_dither(dither_tex, dither_size, xo, yo),
+                                   dither_size, dither_quantization, (float)mask_16bit);
+        DEFAULT_DST(0) = conv_16to10(res);
     }
 
     DEF_F(Convert_uv, out_T_uv)
@@ -638,7 +667,10 @@ struct Convert_semiplanar10_planar8
 
     DEF_F(Convert, out_T)
     {
-        DEFAULT_DST(0) = conv_10to8(SUB_F(y, 0));
+        in_T res = SUB_F(y, 0);
+        res = (in_T)get_dithered_y((float)res, read_dither(dither_tex, dither_size, xo, yo),
+                                   dither_size, dither_quantization, (float)mask_10bit);
+        DEFAULT_DST(0) = conv_10to8(res);
     }
 
     DEF_F(Convert_uv, out_T_uv)
@@ -701,7 +733,10 @@ struct Convert_semiplanar10_semiplanar8
 
     DEF_F(Convert, out_T)
     {
-        DEFAULT_DST(0) = conv_10to8(SUB_F(y, 0));
+        in_T res = SUB_F(y, 0);
+        res = (in_T)get_dithered_y((float)res, read_dither(dither_tex, dither_size, xo, yo),
+                                   dither_size, dither_quantization, (float)mask_10bit);
+        DEFAULT_DST(0) = conv_10to8(res);
     }
 
     DEF_F(Convert_uv, out_T_uv)
@@ -769,7 +804,10 @@ struct Convert_semiplanar16_planar8
 
     DEF_F(Convert, out_T)
     {
-        DEFAULT_DST(0) = conv_16to8(SUB_F(y, 0));
+        in_T res = SUB_F(y, 0);
+        res = (in_T)get_dithered_y((float)res, read_dither(dither_tex, dither_size, xo, yo),
+                                   dither_size, dither_quantization, (float)mask_16bit);
+        DEFAULT_DST(0) = conv_16to8(res);
     }
 
     DEF_F(Convert_uv, out_T_uv)
@@ -790,7 +828,10 @@ struct Convert_semiplanar16_planar10
 
     DEF_F(Convert, out_T)
     {
-        DEFAULT_DST(0) = conv_16to10pl(SUB_F(y, 0));
+        in_T res = SUB_F(y, 0);
+        res = (in_T)get_dithered_y((float)res, read_dither(dither_tex, dither_size, xo, yo),
+                                   dither_size, dither_quantization, (float)mask_16bit);
+        DEFAULT_DST(0) = conv_16to10pl(res);
     }
 
     DEF_F(Convert_uv, out_T_uv)
@@ -832,7 +873,10 @@ struct Convert_semiplanar16_semiplanar8
 
     DEF_F(Convert, out_T)
     {
-        DEFAULT_DST(0) = conv_16to8(SUB_F(y, 0));
+        in_T res = SUB_F(y, 0);
+        res = (in_T)get_dithered_y((float)res, read_dither(dither_tex, dither_size, xo, yo),
+                                   dither_size, dither_quantization, (float)mask_16bit);
+        DEFAULT_DST(0) = conv_16to8(res);
     }
 
     DEF_F(Convert_uv, out_T_uv)
@@ -855,7 +899,10 @@ struct Convert_semiplanar16_semiplanar10
 
     DEF_F(Convert, out_T)
     {
-        DEFAULT_DST(0) = conv_16to10(SUB_F(y, 0));
+        in_T res = SUB_F(y, 0);
+        res = (in_T)get_dithered_y((float)res, read_dither(dither_tex, dither_size, xo, yo),
+                                   dither_size, dither_quantization, (float)mask_16bit);
+        DEFAULT_DST(0) = conv_16to10(res);
     }
 
     DEF_F(Convert_uv, out_T_uv)
@@ -1049,6 +1096,9 @@ typedef float4 (*coeffs_function_t)(float, float);
 
 __device__ static inline float4 lanczos_coeffs(float x, float param)
 {
+#if defined(__clang__) && (__clang_major__ >= 11)
+    #pragma clang fp reassociate(off)
+#endif
     const float pi = 3.141592654f;
 
     float4 res = make_float4(
@@ -1099,9 +1149,7 @@ __device__ static inline T Subsample_Nearest(cudaTextureObject_t tex,
                                              int dst_width, int dst_height,
                                              int src_left, int src_top,
                                              int src_width, int src_height,
-                                             int bit_depth, float param,
-                                             const float *weights, const int *offsets,
-                                             int filter_size)
+                                             int bit_depth, float param)
 {
     float hscale = (float)src_width / (float)dst_width;
     float vscale = (float)src_height / (float)dst_height;
@@ -1117,9 +1165,7 @@ __device__ static inline T Subsample_Bilinear(cudaTextureObject_t tex,
                                               int dst_width, int dst_height,
                                               int src_left, int src_top,
                                               int src_width, int src_height,
-                                              int bit_depth, float param,
-                                              const float *weights, const int *offsets,
-                                              int filter_size)
+                                              int bit_depth, float param)
 {
     float hscale = (float)src_width / (float)dst_width;
     float vscale = (float)src_height / (float)dst_height;
@@ -1151,9 +1197,7 @@ __device__ static inline T Subsample_Bicubic(cudaTextureObject_t tex,
                                              int dst_width, int dst_height,
                                              int src_left, int src_top,
                                              int src_width, int src_height,
-                                             int bit_depth, float param,
-                                             const float *weights, const int *offsets,
-                                             int filter_size)
+                                             int bit_depth, float param)
 {
     float hscale = (float)src_width / (float)dst_width;
     float vscale = (float)src_height / (float)dst_height;
@@ -1172,52 +1216,18 @@ __device__ static inline T Subsample_Bicubic(cudaTextureObject_t tex,
 #define PIX(x, y) tex2D<floatT>(tex, (x), (y))
 
     return from_floatN<T, floatT>(
-        apply_coeffs<floatT>(coeffsY,
-            apply_coeffs<floatT>(coeffsX, PIX(px - 1, py - 1), PIX(px, py - 1), PIX(px + 1, py - 1), PIX(px + 2, py - 1)),
-            apply_coeffs<floatT>(coeffsX, PIX(px - 1, py    ), PIX(px, py    ), PIX(px + 1, py    ), PIX(px + 2, py    )),
-            apply_coeffs<floatT>(coeffsX, PIX(px - 1, py + 1), PIX(px, py + 1), PIX(px + 1, py + 1), PIX(px + 2, py + 1)),
-            apply_coeffs<floatT>(coeffsX, PIX(px - 1, py + 2), PIX(px, py + 2), PIX(px + 1, py + 2), PIX(px + 2, py + 2))
-        ) * factor
+        saturate_rintf(
+            apply_coeffs<floatT>(coeffsY,
+                apply_coeffs<floatT>(coeffsX, PIX(px - 1, py - 1), PIX(px, py - 1), PIX(px + 1, py - 1), PIX(px + 2, py - 1)),
+                apply_coeffs<floatT>(coeffsX, PIX(px - 1, py    ), PIX(px, py    ), PIX(px + 1, py    ), PIX(px + 2, py    )),
+                apply_coeffs<floatT>(coeffsX, PIX(px - 1, py + 1), PIX(px, py + 1), PIX(px + 1, py + 1), PIX(px + 2, py + 1)),
+                apply_coeffs<floatT>(coeffsX, PIX(px - 1, py + 2), PIX(px, py + 2), PIX(px + 1, py + 2), PIX(px + 2, py + 2))
+            ),
+            factor
+        )
     );
 
 #undef PIX
-}
-
-enum ScaleDir {
-    SCALE_DIR_X,
-    SCALE_DIR_Y,
-};
-
-template<typename T, int dir>
-__device__ static inline T Subsample_Generic(cudaTextureObject_t tex,
-                                             int xo, int yo,
-                                             int dst_width, int dst_height,
-                                             int src_left, int src_top,
-                                             int src_width, int src_height,
-                                             int bit_depth, float param,
-                                             const float *weights, const int *offsets,
-                                             int filter_size)
-{
-    const float factor = bit_depth > 8 ? 0xFFFF : 0xFF;
-
-    floatT sum;
-    vec_set_scalar(sum, 0.0f);
-
-    if (dir == SCALE_DIR_X) {
-        const float *row = &weights[xo * filter_size];
-        const float x = 0.5f + src_left + offsets[xo];
-        const float y = 0.5f + src_top  + yo;
-        for (int i = 0; i < filter_size; i++)
-            sum += tex2D<floatT>(tex, x + i, y) * row[i];
-    } else {
-        const float *col = &weights[yo * filter_size];
-        const float x = 0.5f + src_left + xo;
-        const float y = 0.5f + src_top  + offsets[yo];
-        for (int i = 0; i < filter_size; i++)
-            sum += tex2D<floatT>(tex, x, y + i) * col[i];
-    }
-
-    return from_floatN<T, floatT>(sum * factor);
 }
 
 /// --- FUNCTION EXPORTS ---
@@ -1242,9 +1252,7 @@ __device__ static inline T Subsample_Generic(cudaTextureObject_t tex,
         params.src_left, params.src_top,                \
         params.src_width, params.src_height,            \
         params.param, params.mpeg_range,                \
-        (const float*) params.weights,                  \
-        (const int*) params.offsets,                    \
-        params.filter_size);
+        params.dither_tex, params.dither_size, params.dither_quantization);
 
 extern "C" {
 
@@ -1407,46 +1415,4 @@ LANCZOS_KERNELS_RGB(rgb0)
 LANCZOS_KERNELS_RGB(bgr0)
 LANCZOS_KERNELS_RGB(rgba)
 LANCZOS_KERNELS_RGB(bgra)
-
-#define GENERIC_KERNEL(D, DIR, C, S) \
-    __global__ void Subsample_Generic_##D##_##C##S(                     \
-        KERNEL_ARGS(Convert_##C::out_T##S))                             \
-    {                                                                   \
-        SUBSAMPLE((Convert_##C::Convert##S<                             \
-                       Subsample_Generic<Convert_##C::in_T, DIR>,       \
-                       Subsample_Generic<Convert_##C::in_T_uv, DIR> >), \
-                  Convert_##C::out_T##S) \
-    }
-
-#define GENERIC_KERNEL_RAW(C) \
-    GENERIC_KERNEL(h, SCALE_DIR_X, C,)      \
-    GENERIC_KERNEL(h, SCALE_DIR_X, C,_uv)   \
-    GENERIC_KERNEL(v, SCALE_DIR_Y, C,)      \
-    GENERIC_KERNEL(v, SCALE_DIR_Y, C,_uv)
-
-#define GENERIC_KERNELS(C) \
-    GENERIC_KERNEL_RAW(planar8_ ## C)       \
-    GENERIC_KERNEL_RAW(planar10_ ## C)      \
-    GENERIC_KERNEL_RAW(planar16_ ## C)      \
-    GENERIC_KERNEL_RAW(semiplanar8_ ## C)   \
-    GENERIC_KERNEL_RAW(semiplanar10_ ## C)  \
-    GENERIC_KERNEL_RAW(semiplanar16_ ## C)
-
-#define GENERIC_KERNELS_RGB(C) \
-    GENERIC_KERNEL_RAW(rgb0_ ## C)  \
-    GENERIC_KERNEL_RAW(bgr0_ ## C)  \
-    GENERIC_KERNEL_RAW(rgba_ ## C)  \
-    GENERIC_KERNEL_RAW(bgra_ ## C)
-
-GENERIC_KERNELS(planar8)
-GENERIC_KERNELS(planar10)
-GENERIC_KERNELS(planar16)
-GENERIC_KERNELS(semiplanar8)
-GENERIC_KERNELS(semiplanar10)
-GENERIC_KERNELS(semiplanar16)
-
-GENERIC_KERNELS_RGB(rgb0)
-GENERIC_KERNELS_RGB(bgr0)
-GENERIC_KERNELS_RGB(rgba)
-GENERIC_KERNELS_RGB(bgra)
 }

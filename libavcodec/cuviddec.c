@@ -164,9 +164,17 @@ static int CUDAAPI cuvid_handle_video_sequence(void *opaque, CUVIDEOFORMAT* form
         avctx->height = cuinfo.display_area.bottom - cuinfo.display_area.top;
     }
 
-    // target width/height need to be multiples of two
-    cuinfo.ulTargetWidth = avctx->width = (avctx->width + 1) & ~1;
-    cuinfo.ulTargetHeight = avctx->height = (avctx->height + 1) & ~1;
+    // NVDEC target dimensions must be even-aligned for internal surface allocation.
+    // For chroma-subsampled formats (420/422), the output dimensions must also be
+    // even. For monochrome/444, keep the original output dimensions and only
+    // even-align the NVDEC target — the frame copy will crop to avctx dimensions.
+    cuinfo.ulTargetWidth  = (avctx->width + 1) & ~1;
+    cuinfo.ulTargetHeight = (avctx->height + 1) & ~1;
+    if (format->chroma_format == cudaVideoChromaFormat_420 ||
+        format->chroma_format == cudaVideoChromaFormat_422) {
+        avctx->width  = cuinfo.ulTargetWidth;
+        avctx->height = cuinfo.ulTargetHeight;
+    }
 
     // aspect ratio conversion, 1:1, depends on scaled resolution
     cuinfo.target_rect.left = 0;
@@ -573,7 +581,8 @@ static int cuvid_output_frame(AVCodecContext *avctx, AVFrame *frame)
             return ret;
     }
 
-    if (!cuvid_is_buffer_full(avctx)) {
+    // Consume queued output before parsing can reuse its decode surfaces.
+    if (!av_fifo_can_read(ctx->frame_queue) && !cuvid_is_buffer_full(avctx)) {
         AVPacket *const pkt = ctx->pkt;
         ret = ff_decode_get_packet(avctx, pkt);
         if (ret < 0 && ret != AVERROR_EOF)
@@ -916,7 +925,7 @@ static av_cold int cuvid_decode_init(AVCodecContext *avctx)
     if (probe_desc && probe_desc->nb_components)
         probed_bit_depth = probe_desc->comp[0].depth;
 
-    if (probe_desc && !probe_desc->log2_chroma_w && !probe_desc->log2_chroma_h)
+    if (probe_desc && probe_desc->nb_components > 1 && !probe_desc->log2_chroma_w && !probe_desc->log2_chroma_h)
         is_yuv444 = 1;
 
 #ifdef NVDEC_HAVE_422_SUPPORT
@@ -1103,7 +1112,7 @@ static av_cold int cuvid_decode_init(AVCodecContext *avctx)
     // Skip first 4 bytes of AV1CodecConfigurationRecord to keep configOBUs
     // only, otherwise cuvidParseVideoData report unknown error.
     if (avctx->codec->id == AV_CODEC_ID_AV1 &&
-            extradata_size > 4 &&
+            extradata_size >= 4 &&
             extradata[0] & 0x80) {
         extradata += 4;
         extradata_size -= 4;

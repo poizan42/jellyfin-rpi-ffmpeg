@@ -24,8 +24,10 @@
 #include "cbs.h"
 #include "cbs_bsf.h"
 #include "cbs_h265.h"
+#include "cbs_sei.h"
 #include "h2645data.h"
 #include "h265_profile_level.h"
+#include "itut35.h"
 
 #include "hevc/hevc.h"
 
@@ -65,6 +67,8 @@ typedef struct H265MetadataContext {
     int level;
     int level_guess;
     int level_warned;
+    int remove_dovi;
+    int remove_hdr10plus;
 } H265MetadataContext;
 
 
@@ -412,6 +416,37 @@ static int h265_metadata_update_sps(AVBSFContext *bsf,
     return 0;
 }
 
+static void h265_metadata_remove_hdr10plus(CodedBitstreamFragment *au)
+{
+    int i, j;
+
+    for (i = au->nb_units - 1; i >= 0; i--) {
+        CodedBitstreamUnit *unit = &au->units[i];
+        H265RawSEI *sei;
+
+        if (unit->type != HEVC_NAL_SEI_PREFIX &&
+            unit->type != HEVC_NAL_SEI_SUFFIX)
+            continue;
+
+        sei = unit->content;
+        for (j = sei->message_list.nb_messages - 1; j >= 0; j--) {
+            SEIRawMessage *message = &sei->message_list.messages[j];
+            SEIRawUserDataRegistered *t35;
+
+            if (message->payload_type != SEI_TYPE_USER_DATA_REGISTERED_ITU_T_T35)
+                continue;
+
+            t35 = message->payload;
+            if (ff_itut35_is_hdr10plus(t35->itu_t_t35_country_code,
+                                      t35->data, t35->data_length))
+                ff_cbs_sei_delete_message(&sei->message_list, j);
+        }
+
+        if (!sei->message_list.nb_messages)
+            ff_cbs_delete_unit(au, i);
+    }
+}
+
 static int h265_metadata_update_fragment(AVBSFContext *bsf, AVPacket *pkt,
                                          CodedBitstreamFragment *au)
 {
@@ -477,6 +512,20 @@ static int h265_metadata_update_fragment(AVBSFContext *bsf, AVPacket *pkt,
         }
     }
 
+    if (ctx->remove_hdr10plus)
+        h265_metadata_remove_hdr10plus(au);
+
+    if (ctx->remove_dovi && au->nb_units) {
+        if (au->units[au->nb_units - 1].type == HEVC_NAL_UNSPEC62) { // Dolby Vision RPU
+            ff_cbs_delete_unit(au, au->nb_units - 1);
+            av_log(bsf, AV_LOG_DEBUG, "Removing Dolby Vision RPU\n");
+        }
+        if (au->units[au->nb_units - 1].type == HEVC_NAL_UNSPEC63) { // Dolby Vision EL
+            ff_cbs_delete_unit(au, au->nb_units - 1);
+            av_log(bsf, AV_LOG_DEBUG, "Removing Dolby Vision EL\n");
+        }
+    }
+
     return 0;
 }
 
@@ -489,6 +538,11 @@ static const CBSBSFType h265_metadata_type = {
 
 static int h265_metadata_init(AVBSFContext *bsf)
 {
+    if (((H265MetadataContext *)bsf->priv_data)->remove_dovi) {
+        av_packet_side_data_remove(bsf->par_out->coded_side_data,
+                                   &bsf->par_out->nb_coded_side_data,
+                                   AV_PKT_DATA_DOVI_CONF);
+    }
     return ff_cbs_bsf_generic_init(bsf, &h265_metadata_type);
 }
 
@@ -573,6 +627,13 @@ static const AVOption h265_metadata_options[] = {
     { LEVEL("6.2", 186) },
     { LEVEL("8.5", 255) },
 #undef LEVEL
+
+    { "remove_dovi", "Remove Dolby Vision EL and RPU",
+      OFFSET(remove_dovi), AV_OPT_TYPE_BOOL,
+      { .i64 = 0 }, 0, 1, FLAGS },
+    { "remove_hdr10plus", "Remove HDR10+ metadata",
+      OFFSET(remove_hdr10plus), AV_OPT_TYPE_BOOL,
+      { .i64 = 0 }, 0, 1, FLAGS },
 
     { NULL }
 };

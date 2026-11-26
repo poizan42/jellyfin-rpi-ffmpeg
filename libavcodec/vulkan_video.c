@@ -118,7 +118,7 @@ VkVideoChromaSubsamplingFlagBitsKHR ff_vk_subsampling_from_av_desc(const AVPixFm
         return VK_VIDEO_CHROMA_SUBSAMPLING_MONOCHROME_BIT_KHR;
     else if (!desc->log2_chroma_w && !desc->log2_chroma_h)
         return VK_VIDEO_CHROMA_SUBSAMPLING_444_BIT_KHR;
-    else if (!desc->log2_chroma_w && desc->log2_chroma_h == 1)
+    else if (desc->log2_chroma_w == 1 && !desc->log2_chroma_h)
         return VK_VIDEO_CHROMA_SUBSAMPLING_422_BIT_KHR;
     else if (desc->log2_chroma_w == 1 && desc->log2_chroma_h == 1)
         return VK_VIDEO_CHROMA_SUBSAMPLING_420_BIT_KHR;
@@ -260,6 +260,7 @@ StdVideoAV1Level ff_vk_av1_level_to_vk(int level)
 StdVideoH264ProfileIdc ff_vk_h264_profile_to_vk(int profile)
 {
     switch (profile) {
+    case AV_PROFILE_H264_BASELINE:
     case AV_PROFILE_H264_CONSTRAINED_BASELINE: return STD_VIDEO_H264_PROFILE_IDC_BASELINE;
     case AV_PROFILE_H264_MAIN: return STD_VIDEO_H264_PROFILE_IDC_MAIN;
     case AV_PROFILE_H264_HIGH: return STD_VIDEO_H264_PROFILE_IDC_HIGH;

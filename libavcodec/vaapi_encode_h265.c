@@ -264,6 +264,7 @@ static int vaapi_encode_h265_init_sequence_params(AVCodecContext *avctx)
     H265RawVPS                        *vps = &priv->units.raw_vps;
     H265RawSPS                        *sps = &priv->units.raw_sps;
     H265RawPPS                        *pps = &priv->units.raw_pps;
+    H265RawVUI                        *vui = &sps->vui;
     VAEncSequenceParameterBufferHEVC *vseq = ctx->codec_sequence_params;
     VAEncPictureParameterBufferHEVC  *vpic = ctx->codec_picture_params;
     int i, err;
@@ -319,6 +320,13 @@ static int vaapi_encode_h265_init_sequence_params(AVCodecContext *avctx)
             bs.bits.max_max_transform_hierarchy_depth_inter;
         sps->max_transform_hierarchy_depth_intra =
             bs.bits.max_max_transform_hierarchy_depth_intra;
+
+        if (ctx->amd_vcn_override) {
+            sps->max_transform_hierarchy_depth_inter =
+                sps->log2_diff_max_min_luma_coding_block_size + 1;
+            sps->max_transform_hierarchy_depth_intra =
+                sps->max_transform_hierarchy_depth_inter;
+        }
     }
 
     // update pps setting according to queried result
@@ -334,6 +342,9 @@ static int vaapi_encode_h265_init_sequence_params(AVCodecContext *avctx)
         // 0 will make cu_qp_delta invalid.
         if (pps->cu_qp_delta_enabled_flag)
             pps->diff_cu_qp_delta_depth = sps->log2_diff_max_min_luma_coding_block_size;
+
+        if (ctx->amd_vcn_override)
+            pps->diff_cu_qp_delta_depth = 0;
     }
 #endif
 
@@ -391,7 +402,25 @@ static int vaapi_encode_h265_init_sequence_params(AVCodecContext *avctx)
             sps->log2_min_pcm_luma_coding_block_size_minus3 +
             sps->log2_diff_max_min_pcm_luma_coding_block_size,
 
-        .vui_parameters_present_flag = 0,
+        .vui_parameters_present_flag = sps->vui_parameters_present_flag,
+        .vui_fields.bits = {
+            .aspect_ratio_info_present_flag = vui->aspect_ratio_info_present_flag,
+            .vui_timing_info_present_flag = vui->vui_timing_info_present_flag,
+            .bitstream_restriction_flag = vui->bitstream_restriction_flag,
+            .motion_vectors_over_pic_boundaries_flag =
+                vui->motion_vectors_over_pic_boundaries_flag,
+            .restricted_ref_pic_lists_flag = vui->restricted_ref_pic_lists_flag,
+            .log2_max_mv_length_horizontal = vui->log2_max_mv_length_horizontal,
+            .log2_max_mv_length_vertical = vui->log2_max_mv_length_vertical,
+        },
+
+        .aspect_ratio_idc = vui->aspect_ratio_idc,
+        .sar_width = vui->sar_width,
+        .sar_height = vui->sar_height,
+        .vui_num_units_in_tick = vui->vui_num_units_in_tick,
+        .vui_time_scale = vui->vui_time_scale,
+        .max_bytes_per_pic_denom = vui->max_bytes_per_pic_denom,
+        .max_bits_per_min_cu_denom = vui->max_bits_per_min_cu_denom,
     };
 
     *vpic = (VAEncPictureParameterBufferHEVC) {
@@ -1000,6 +1029,9 @@ static av_cold int vaapi_encode_h265_configure(AVCodecContext *avctx)
         priv->fixed_qp_p   = 30;
         priv->fixed_qp_b   = 30;
     }
+
+    if (ctx->amd_vcn_override)
+        priv->unit_opts.fixed_qp_idr = 26; // pps->init_qp_minus26
 
     ctx->roi_quant_range = 51 + 6 * (ctx->profile->depth - 8);
 

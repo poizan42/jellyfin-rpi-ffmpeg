@@ -43,13 +43,16 @@
 #include "libavutil/film_grain_params.h"
 #include "libavutil/mastering_display_metadata.h"
 #include "libavutil/avassert.h"
+#include "libavutil/stereo3d.h"
 
 #include "avcodec.h"
 #include "codec_internal.h"
 #include "internal.h"
 #include "decode.h"
 #include "hwconfig.h"
+#include "get_bits.h"
 #include "qsv.h"
+#include "h264_sei.h"
 #include "qsv_internal.h"
 #include "libavutil/refstruct.h"
 
@@ -111,8 +114,13 @@ typedef struct QSVContext {
 
     char *load_plugins;
 
+    mfxPayload payload;
+
     mfxExtBuffer **ext_buffers;
     int         nb_ext_buffers;
+
+    H264SEIContext sei;
+    H264ParamSets ps;
 } QSVContext;
 
 static const AVCodecHWConfigInternal *const qsv_hw_configs[] = {
@@ -700,17 +708,35 @@ static int qsv_export_hdr_side_data(AVCodecContext *avctx, mfxExtMasteringDispla
     // The SDK reuses this flag for HDR SEI parsing
     if (mdcv->InsertPayloadToggle) {
         AVMasteringDisplayMetadata *mastering;
-        const int mapping[3] = {2, 0, 1};
-        const int chroma_den = 50000;
-        const int luma_den = 10000;
-        int i;
+        int mapping[3] = { 0, 1, 2 };
+        int chroma_den;
+        int max_luma_den;
+        int min_luma_den;
+
+        switch (avctx->codec_id) {
+        case AV_CODEC_ID_HEVC:
+            mapping[0] = 2;
+            mapping[1] = 0;
+            mapping[2] = 1;
+            chroma_den = 50000;
+            max_luma_den = 10000;
+            min_luma_den = 10000;
+            break;
+        case AV_CODEC_ID_AV1:
+            chroma_den = 1 << 16;
+            max_luma_den = 1 << 8;
+            min_luma_den = 1 << 14;
+            break;
+        default:
+            return AVERROR(ENOSYS);
+        }
 
         ret = ff_decode_mastering_display_new(avctx, frame, &mastering);
         if (ret < 0)
             return ret;
 
         if (mastering) {
-            for (i = 0; i < 3; i++) {
+            for (int i = 0; i < 3; i++) {
                 const int j = mapping[i];
                 mastering->display_primaries[i][0] = av_make_q(mdcv->DisplayPrimariesX[j], chroma_den);
                 mastering->display_primaries[i][1] = av_make_q(mdcv->DisplayPrimariesY[j], chroma_den);
@@ -719,8 +745,8 @@ static int qsv_export_hdr_side_data(AVCodecContext *avctx, mfxExtMasteringDispla
             mastering->white_point[0] = av_make_q(mdcv->WhitePointX, chroma_den);
             mastering->white_point[1] = av_make_q(mdcv->WhitePointY, chroma_den);
 
-            mastering->max_luminance = av_make_q(mdcv->MaxDisplayMasteringLuminance, luma_den);
-            mastering->min_luminance = av_make_q(mdcv->MinDisplayMasteringLuminance, luma_den);
+            mastering->max_luminance = av_make_q(mdcv->MaxDisplayMasteringLuminance, max_luma_den);
+            mastering->min_luminance = av_make_q(mdcv->MinDisplayMasteringLuminance, min_luma_den);
 
             mastering->has_luminance = 1;
             mastering->has_primaries = 1;
@@ -743,47 +769,148 @@ static int qsv_export_hdr_side_data(AVCodecContext *avctx, mfxExtMasteringDispla
 
     return 0;
 }
+#endif
 
-static int qsv_export_hdr_side_data_av1(AVCodecContext *avctx, mfxExtMasteringDisplayColourVolume *mdcv,
-                                        mfxExtContentLightLevelInfo *clli, AVFrame *frame)
+static int h264_decode_fpa(H2645SEIFramePacking *fpa, AVFrame *frame)
 {
-    if (mdcv->InsertPayloadToggle) {
-        AVMasteringDisplayMetadata *mastering = av_mastering_display_metadata_create_side_data(frame);
-        const int chroma_den   = 1 << 16;
-        const int max_luma_den = 1 << 8;
-        const int min_luma_den = 1 << 14;
+    if (!fpa || !frame) {
+        return AVERROR(EINVAL);
+    }
 
-        if (!mastering)
-            return AVERROR(ENOMEM);
+    if (!fpa->arrangement_cancel_flag &&
+        fpa->arrangement_type <= 6 &&
+        fpa->content_interpretation_type > 0 &&
+        fpa->content_interpretation_type < 3) {
+        AVStereo3D *stereo = av_stereo3d_create_side_data(frame);
+        if (stereo) {
+            switch (fpa->arrangement_type) {
+            case 0:
+                stereo->type = AV_STEREO3D_CHECKERBOARD;
+                break;
+            case 1:
+                stereo->type = AV_STEREO3D_COLUMNS;
+                break;
+            case 2:
+                stereo->type = AV_STEREO3D_LINES;
+                break;
+            case 3:
+                if (fpa->quincunx_sampling_flag)
+                    stereo->type = AV_STEREO3D_SIDEBYSIDE_QUINCUNX;
+                else
+                    stereo->type = AV_STEREO3D_SIDEBYSIDE;
+                break;
+            case 4:
+                stereo->type = AV_STEREO3D_TOPBOTTOM;
+                break;
+            case 5:
+                stereo->type = AV_STEREO3D_FRAMESEQUENCE;
+                if (fpa->current_frame_is_frame0_flag)
+                    stereo->view = AV_STEREO3D_VIEW_LEFT;
+                else
+                    stereo->view = AV_STEREO3D_VIEW_RIGHT;
+                break;
+            case 6:
+                stereo->type = AV_STEREO3D_2D;
+                break;
+            }
 
-        for (int i = 0; i < 3; i++) {
-            mastering->display_primaries[i][0] = av_make_q(mdcv->DisplayPrimariesX[i], chroma_den);
-            mastering->display_primaries[i][1] = av_make_q(mdcv->DisplayPrimariesY[i], chroma_den);
+            if (fpa->content_interpretation_type == 2)
+                stereo->flags = AV_STEREO3D_FLAG_INVERT;
         }
-
-        mastering->white_point[0] = av_make_q(mdcv->WhitePointX, chroma_den);
-        mastering->white_point[1] = av_make_q(mdcv->WhitePointY, chroma_den);
-
-        mastering->max_luminance = av_make_q(mdcv->MaxDisplayMasteringLuminance, max_luma_den);
-        mastering->min_luminance = av_make_q(mdcv->MinDisplayMasteringLuminance, min_luma_den);
-
-        mastering->has_luminance = 1;
-        mastering->has_primaries = 1;
     }
-
-    if (clli->InsertPayloadToggle) {
-        AVContentLightMetadata *light = av_content_light_metadata_create_side_data(frame);
-        if (!light)
-            return AVERROR(ENOMEM);
-
-        light->MaxCLL  = clli->MaxContentLightLevel;
-        light->MaxFALL = clli->MaxPicAverageLightLevel;
-    }
-
     return 0;
 }
 
-#endif
+static int h264_parse_side_data(AVCodecContext *avctx, QSVContext *q, AVFrame *frame)
+{
+    GetBitContext gb_payload;
+    uint8_t *sei_buffer;
+    int sei_buffer_index;
+    int ret;
+
+    /* remove emulation prevention bytes */
+    sei_buffer = (uint8_t *)av_mallocz(q->payload.NumBit / 8);
+    if (!sei_buffer) {
+        av_freep(&sei_buffer);
+        return AVERROR(ENOMEM);
+    }
+    sei_buffer_index = 0;
+    for (int i = 0; i < q->payload.NumBit / 8; i++) {
+        if (q->payload.Data[i] == 3)
+            i++;
+        sei_buffer[sei_buffer_index] = q->payload.Data[i];
+        sei_buffer_index += 1;
+    }
+
+    ret = init_get_bits8(&gb_payload, sei_buffer, sei_buffer_index+1);
+    if (ret < 0) {
+        av_freep(&sei_buffer);
+        return ret;
+    }
+
+    ret = ff_h264_sei_decode(&q->sei, &gb_payload, &q->ps, avctx);
+    if (ret < 0) {
+        av_freep(&sei_buffer);
+        return ret;
+    }
+
+    switch (q->payload.Type) {
+    case SEI_TYPE_FRAME_PACKING_ARRANGEMENT:
+        ret = h264_decode_fpa(&q->sei.common.frame_packing, frame);
+        break;
+    default:
+        break;
+    }
+
+    av_freep(&sei_buffer);
+    return ret;
+}
+
+static int extract_frame_side_data(AVCodecContext *avctx, QSVContext *q, AVFrame *frame)
+{
+    mfxU64 ts;
+    mfxStatus sts;
+    int ret = 0;
+
+    if (q->payload.BufSize == 0) {
+        q->payload.Data = av_mallocz(QSV_PAYLOAD_SIZE);
+        if (!q->payload.Data) {
+            av_freep(&q->payload.Data);
+            return AVERROR(ENOMEM);
+        }
+        q->payload.BufSize = QSV_PAYLOAD_SIZE;
+    }
+
+    sts = MFX_ERR_NONE;
+    while (sts == MFX_ERR_NONE) {
+
+        sts = MFXVideoDECODE_GetPayload(q->session, &ts, &q->payload);
+
+        if (sts == MFX_ERR_NOT_ENOUGH_BUFFER) {
+            av_log(avctx, AV_LOG_VERBOSE, "Space for SEI is not enough. One SEI will be skipped\n");
+            continue;
+        } else if (sts != MFX_ERR_NONE || q->payload.NumBit == 0) {
+            break;
+        }
+
+        if (q->payload.Type != SEI_TYPE_FRAME_PACKING_ARRANGEMENT)
+            continue;
+
+        switch (avctx->codec_id) {
+        case AV_CODEC_ID_H264:
+            ret = h264_parse_side_data(avctx, q, frame);
+            break;
+        default:
+            break;
+        }
+
+        if (ret < 0) {
+            av_log(avctx, AV_LOG_VERBOSE, "parse side data failed\n");
+            break;
+        }
+    }
+    return ret;
+}
 
 static int qsv_decode(AVCodecContext *avctx, QSVContext *q,
                       AVFrame *frame, int *got_frame,
@@ -896,6 +1023,10 @@ static int qsv_decode(AVCodecContext *avctx, QSVContext *q,
 
         outsurf = &aframe.frame->surface;
 
+        ret = extract_frame_side_data(avctx, q, frame);
+        if (ret < 0)
+            av_log(avctx, AV_LOG_WARNING, "Extracting side from packet failed\n");
+
         frame->pts = MFX_PTS_TO_PTS(outsurf->Data.TimeStamp, avctx->pkt_timebase);
 #if QSV_VERSION_ATLEAST(1, 34)
         if ((avctx->export_side_data & AV_CODEC_EXPORT_DATA_FILM_GRAIN) &&
@@ -909,15 +1040,9 @@ static int qsv_decode(AVCodecContext *avctx, QSVContext *q,
 #endif
 
 #if QSV_VERSION_ATLEAST(1, 35)
-        if (QSV_RUNTIME_VERSION_ATLEAST(q->ver, 1, 35) && avctx->codec_id == AV_CODEC_ID_HEVC) {
+        if ((QSV_RUNTIME_VERSION_ATLEAST(q->ver, 1, 35) && avctx->codec_id == AV_CODEC_ID_HEVC) ||
+            (QSV_RUNTIME_VERSION_ATLEAST(q->ver, 2, 9)  && avctx->codec_id == AV_CODEC_ID_AV1)) {
             ret = qsv_export_hdr_side_data(avctx, &aframe.frame->mdcv, &aframe.frame->clli, frame);
-
-            if (ret < 0)
-                return ret;
-        }
-
-        if (QSV_RUNTIME_VERSION_ATLEAST(q->ver, 2, 9) && avctx->codec_id == AV_CODEC_ID_AV1) {
-            ret = qsv_export_hdr_side_data_av1(avctx, &aframe.frame->mdcv, &aframe.frame->clli, frame);
             if (ret < 0)
                 return ret;
         }
@@ -987,6 +1112,8 @@ static void qsv_decode_close_qsvcontext(QSVContext *q)
     av_buffer_unref(&q->frames_ctx.hw_frames_ctx);
     av_refstruct_unref(&q->frames_ctx.mids);
     av_buffer_pool_uninit(&q->pool);
+
+    av_freep(&q->payload.Data);
 }
 
 static int qsv_process_data(AVCodecContext *avctx, QSVContext *q,

@@ -555,13 +555,14 @@ int ff_instantiate_mf(void *log,
                       MFT_REGISTER_TYPE_INFO *in_type,
                       MFT_REGISTER_TYPE_INFO *out_type,
                       int use_hw,
+                      const LUID *hw_luid,
                       IMFTransform **res)
 {
     HRESULT hr;
     int n;
     int ret;
-    IMFActivate **activate;
-    UINT32 num_activate;
+    IMFActivate **activate = NULL;
+    UINT32 num_activate = 0;
     IMFActivate *winner = 0;
     UINT32 flags;
 
@@ -577,10 +578,26 @@ int ff_instantiate_mf(void *log,
         flags |= MFT_ENUM_FLAG_SYNCMFT;
     }
 
-    hr = f->MFTEnumEx(category, flags, in_type, out_type, &activate,
-                      &num_activate);
-    if (FAILED(hr))
-        goto error_uninit_mf;
+    // MFTEnum2 is loaded optionally
+    if (use_hw && hw_luid && f->MFTEnum2) {
+        IMFAttributes *attrs = NULL;
+        hr = f->MFCreateAttributes(&attrs, 1);
+        if (SUCCEEDED(hr)) {
+            hr = IMFAttributes_SetBlob(attrs, &ff_MFT_ENUM_ADAPTER_LUID,
+                                       (const UINT8*)hw_luid, sizeof(*hw_luid));
+            if (SUCCEEDED(hr))
+                hr = f->MFTEnum2(category, flags, in_type, out_type, attrs,
+                                 &activate, &num_activate);
+            IMFAttributes_Release(attrs);
+        }
+        if (FAILED(hr))
+            goto error_uninit_mf;
+    } else {
+        hr = f->MFTEnumEx(category, flags, in_type, out_type,
+                          &activate, &num_activate);
+        if (FAILED(hr))
+            goto error_uninit_mf;
+    }
 
     if (log) {
         if (!num_activate)

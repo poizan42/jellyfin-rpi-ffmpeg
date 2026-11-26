@@ -188,6 +188,7 @@ static int init_pic_params(AVCodecContext *avctx, FFHWBaseEncodePicture *pic,
 
     uint32_t ref_name_mask = 0x0;
     int name_slots[STD_VIDEO_AV1_REFS_PER_FRAME];
+    int name;
 
     StdVideoAV1Segmentation *segmentation = &ap->segmentation;
     StdVideoAV1LoopFilter  *loop_filter = &ap->loop_filter;
@@ -355,6 +356,7 @@ static int init_pic_params(AVCodecContext *avctx, FFHWBaseEncodePicture *pic,
         av_assert0(pic->nb_refs[0] == 0 || pic->nb_refs[1]);
         ap->av1pic_info.frame_type = STD_VIDEO_AV1_FRAME_TYPE_KEY;
         ap->av1pic_info.refresh_frame_flags = 0xFF;
+        ap->av1pic_info.primary_ref_frame = STD_VIDEO_AV1_PRIMARY_REF_NONE;
         quantization->base_q_idx = enc->q_idx_idr;
         ap->slot = 0;
         ap->last_idr_frame = pic->display_order;
@@ -396,10 +398,10 @@ static int init_pic_params(AVCodecContext *avctx, FFHWBaseEncodePicture *pic,
             }
             ref = pic->refs[0][pic->nb_refs[0] - 2];
             ap_ref = ref->codec_priv;
-            ap->av1pic_info.ref_frame_idx[3] = ap_ref->slot;
             ap->av1pic_info.ref_order_hint[ap_ref->slot] = ref->display_order - ap_ref->last_idr_frame;
-//            vpic->ref_frame_ctrl_l0.fields.search_idx1 = AV1_REF_FRAME_GOLDEN;
-            set_name_slot(ap_ref->av1pic_info.current_frame_id, name_slots, ref_name_mask, 0);
+            /* The header must name the same reference the encoder uses for it. */
+            name = set_name_slot(ap_ref->av1pic_info.current_frame_id, name_slots, ref_name_mask, 0);
+            ap->av1pic_info.ref_frame_idx[name] = ap_ref->slot;
         }
         break;
     case FF_HW_PICTURE_TYPE_B:
@@ -451,6 +453,10 @@ static int init_pic_params(AVCodecContext *avctx, FFHWBaseEncodePicture *pic,
         .primaryReferenceCdfOnly = 0,
         .generateObuExtensionHeader = 0,
     };
+    /* With rate control on, the driver picks the quantiser; constantQIndex must be 0
+     * (VUID-vkCmdEncodeVideoKHR-constantQIndex-10320). */
+    if (ctx->opts.rc_mode != VK_VIDEO_ENCODE_RATE_CONTROL_MODE_DISABLED_BIT_KHR)
+        ap->vkav1pic_info.constantQIndex = 0;
     encode_info->pNext = &ap->vkav1pic_info;
 
     for (int i = 0; i < FF_ARRAY_ELEMS(ap->vkav1pic_info.referenceNameSlotIndices); i++)
@@ -593,7 +599,6 @@ static int init_profile(AVCodecContext *avctx,
     FFVulkanEncodeContext *ctx = &enc->common;
     FFVulkanContext *s = &ctx->s;
     FFVulkanFunctions *vk = &ctx->s.vkfn;
-    FFHWBaseEncodeContext *base_ctx = &ctx->base;
 
     VkVideoEncodeAV1CapabilitiesKHR av1_caps = {
         .sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_AV1_CAPABILITIES_KHR,
@@ -630,31 +635,6 @@ static int init_profile(AVCodecContext *avctx,
         .stdProfile = ff_vk_av1_profile_to_vk(avctx->profile),
     };
     profile->pNext = &enc->profile;
-
-    /* Set level */
-    if (avctx->level == AV_LEVEL_UNKNOWN) {
-        const AV1LevelDescriptor *level;
-        float framerate = 0.0;
-
-        if (avctx->framerate.num > 0 && avctx->framerate.den > 0)
-            framerate = av_q2d(avctx->framerate);
-
-        level = ff_av1_guess_level(avctx->bit_rate, enc->seq_tier,
-                                   base_ctx->surface_width, base_ctx->surface_height,
-                                   enc->tile_rows * enc->tile_cols,
-                                   enc->tile_cols, framerate);
-        if (level) {
-            av_log(avctx, AV_LOG_VERBOSE, "Using level %s.\n", level->name);
-            enc->seq_level_idx = level->level_idx;
-        } else {
-            av_log(avctx, AV_LOG_VERBOSE, "Stream will not conform to "
-                   "any normal level, using level 7.3 by default.\n");
-            enc->seq_level_idx = STD_VIDEO_AV1_LEVEL_7_3;
-            enc->seq_tier = 1;
-        }
-    } else {
-        enc->seq_level_idx = ff_vk_av1_level_to_vk(avctx->level);
-    }
 
     /* User has explicitly specified a profile. */
     if (avctx->profile != AV_PROFILE_UNKNOWN)
@@ -749,6 +729,32 @@ static av_cold int init_sequence_headers(AVCodecContext *avctx)
     const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(s->frames->sw_format);
     if (!desc)
         return AVERROR(EINVAL);
+
+    enc->seq_tier = enc->common.opts.tier;
+
+    if (avctx->level == AV_LEVEL_UNKNOWN) {
+        const AV1LevelDescriptor *level;
+        float framerate = 0.0;
+
+        if (avctx->framerate.num > 0 && avctx->framerate.den > 0)
+            framerate = av_q2d(avctx->framerate);
+
+        level = ff_av1_guess_level(avctx->bit_rate, enc->seq_tier,
+                                   base_ctx->surface_width, base_ctx->surface_height,
+                                   enc->tile_rows * enc->tile_cols,
+                                   enc->tile_cols, framerate);
+        if (level) {
+            av_log(avctx, AV_LOG_VERBOSE, "Using level %s.\n", level->name);
+            enc->seq_level_idx = level->level_idx;
+        } else {
+            av_log(avctx, AV_LOG_VERBOSE, "Stream will not conform to "
+                   "any normal level, using level 7.3 by default.\n");
+            enc->seq_level_idx = STD_VIDEO_AV1_LEVEL_7_3;
+            enc->seq_tier = 1;
+        }
+    } else {
+        enc->seq_level_idx = avctx->level;
+    }
 
     seq_obu->header.obu_type = AV1_OBU_SEQUENCE_HEADER;
     *seq = (AV1RawSequenceHeader) {
@@ -1231,6 +1237,8 @@ static av_cold int vulkan_encode_av1_init(AVCodecContext *avctx)
 
     if (avctx->profile == AV_PROFILE_UNKNOWN)
         avctx->profile = enc->common.opts.profile;
+    if (avctx->level == AV_LEVEL_UNKNOWN)
+        avctx->level = enc->common.opts.level;
 
     enc->caps = (VkVideoEncodeAV1CapabilitiesKHR) {
         .sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_AV1_CAPABILITIES_KHR,
@@ -1361,6 +1369,10 @@ static av_cold int vulkan_encode_av1_init(AVCodecContext *avctx)
 static av_cold int vulkan_encode_av1_close(AVCodecContext *avctx)
 {
     VulkanEncodeAV1Context *enc = avctx->priv_data;
+
+    ff_cbs_fragment_free(&enc->current_access_unit);
+    ff_cbs_close(&enc->cbs);
+
     av_free(enc->padding_payload);
     ff_vulkan_encode_uninit(&enc->common);
     return 0;

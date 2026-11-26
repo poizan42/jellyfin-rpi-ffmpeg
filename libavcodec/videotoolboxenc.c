@@ -556,6 +556,7 @@ static CMVideoCodecType get_cm_codec_type(AVCodecContext *avctx,
             else
                 return MKBETAG('a','p','c','n'); // kCMVideoCodecType_AppleProRes422
         }
+    case AV_CODEC_ID_MJPEG: return kCMVideoCodecType_JPEG;
     default:               return 0;
     }
 }
@@ -1049,9 +1050,10 @@ static int create_cv_pixel_buffer_info(AVCodecContext* avctx,
     CFNumberRef width_num = NULL;
     CFNumberRef height_num = NULL;
     CFMutableDictionaryRef pixel_buffer_info = NULL;
+    enum AVPixelFormat pix_fmt = avctx->pix_fmt == AV_PIX_FMT_VIDEOTOOLBOX ? avctx->sw_pix_fmt : avctx->pix_fmt;
     int cv_color_format;
     int status = get_cv_pixel_format(avctx,
-                                     avctx->pix_fmt,
+                                     pix_fmt,
                                      avctx->color_range,
                                      &cv_color_format,
                                      NULL);
@@ -1258,7 +1260,7 @@ static int vtenc_create_encoder(AVCodecContext   *avctx,
                                       kVTCompressionPropertyKey_Quality,
                                       quality_num);
         CFRelease(quality_num);
-    } else if (avctx->codec_id != AV_CODEC_ID_PRORES) {
+    } else if (avctx->codec_id != AV_CODEC_ID_PRORES && avctx->codec_id != AV_CODEC_ID_MJPEG) {
         bit_rate_num = CFNumberCreate(kCFAllocatorDefault,
                                       kCFNumberSInt32Type,
                                       &bit_rate);
@@ -1374,7 +1376,7 @@ static int vtenc_create_encoder(AVCodecContext   *avctx,
         }
     }
 
-    if (avctx->gop_size > 0 && avctx->codec_id != AV_CODEC_ID_PRORES) {
+    if (avctx->gop_size > 0 && avctx->codec_id != AV_CODEC_ID_PRORES && avctx->codec_id != AV_CODEC_ID_MJPEG) {
         CFNumberRef interval = CFNumberCreate(kCFAllocatorDefault,
                                               kCFNumberIntType,
                                               &avctx->gop_size);
@@ -1523,7 +1525,7 @@ static int vtenc_create_encoder(AVCodecContext   *avctx,
         }
     }
 
-    if (!vtctx->has_b_frames && avctx->codec_id != AV_CODEC_ID_PRORES) {
+    if (!vtctx->has_b_frames && avctx->codec_id != AV_CODEC_ID_PRORES && avctx->codec_id != AV_CODEC_ID_MJPEG) {
         status = VTSessionSetProperty(vtctx->session,
                                       kVTCompressionPropertyKey_AllowFrameReordering,
                                       kCFBooleanFalse);
@@ -1722,11 +1724,9 @@ static int vtenc_configure_encoder(AVCodecContext *avctx)
                              kCFBooleanTrue);
     }
 
-    if (avctx->pix_fmt != AV_PIX_FMT_VIDEOTOOLBOX) {
-        status = create_cv_pixel_buffer_info(avctx, &pixel_buffer_info);
-        if (status)
-            goto init_cleanup;
-    }
+    status = create_cv_pixel_buffer_info(avctx, &pixel_buffer_info);
+    if (status)
+        goto init_cleanup;
 
     vtctx->dts_delta = vtctx->has_b_frames ? -1 : 0;
 
@@ -1836,64 +1836,6 @@ static int is_post_sei_nal_type(int nal_type){
            nal_type != H264_NAL_SPS &&
            nal_type != H264_NAL_PPS &&
            nal_type != H264_NAL_AUD;
-}
-
-/*
- * Finds the sei message start/size of type find_sei_type.
- * If more than one of that type exists, the last one is returned.
- */
-static int find_sei_end(AVCodecContext *avctx,
-                        uint8_t        *nal_data,
-                        size_t          nal_size,
-                        uint8_t       **sei_end)
-{
-    int nal_type;
-    size_t sei_payload_size = 0;
-    uint8_t *nal_start = nal_data;
-    *sei_end = NULL;
-
-    if (!nal_size)
-        return 0;
-
-    nal_type = *nal_data & 0x1F;
-    if (nal_type != H264_NAL_SEI)
-        return 0;
-
-    nal_data++;
-    nal_size--;
-
-    if (nal_data[nal_size - 1] == 0x80)
-        nal_size--;
-
-    while (nal_size > 0 && *nal_data > 0) {
-        do{
-            nal_data++;
-            nal_size--;
-        } while (nal_size > 0 && *nal_data == 0xFF);
-
-        if (!nal_size) {
-            av_log(avctx, AV_LOG_ERROR, "Unexpected end of SEI NAL Unit parsing type.\n");
-            return AVERROR_INVALIDDATA;
-        }
-
-        do{
-            sei_payload_size += *nal_data;
-            nal_data++;
-            nal_size--;
-        } while (nal_size > 0 && *nal_data == 0xFF);
-
-        if (nal_size < sei_payload_size) {
-            av_log(avctx, AV_LOG_ERROR, "Unexpected end of SEI NAL Unit parsing size.\n");
-            return AVERROR_INVALIDDATA;
-        }
-
-        nal_data += sei_payload_size;
-        nal_size -= sei_payload_size;
-    }
-
-    *sei_end = nal_data;
-
-    return nal_data - nal_start + 1;
 }
 
 /**
@@ -2085,7 +2027,6 @@ static int copy_replace_length_codes(
         }
 
         if (sei && !wrote_sei && is_post_sei_nal_type(nal_type)) {
-            //No SEI NAL unit - insert.
             int wrote_bytes;
 
             memcpy(dst_data, start_code, sizeof(start_code));
@@ -2140,35 +2081,6 @@ static int copy_replace_length_codes(
         if (status) {
             av_log(avctx, AV_LOG_ERROR, "Cannot copy data: %d\n", status);
             return AVERROR_EXTERNAL;
-        }
-
-        if (sei && !wrote_sei && nal_type == H264_NAL_SEI) {
-            //Found SEI NAL unit - append.
-            int wrote_bytes;
-            int old_sei_length;
-            int extra_bytes;
-            uint8_t *new_sei;
-            old_sei_length = find_sei_end(avctx, dst_box, box_len, &new_sei);
-            if (old_sei_length < 0)
-                return old_sei_length;
-
-            wrote_bytes = write_sei(sei,
-                                    SEI_TYPE_USER_DATA_REGISTERED_ITU_T_T35,
-                                    new_sei,
-                                    remaining_dst_size - old_sei_length);
-            if (wrote_bytes < 0)
-                return wrote_bytes;
-
-            if (new_sei + wrote_bytes >= dst_data + remaining_dst_size)
-                return AVERROR_BUFFER_TOO_SMALL;
-
-            new_sei[wrote_bytes++] = 0x80;
-            extra_bytes = wrote_bytes - (dst_box + box_len - new_sei);
-
-            dst_data += extra_bytes;
-            remaining_dst_size -= extra_bytes;
-
-            wrote_sei = 1;
         }
 
         src_offset += curr_src_len;
@@ -2769,6 +2681,13 @@ static const enum AVPixelFormat prores_pix_fmts[] = {
     AV_PIX_FMT_NONE
 };
 
+static const enum AVPixelFormat mjpeg_pix_fmts[] = {
+    AV_PIX_FMT_VIDEOTOOLBOX,
+    AV_PIX_FMT_NV12,
+    AV_PIX_FMT_YUV420P,
+    AV_PIX_FMT_NONE
+};
+
 #define VE AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_ENCODING_PARAM
 #define COMMON_OPTIONS \
     { "allow_sw", "Allow software encoding", OFFSET(allow_sw), AV_OPT_TYPE_BOOL, \
@@ -2941,6 +2860,38 @@ const FFCodec ff_prores_videotoolbox_encoder = {
     FF_CODEC_ENCODE_CB(vtenc_frame),
     .close            = vtenc_close,
     .p.priv_class     = &prores_videotoolbox_class,
+    .caps_internal    = FF_CODEC_CAP_INIT_CLEANUP,
+    .p.wrapper_name   = "videotoolbox",
+    .hw_configs       = vt_encode_hw_configs,
+};
+
+static const AVOption mjpeg_options[] = {
+    { "allow_sw", "Allow software encoding", OFFSET(allow_sw), AV_OPT_TYPE_BOOL,{ .i64 = 0 }, 0, 1, VE },
+    { NULL },
+};
+
+static const AVClass mjpeg_videotoolbox_class = {
+    .class_name = "mjpeg_videotoolbox",
+    .item_name  = av_default_item_name,
+    .option     = mjpeg_options,
+    .version    = LIBAVUTIL_VERSION_INT,
+};
+
+const FFCodec ff_mjpeg_videotoolbox_encoder = {
+    .p.name           = "mjpeg_videotoolbox",
+    CODEC_LONG_NAME("VideoToolbox MJPEG Encoder"),
+    .p.type           = AVMEDIA_TYPE_VIDEO,
+    .p.id             = AV_CODEC_ID_MJPEG,
+    .p.capabilities   = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_DELAY |
+                        AV_CODEC_CAP_HARDWARE,
+    .priv_data_size   = sizeof(VTEncContext),
+    CODEC_PIXFMTS_ARRAY(mjpeg_pix_fmts),
+    .defaults         = vt_defaults,
+    .color_ranges     = AVCOL_RANGE_MPEG | AVCOL_RANGE_JPEG,
+    .init             = vtenc_init,
+    FF_CODEC_ENCODE_CB(vtenc_frame),
+    .close            = vtenc_close,
+    .p.priv_class     = &mjpeg_videotoolbox_class,
     .caps_internal    = FF_CODEC_CAP_INIT_CLEANUP,
     .p.wrapper_name   = "videotoolbox",
     .hw_configs       = vt_encode_hw_configs,

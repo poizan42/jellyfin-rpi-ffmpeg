@@ -41,7 +41,13 @@ cglobal scene_sad%1, 6, 7, 3, src1, stride1, src2, stride2, width, end, x
 
 %macro PSADQ 4 ; depth, dst, [src2], tmp
 %if %1 == 8
+    %if cpuflag(avx)
         psadbw %2, %3
+    %else
+        ; PSADBW requires an aligned memory operand.
+        movu   %4, %3
+        psadbw %2, %4
+    %endif
 %else
         psubw     %2, %3
         pabsw     %2, %2

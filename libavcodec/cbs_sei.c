@@ -544,8 +544,7 @@ int ff_cbs_sei_find_message(CodedBitstreamContext *ctx,
     return AVERROR(ENOENT);
 }
 
-static void cbs_sei_delete_message(SEIRawMessageList *list,
-                                   int position)
+void ff_cbs_sei_delete_message(SEIRawMessageList *list, int position)
 {
     SEIRawMessage *message;
 
@@ -580,7 +579,7 @@ void ff_cbs_sei_delete_message_type(CodedBitstreamContext *ctx,
 
         for (j = list->nb_messages - 1; j >= 0; j--) {
             if (list->messages[j].payload_type == payload_type)
-                cbs_sei_delete_message(list, j);
+                ff_cbs_sei_delete_message(list, j);
         }
     }
 }

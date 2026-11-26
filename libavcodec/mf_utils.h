@@ -51,6 +51,8 @@ typedef struct MFFunctions {
     HRESULT (WINAPI *MFCreateAlignedMemoryBuffer) (DWORD cbMaxLength,
                                                    DWORD cbAligment,
                                                    IMFMediaBuffer **ppBuffer);
+    HRESULT (WINAPI *MFCreateAttributes)(IMFAttributes **ppMFAttributes,
+                                         UINT32 cInitialSize);
     HRESULT (WINAPI *MFCreateSample) (IMFSample **ppIMFSample);
     HRESULT (WINAPI *MFCreateMediaType) (IMFMediaType **ppMFType);
     HRESULT (WINAPI *MFCreateDXGISurfaceBuffer) (REFIID riid,
@@ -66,6 +68,14 @@ typedef struct MFFunctions {
                                 const MFT_REGISTER_TYPE_INFO *pOutputType,
                                 IMFActivate ***pppMFTActivate,
                                 UINT32 *pnumMFTActivate);
+    // MFTEnum2 is missing in pre-Windows 10, version 1703's mfplat.dll.
+    // Therefore we load it optionally.
+    HRESULT (WINAPI *MFTEnum2)(GUID guidCategory, UINT32 Flags,
+                               const MFT_REGISTER_TYPE_INFO *pInputType,
+                               const MFT_REGISTER_TYPE_INFO *pOutputType,
+                               IMFAttributes *pAttributes,
+                               IMFActivate ***pppMFTActivate,
+                               UINT32 *pnumMFTActivate);
 } MFFunctions;
 
 // These functions do exist in mfapi.h, but are only available within
@@ -122,6 +132,8 @@ DEFINE_MEDIATYPE_GUID(ff_MFVideoFormat_HEVC, 0x43564548); // FCC('HEVC')
 DEFINE_MEDIATYPE_GUID(ff_MFVideoFormat_HEVC_ES, 0x53564548); // FCC('HEVS')
 DEFINE_MEDIATYPE_GUID(ff_MFVideoFormat_AV1, 0x31305641); // FCC('AV01')
 
+// This enum is missing from mingw-w64's headers
+DEFINE_GUID(ff_MFT_ENUM_ADAPTER_LUID, 0x1d39518c, 0xe220, 0x4da8, 0xa0, 0x7f, 0xba, 0x17, 0x25, 0x52, 0xd6, 0xb1);
 
 // This enum is missing from mingw-w64's codecapi.h by v7.0.0.
 enum ff_eAVEncCommonRateControlMode {
@@ -160,9 +172,19 @@ enum {
 // header when targeting UWP (where including it with MSVC seems to work,
 // but fails when built with clang in MSVC mode).
 enum ff_eAVEncH264VProfile {
-   ff_eAVEncH264VProfile_Base = 66,
-   ff_eAVEncH264VProfile_Main = 77,
-   ff_eAVEncH264VProfile_High = 100,
+    ff_eAVEncH264VProfile_Base = 66,
+    ff_eAVEncH264VProfile_Main = 77,
+    ff_eAVEncH264VProfile_High = 100,
+};
+
+enum ff_eAVEncH265VProfile {
+    ff_eAVEncH265VProfile_Main_420_8  = 1,
+    ff_eAVEncH265VProfile_Main_420_10 = 2,
+};
+
+enum ff_eAVEncAV1VProfile {
+    ff_eAVEncAV1VProfile_Main_420_8  = 1,
+    ff_eAVEncAV1VProfile_Main_420_10 = 2,
 };
 
 char *ff_hr_str_buf(char *buf, size_t size, HRESULT hr);
@@ -188,7 +210,8 @@ const CLSID *ff_codec_to_mf_subtype(enum AVCodecID codec);
 int ff_instantiate_mf(void *log, MFFunctions *f, GUID category,
                       MFT_REGISTER_TYPE_INFO *in_type,
                       MFT_REGISTER_TYPE_INFO *out_type,
-                      int use_hw, IMFTransform **res);
+                      int use_hw, const LUID *hw_luid,
+                      IMFTransform **res);
 void ff_free_mf(MFFunctions *f, IMFTransform **mft);
 
 #endif

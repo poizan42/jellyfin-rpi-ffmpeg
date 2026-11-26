@@ -28,6 +28,27 @@ const AVCodecHWConfigInternal *const ff_vulkan_encode_hw_configs[] = {
     NULL,
 };
 
+static void vulkan_encode_free_pic(FFVulkanEncodeContext *ctx,
+                                   FFHWBaseEncodePicture *pic)
+{
+    FFVulkanFunctions *vk = &ctx->s.vkfn;
+
+    FFVulkanEncodePicture *vp = pic->priv;
+
+    if (vp->in.view)
+        vk->DestroyImageView(ctx->s.hwctx->act_dev, vp->in.view,
+                             ctx->s.hwctx->alloc);
+
+    if (!ctx->common.layered_dpb && vp->dpb.view)
+        vk->DestroyImageView(ctx->s.hwctx->act_dev, vp->dpb.view,
+                             ctx->s.hwctx->alloc);
+
+    vp->in.view = VK_NULL_HANDLE;
+    vp->dpb.view = VK_NULL_HANDLE;
+
+    ctx->slots[vp->dpb_slot.slotIndex] = NULL;
+}
+
 av_cold void ff_vulkan_encode_uninit(FFVulkanEncodeContext *ctx)
 {
     FFVulkanContext *s = &ctx->s;
@@ -42,9 +63,14 @@ av_cold void ff_vulkan_encode_uninit(FFVulkanEncodeContext *ctx)
                                              ctx->session_params,
                                              s->hwctx->alloc);
 
-    ff_hw_base_encode_close(&ctx->base);
+    /* Destroy the image views of any pictures still in the queue,
+     * as ff_hw_base_encode_close() only frees the picture structs */
+    for (FFHWBaseEncodePicture *pic = ctx->base.pic_start; pic; pic = pic->next)
+        vulkan_encode_free_pic(ctx, pic);
 
     av_buffer_pool_uninit(&ctx->buf_pool);
+
+    ff_hw_base_encode_close(&ctx->base);
 
     ff_vk_video_common_uninit(s, &ctx->common);
 
@@ -95,19 +121,8 @@ static int vulkan_encode_init(AVCodecContext *avctx, FFHWBaseEncodePicture *pic)
 static int vulkan_encode_free(AVCodecContext *avctx, FFHWBaseEncodePicture *pic)
 {
     FFVulkanEncodeContext *ctx = avctx->priv_data;
-    FFVulkanFunctions *vk = &ctx->s.vkfn;
 
-    FFVulkanEncodePicture *vp = pic->priv;
-
-    if (vp->in.view)
-        vk->DestroyImageView(ctx->s.hwctx->act_dev, vp->in.view,
-                             ctx->s.hwctx->alloc);
-
-    if (!ctx->common.layered_dpb && vp->dpb.view)
-        vk->DestroyImageView(ctx->s.hwctx->act_dev, vp->dpb.view,
-                             ctx->s.hwctx->alloc);
-
-    ctx->slots[vp->dpb_slot.slotIndex] = NULL;
+    vulkan_encode_free_pic(ctx, pic);
 
     return 0;
 }
@@ -354,12 +369,15 @@ static int vulkan_encode_issue(AVCodecContext *avctx,
     if (err < 0)
         goto fail;
 
-    /* Source image layout conversion */
+    /* Source image layout conversion. Writes to it happened on other
+     * queues, and were made available by the semaphore wait: their access
+     * flags are not to be carried over, and may not even be valid on this
+     * queue. */
     img_bar[nb_img_bar] = (VkImageMemoryBarrier2) {
         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
         .pNext = NULL,
         .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-        .srcAccessMask = vkf->access[0],
+        .srcAccessMask = VK_ACCESS_2_NONE,
         .dstStageMask = VK_PIPELINE_STAGE_2_VIDEO_ENCODE_BIT_KHR,
         .dstAccessMask = VK_ACCESS_2_VIDEO_ENCODE_READ_BIT_KHR,
         .oldLayout = vkf->layout[0],
@@ -852,10 +870,17 @@ av_cold int ff_vulkan_encode_init(AVCodecContext *avctx, FFVulkanEncodeContext *
     ctx->caps.sType = VK_STRUCTURE_TYPE_VIDEO_CAPABILITIES_KHR;
     ctx->caps.pNext = &ctx->enc_caps;
 
-    ret = vk->GetPhysicalDeviceVideoCapabilitiesKHR(s->hwctx->phys_dev,
-                                                    &ctx->profile,
-                                                    &ctx->caps);
-    if (ret == VK_ERROR_VIDEO_PROFILE_OPERATION_NOT_SUPPORTED_KHR) {
+    /* A pixel format without a video profile representation is not a valid
+     * profile to query the capabilities for */
+    if (ctx->profile.chromaSubsampling == VK_VIDEO_CHROMA_SUBSAMPLING_INVALID_KHR ||
+        ctx->profile.lumaBitDepth == VK_VIDEO_COMPONENT_BIT_DEPTH_INVALID_KHR)
+        ret = VK_ERROR_VIDEO_PROFILE_FORMAT_NOT_SUPPORTED_KHR;
+    else
+        ret = vk->GetPhysicalDeviceVideoCapabilitiesKHR(s->hwctx->phys_dev,
+                                                        &ctx->profile,
+                                                        &ctx->caps);
+    if (ret == VK_ERROR_VIDEO_PROFILE_OPERATION_NOT_SUPPORTED_KHR ||
+        ret == VK_ERROR_VIDEO_PROFILE_CODEC_NOT_SUPPORTED_KHR) {
         av_log(avctx, AV_LOG_ERROR, "Unable to initialize encoding: "
                "%s profile \"%s\" not supported!\n",
                avcodec_get_name(avctx->codec_id),
@@ -1037,7 +1062,7 @@ av_cold int ff_vulkan_encode_init(AVCodecContext *avctx, FFVulkanEncodeContext *
 
     /* Create session */
     session_create.pVideoProfile = &ctx->profile;
-    session_create.flags = 0x0;
+    session_create.flags = VK_VIDEO_SESSION_CREATE_ALLOW_ENCODE_PARAMETER_OPTIMIZATIONS_BIT_KHR;
     session_create.queueFamilyIndex = ctx->qf_enc->idx;
     session_create.maxCodedExtent = ctx->caps.maxCodedExtent;
     session_create.maxDpbSlots = ctx->caps.maxDpbSlots;

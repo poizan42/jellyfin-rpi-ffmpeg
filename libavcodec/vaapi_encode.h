@@ -264,6 +264,9 @@ typedef struct VAAPIEncodeContext {
     // Surface alignment required by driver.
     int             surface_alignment_width;
     int             surface_alignment_height;
+
+    // Enabling overrides for AMD VCN/VCE.
+    int             amd_vcn_override;
 } VAAPIEncodeContext;
 
 typedef struct VAAPIEncodeType {

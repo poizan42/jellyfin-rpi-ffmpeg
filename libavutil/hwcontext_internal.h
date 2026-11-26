@@ -166,4 +166,25 @@ extern const HWContextType ff_hwcontext_type_vulkan;
 extern const HWContextType ff_hwcontext_type_amf;
 extern const HWContextType ff_hwcontext_type_oh;
 
+typedef struct FFHWDeviceContext {
+    /**
+     * The public AVHWDeviceContext. See hwcontext.h for it.
+     */
+    AVHWDeviceContext p;
+
+    const HWContextType *hw_type;
+
+    /**
+     * For a derived device, a reference to the original device
+     * context it was derived from.
+     */
+    AVBufferRef *source_device;
+
+    /**
+     * An array of reference to device contexts which
+     * were derived from this device.
+     */
+    AVBufferRef *derived_devices[AV_HWDEVICE_TYPE_NB];
+} FFHWDeviceContext;
+
 #endif /* AVUTIL_HWCONTEXT_INTERNAL_H */

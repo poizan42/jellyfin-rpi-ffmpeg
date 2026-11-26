@@ -1717,9 +1717,22 @@ static int configure_output_video_filter(FilterGraphPriv *fgp, AVFilterGraph *gr
                ofp->format != AV_PIX_FMT_NONE || !ofp->pix_fmts);
     av_bprint_init(&bprint, 0, AV_BPRINT_SIZE_UNLIMITED);
     choose_pix_fmts(ofp, &bprint);
-    choose_color_spaces(ofp, &bprint);
-    choose_color_ranges(ofp, &bprint);
-    choose_alpha_modes(ofp, &bprint);
+    /* SW filter cannot handle color conversions between HW pixel formats. */
+    {
+        int bprint_color_options = 1;
+        if (ofp->format != AV_PIX_FMT_NONE) {
+            const AVPixFmtDescriptor *ofp_fmt_desc;
+
+            ofp_fmt_desc = av_pix_fmt_desc_get(ofp->format);
+            if (ofp_fmt_desc->flags & AV_PIX_FMT_FLAG_HWACCEL)
+                bprint_color_options = 0;
+        }
+        if (bprint_color_options) {
+            choose_color_spaces(ofp, &bprint);
+            choose_color_ranges(ofp, &bprint);
+            choose_alpha_modes(ofp, &bprint);
+        }
+    }
     if (!av_bprint_is_complete(&bprint))
         return AVERROR(ENOMEM);
 
@@ -2037,8 +2050,11 @@ static int configure_input_filter(FilterGraph *fg, AVFilterGraph *graph,
 
 static void cleanup_filtergraph(FilterGraph *fg, FilterGraphThread *fgt)
 {
-    for (int i = 0; i < fg->nb_outputs; i++)
+    for (int i = 0; i < fg->nb_outputs; i++) {
         fg->outputs[i]->filter = NULL;
+        // drop the last frame retained by FPS conversion before graph reinitialization
+        av_frame_unref(ofp_from_ofilter(fg->outputs[i])->fps.last_frame);
+    }
     for (int i = 0; i < fg->nb_inputs; i++)
         fg->inputs[i]->filter = NULL;
     avfilter_graph_free(&fgt->graph);
@@ -2205,7 +2221,7 @@ static int configure_filtergraph(FilterGraph *fg, FilterGraphThread *fgt)
         AVFrame *tmp;
         while (av_fifo_read(ifp->frame_queue, &tmp, 1) >= 0) {
             if (ifp->type_src == AVMEDIA_TYPE_SUBTITLE) {
-                sub2video_frame(&ifp->ifilter, tmp, !fgt->graph);
+                ret = sub2video_frame(&ifp->ifilter, tmp, !fgt->graph);
             } else {
                 if (ifp->type_src == AVMEDIA_TYPE_VIDEO) {
                     if (ifp->displaymatrix_applied)
@@ -2275,8 +2291,7 @@ static int ifilter_parameters_from_frame(InputFilter *ifilter, const AVFrame *fr
     for (int i = 0; i < frame->nb_side_data; i++) {
         const AVSideDataDescriptor *desc = av_frame_side_data_desc(frame->side_data[i]->type);
 
-        if (!(desc->props & AV_SIDE_DATA_PROP_GLOBAL) ||
-            frame->side_data[i]->type == AV_FRAME_DATA_DISPLAYMATRIX)
+        if (!(desc->props & AV_SIDE_DATA_PROP_GLOBAL))
             continue;
 
         ret = av_frame_side_data_clone(&ifp->side_data,
@@ -2287,8 +2302,12 @@ static int ifilter_parameters_from_frame(InputFilter *ifilter, const AVFrame *fr
     }
 
     sd = av_frame_get_side_data(frame, AV_FRAME_DATA_DISPLAYMATRIX);
-    if (sd)
+    if (sd) {
         memcpy(ifp->displaymatrix, sd->data, sizeof(ifp->displaymatrix));
+        if ((ifp->opts.flags & IFILTER_FLAG_AUTOROTATE) &&
+            !(av_pix_fmt_desc_get(ifp->format)->flags & AV_PIX_FMT_FLAG_HWACCEL))
+            av_frame_side_data_remove(&ifp->side_data, &ifp->nb_side_data, AV_FRAME_DATA_DISPLAYMATRIX);
+    }
     ifp->displaymatrix_present = !!sd;
 
     /* Copy downmix related side data to InputFilterPriv so it may be propagated
@@ -2662,9 +2681,20 @@ static int close_output(OutputFilterPriv *ofp, FilterGraphThread *fgt)
     if (!fgt->got_frame) {
         AVFrame *frame = fgt->frame;
         FrameData *fd;
+        const AVPixFmtDescriptor *ofp_fmt_desc;
 
         frame->time_base   = ofp->tb_out;
         frame->format      = ofp->format;
+
+        ofp_fmt_desc = av_pix_fmt_desc_get(ofp->format);
+        // a dummy frame with HW pixel format requires a valid hw_frames_ctx
+        if (ofp_fmt_desc->flags & AV_PIX_FMT_FLAG_HWACCEL) {
+            AVFilterContext *sink = ofp->ofilter.filter;
+            AVBufferRef *hwfc = av_buffersink_get_hw_frames_ctx(sink);
+            ret = av_buffer_replace(&frame->hw_frames_ctx, hwfc);
+            if (ret < 0)
+                return ret;
+        }
 
         frame->width               = ofp->width;
         frame->height              = ofp->height;
@@ -2957,7 +2987,8 @@ static void sub2video_heartbeat(InputFilter *ifilter, int64_t pts, AVRational tb
            or if we need to initialize the system, update the
            overlaid subpicture and its start/end times */
         sub2video_update(ifp, pts2 + 1, NULL);
-    else
+
+    if (av_buffersrc_get_nb_failed_requests(ifp->ifilter.filter))
         sub2video_push_ref(ifp, pts2);
 }
 
@@ -2967,16 +2998,17 @@ static int sub2video_frame(InputFilter *ifilter, AVFrame *frame, int buffer)
     int ret;
 
     if (buffer) {
-        AVFrame *tmp;
+        // queue a NULL entry for EOF, so it is not lost when
+        // the queue is replayed after configuring the graph
+        AVFrame *tmp = NULL;
 
-        if (!frame)
-            return 0;
+        if (frame) {
+            tmp = av_frame_alloc();
+            if (!tmp)
+                return AVERROR(ENOMEM);
 
-        tmp = av_frame_alloc();
-        if (!tmp)
-            return AVERROR(ENOMEM);
-
-        av_frame_move_ref(tmp, frame);
+            av_frame_move_ref(tmp, frame);
+        }
 
         ret = av_fifo_write(ifp->frame_queue, &tmp, 1);
         if (ret < 0) {

@@ -1195,6 +1195,35 @@ fail:
 #endif
 }
 
+static av_cold void vaapi_encode_probe_overrides(av_unused AVCodecContext *avctx)
+{
+#if !defined(_WIN32)
+    VAAPIEncodeContext *ctx = avctx->priv_data;
+#if VA_CHECK_VERSION(1, 15, 0)
+    VADisplayAttribute attr = {
+        .type = VADisplayPCIID,
+    };
+    VAStatus vas = vaGetDisplayAttributes(ctx->hwctx->display, &attr, 1);
+
+    // AMD VCN/VCE hardware needs additional overrides, while
+    // libva does not provide any feedback functionality.
+    if (vas == VA_STATUS_SUCCESS &&
+        attr.flags != VA_DISPLAY_ATTRIB_NOT_SUPPORTED)
+        ctx->amd_vcn_override = ((attr.value >> 16) & 0xffff) == 0x1002;
+    else
+#endif
+    {
+        const char *vendor = vaQueryVendorString(ctx->hwctx->display);
+        ctx->amd_vcn_override = vendor &&
+            strstr(vendor, "Mesa Gallium driver") &&
+            strstr(vendor, "AMD");
+    }
+
+    if (ctx->amd_vcn_override)
+        av_log(avctx, AV_LOG_DEBUG, "Using overrides for AMD.\n");
+#endif
+}
+
 static const VAAPIEncodeRCMode vaapi_encode_rc_modes[] = {
     //                                  Bitrate   Quality
     //                                     | Maxrate | HRD/VBV
@@ -2172,6 +2201,8 @@ av_cold int ff_vaapi_encode_init(AVCodecContext *avctx)
     base_ctx->op = &vaapi_op;
 
     ctx->hwctx = base_ctx->device->hwctx;
+
+    vaapi_encode_probe_overrides(avctx);
 
     err = vaapi_encode_profile_entrypoint(avctx);
     if (err < 0)

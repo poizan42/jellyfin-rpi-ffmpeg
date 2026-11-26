@@ -260,6 +260,11 @@ int ff_cbs_sei_find_message(CodedBitstreamContext *ctx,
                             SEIRawMessage **message);
 
 /**
+ * Delete the message at the given position from a message list.
+ */
+void ff_cbs_sei_delete_message(SEIRawMessageList *list, int position);
+
+/**
  * Delete all messages with the given payload type from an access unit.
  */
 void ff_cbs_sei_delete_message_type(CodedBitstreamContext *ctx,

@@ -23,6 +23,7 @@
 #include "libavutil/avassert.h"
 #include "libavutil/mem.h"
 #include "libavutil/vulkan_loader.h"
+#include "h264dec.h"
 
 #define DECODER_IS_SDR(codec_id) \
     (((codec_id) == AV_CODEC_ID_FFV1) || \
@@ -233,7 +234,8 @@ int ff_vk_decode_prepare_frame(FFVulkanDecodeContext *dec, AVFrame *pic,
                                 (AVVkFrame *)pic->data[0],
                                 hwfc->format[0],
                                 VK_IMAGE_USAGE_VIDEO_DECODE_DST_BIT_KHR |
-                                (!is_current ? VK_IMAGE_USAGE_VIDEO_DECODE_DPB_BIT_KHR : 0));
+                                (hwfc->usage & VK_IMAGE_USAGE_VIDEO_DECODE_DPB_BIT_KHR));
+                                // the above fixes VUID-VkVideoBeginCodingInfoKHR-slotIndex-07245
         if (err < 0)
             return err;
 
@@ -313,7 +315,7 @@ int ff_vk_decode_add_slice(AVCodecContext *avctx, FFVulkanDecodePicture *vp,
 
     if (offsets) {
         slice_off = av_fast_realloc(dec->slice_off, &dec->slice_off_max,
-                                    (nb + 1)*sizeof(slice_off));
+                                    (nb + 1)*sizeof(*slice_off));
         if (!slice_off)
             return AVERROR(ENOMEM);
 
@@ -335,15 +337,28 @@ int ff_vk_decode_add_slice(AVCodecContext *avctx, FFVulkanDecodePicture *vp,
          * easier, and gives us ample headroom. */
         buf_size = 2 << av_log2(buf_size);
 
+        /* When the frames context uses DRM modifier tiling,
+         * hwctx->create_pnext contains VkImageDrmFormatModifierListCreateInfoEXT,
+         * which per spec does not extend VkBufferCreateInfo, so we need to find
+         * the VkVideoProfileListInfoKHR structure within it. */
+        void *buf_pnext = ctx->s.hwfc->create_pnext;
+        if (ctx->s.hwfc->tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT)
+            buf_pnext = (void *)ff_vk_find_struct(ctx->s.hwfc->create_pnext,
+                                                  VK_STRUCTURE_TYPE_VIDEO_PROFILE_LIST_INFO_KHR);
+
+        VkBufferUsageFlags buf_usage = DECODER_IS_SDR(avctx->codec_id) ?
+                                       (VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) :
+                                       VK_BUFFER_USAGE_VIDEO_DECODE_SRC_BIT_KHR;
+
         err = ff_vk_get_pooled_buffer(&ctx->s, &ctx->buf_pool, &new_ref,
-                                      DECODER_IS_SDR(avctx->codec_id) ?
-                                      (VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                                       VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) :
-                                      VK_BUFFER_USAGE_VIDEO_DECODE_SRC_BIT_KHR,
-                                      ctx->s.hwfc->create_pnext, buf_size,
+                                      buf_usage, buf_pnext, buf_size,
                                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                      (DECODER_IS_SDR(avctx->codec_id) ?
-                                       VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT : 0x0));
+                                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (err < 0)
+            err = ff_vk_get_pooled_buffer(&ctx->s, &ctx->buf_pool, &new_ref,
+                                          buf_usage, buf_pnext, buf_size,
+                                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
         if (err < 0)
             return err;
 
@@ -808,10 +823,12 @@ static VkResult vulkan_setup_profile(AVCodecContext *avctx,
         h264_profile->stdProfileIdc = cur_profile & ~(AV_PROFILE_H264_CONSTRAINED |
                                                       AV_PROFILE_H264_INTRA);
 
-        h264_profile->pictureLayout = avctx->field_order == AV_FIELD_UNKNOWN ||
-                                      avctx->field_order == AV_FIELD_PROGRESSIVE ?
-                                      VK_VIDEO_DECODE_H264_PICTURE_LAYOUT_PROGRESSIVE_KHR :
-                                      VK_VIDEO_DECODE_H264_PICTURE_LAYOUT_INTERLACED_INTERLEAVED_LINES_BIT_KHR;
+        h264_profile->pictureLayout =
+            VK_VIDEO_DECODE_H264_PICTURE_LAYOUT_PROGRESSIVE_KHR;
+        const H264Context *h = avctx->priv_data;
+        if (h && h->ps.sps && !h->ps.sps->frame_mbs_only_flag)
+            h264_profile->pictureLayout =
+                VK_VIDEO_DECODE_H264_PICTURE_LAYOUT_INTERLACED_INTERLEAVED_LINES_BIT_KHR;
     } else if (avctx->codec_id == AV_CODEC_ID_H265) {
         dec_caps->pNext = h265_caps;
         usage->pNext = h265_profile;
@@ -841,6 +858,12 @@ static VkResult vulkan_setup_profile(AVCodecContext *avctx,
     profile->chromaSubsampling   = ff_vk_subsampling_from_av_desc(desc);
     profile->lumaBitDepth        = ff_vk_depth_from_av_depth(desc->comp[0].depth);
     profile->chromaBitDepth      = profile->lumaBitDepth;
+
+    /* A pixel format without a video profile representation is not a valid
+     * profile to query the capabilities for */
+    if (profile->chromaSubsampling == VK_VIDEO_CHROMA_SUBSAMPLING_INVALID_KHR ||
+        profile->lumaBitDepth == VK_VIDEO_COMPONENT_BIT_DEPTH_INVALID_KHR)
+        return VK_ERROR_VIDEO_PROFILE_FORMAT_NOT_SUPPORTED_KHR;
 
     profile_list->sType        = VK_STRUCTURE_TYPE_VIDEO_PROFILE_LIST_INFO_KHR;
     profile_list->profileCount = 1;
@@ -946,11 +969,21 @@ static int vulkan_decode_get_profile(AVCodecContext *avctx, AVBufferRef *frames_
                                    cur_profile);
     }
 
-    if (ret == VK_ERROR_VIDEO_PROFILE_OPERATION_NOT_SUPPORTED_KHR) {
+    if (ret == VK_ERROR_VIDEO_PROFILE_OPERATION_NOT_SUPPORTED_KHR ||
+        ret == VK_ERROR_VIDEO_PROFILE_CODEC_NOT_SUPPORTED_KHR) {
         av_log(avctx, AV_LOG_VERBOSE, "Unable to initialize video session: "
                "%s profile \"%s\" not supported!\n",
                avcodec_get_name(avctx->codec_id),
                avcodec_profile_name(avctx->codec_id, cur_profile));
+        return AVERROR(EINVAL);
+    } else if (ret == VK_ERROR_VIDEO_PICTURE_LAYOUT_NOT_SUPPORTED_KHR) {
+        if (avctx->codec_id == AV_CODEC_ID_H264)
+            av_log(avctx, AV_LOG_VERBOSE, "Unable to initialize video session: "
+                   "pictureLayout %#x not supported!\n",
+                   (unsigned)prof->h264_profile.pictureLayout);
+        else
+            av_log(avctx, AV_LOG_VERBOSE, "Unable to initialize video session: "
+                   "pictureLayout not supported!\n");
         return AVERROR(EINVAL);
     } else if (ret == VK_ERROR_VIDEO_PROFILE_FORMAT_NOT_SUPPORTED_KHR) {
         av_log(avctx, AV_LOG_VERBOSE, "Unable to initialize video session: "
@@ -1033,13 +1066,12 @@ static int vulkan_decode_get_profile(AVCodecContext *avctx, AVBufferRef *frames_
                "VK_VIDEO_DECODE_CAPABILITY_DPB_AND_OUTPUT_DISTINCT_BIT_KHR are set!\n");
         return AVERROR_EXTERNAL;
     } else if ((dec_caps->flags & (VK_VIDEO_DECODE_CAPABILITY_DPB_AND_OUTPUT_COINCIDE_BIT_KHR |
-                                   VK_VIDEO_DECODE_CAPABILITY_DPB_AND_OUTPUT_DISTINCT_BIT_KHR) ==
-                                   VK_VIDEO_DECODE_CAPABILITY_DPB_AND_OUTPUT_COINCIDE_BIT_KHR) &&
+                                   VK_VIDEO_DECODE_CAPABILITY_DPB_AND_OUTPUT_DISTINCT_BIT_KHR)) ==
+                                   VK_VIDEO_DECODE_CAPABILITY_DPB_AND_OUTPUT_COINCIDE_BIT_KHR &&
                !(caps->flags & VK_VIDEO_CAPABILITY_SEPARATE_REFERENCE_IMAGES_BIT_KHR)) {
-        av_log(avctx, AV_LOG_ERROR, "Cannot initialize Vulkan decoding session, buggy driver: "
-               "VK_VIDEO_DECODE_CAPABILITY_DPB_AND_OUTPUT_COINCIDE_BIT_KHR set "
-               "but VK_VIDEO_CAPABILITY_SEPARATE_REFERENCE_IMAGES_BIT_KHR is unset!\n");
-        return AVERROR_EXTERNAL;
+        av_log(avctx, AV_LOG_VERBOSE,
+               "COINCIDE-only decode without SEPARATE_REFERENCE_IMAGES "
+               "(layered DPB capability); continuing\n");
     }
 
     dec->dedicated_dpb = !(dec_caps->flags & VK_VIDEO_DECODE_CAPABILITY_DPB_AND_OUTPUT_COINCIDE_BIT_KHR);
@@ -1217,7 +1249,9 @@ int ff_vk_frame_params(AVCodecContext *avctx, AVBufferRef *hw_frames_ctx)
         }
     }
 
-    hwfc->tiling = VK_IMAGE_TILING_OPTIMAL;
+    if (hwfc->tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT)
+        hwfc->tiling = VK_IMAGE_TILING_OPTIMAL;
+
     hwfc->usage  = VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                    VK_IMAGE_USAGE_STORAGE_BIT      |
                    VK_IMAGE_USAGE_SAMPLED_BIT;
@@ -1382,10 +1416,22 @@ int ff_vk_decode_init(AVCodecContext *avctx)
         dpb_frames->height    = s->frames->height;
 
         dpb_hwfc = dpb_frames->hwctx;
-        dpb_hwfc->create_pnext = (void *)ff_vk_find_struct(ctx->s.hwfc->create_pnext,
-                                                           VK_STRUCTURE_TYPE_VIDEO_PROFILE_LIST_INFO_KHR);
+        void *profile_list = (void *)ff_vk_find_struct(ctx->s.hwfc->create_pnext,
+                                                       VK_STRUCTURE_TYPE_VIDEO_PROFILE_LIST_INFO_KHR);
+        /* With DPB_AND_OUTPUT_DISTINCT, DPB images never leave the decoder,
+         * so they don't need the output's DRM modifiers. */
+        void *drm_create_pnext = ff_vk_find_struct(ctx->s.hwfc->create_pnext,
+                                                   VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT);
+        if (drm_create_pnext &&
+            !(ctx->dec_caps.flags & VK_VIDEO_DECODE_CAPABILITY_DPB_AND_OUTPUT_DISTINCT_BIT_KHR)) {
+            dpb_hwfc->create_pnext = drm_create_pnext;
+            dpb_hwfc->tiling       = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+            av_assert2(ff_vk_find_struct(drm_create_pnext, VK_STRUCTURE_TYPE_VIDEO_PROFILE_LIST_INFO_KHR));
+        } else {
+            dpb_hwfc->create_pnext = profile_list;
+            dpb_hwfc->tiling       = VK_IMAGE_TILING_OPTIMAL;
+        }
         dpb_hwfc->format[0]    = s->hwfc->format[0];
-        dpb_hwfc->tiling       = VK_IMAGE_TILING_OPTIMAL;
         dpb_hwfc->usage        = VK_IMAGE_USAGE_VIDEO_DECODE_DPB_BIT_KHR;
 
         if (ctx->common.layered_dpb)

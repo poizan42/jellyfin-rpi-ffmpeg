@@ -27,6 +27,7 @@
 #include <mfxvideo.h>
 
 #include "libavutil/common.h"
+#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 
 #include "avcodec.h"
@@ -55,6 +56,14 @@ static int qsv_h264_set_encode_ctrl(AVCodecContext *avctx,
         res = ff_alloc_a53_sei(frame, sizeof(mfxPayload) + 2, (void**)&payload, &sei_size);
         if (res < 0 || !payload)
             return res;
+
+        if (sei_size >= UINT8_MAX) {
+            av_log(avctx, AV_LOG_VERBOSE,
+                   "A53 caption SEI payload is too large "
+                   "(%zu bytes), skipping\n", sei_size);
+            av_free(payload);
+            return 0;
+        }
 
         sei_data = (mfxU8*)(payload + 1);
         // SEI header
@@ -180,8 +189,8 @@ static const AVClass class = {
 static const FFCodecDefault qsv_enc_defaults[] = {
     { "b",         "0"     },
     { "refs",      "0"     },
-    { "g",         "-1"    },
-    { "bf",        "-1"    },
+    { "g",         "250"   },
+    { "bf",        "3"     },
     { "qmin",      "-1"    },
     { "qmax",      "-1"    },
     { "trellis",   "-1"    },

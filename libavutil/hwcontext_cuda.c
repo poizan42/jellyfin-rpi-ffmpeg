@@ -255,11 +255,17 @@ static int cuda_transfer_data(AVHWFramesContext *ctx, AVFrame *dst,
         return ret;
 
     for (i = 0; i < FF_ARRAY_ELEMS(src->data) && src->data[i]; i++) {
+        int bytewidth = av_image_get_linesize(ctx->sw_format, src->width, i);
+        if (bytewidth < 0) {
+            ret = bytewidth;
+            goto exit;
+        }
+
         CUDA_MEMCPY2D cpy = {
             .srcPitch      = src->linesize[i],
             .dstPitch      = dst->linesize[i],
-            .WidthInBytes  = FFMIN(src->linesize[i], dst->linesize[i]),
-            .Height        = src->height >> ((i == 0 || i == 3) ? 0 : priv->shift_height),
+            .WidthInBytes  = bytewidth,
+            .Height        = AV_CEIL_RSHIFT(src->height, ((i == 0 || i == 3) ? 0 : priv->shift_height)),
         };
 
         if (src->hw_frames_ctx) {

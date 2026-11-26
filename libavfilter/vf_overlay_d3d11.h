@@ -1,4 +1,8 @@
 /*
+ * D3D11 overlay filter shader constants
+ *
+ * Copyright (C) 2026 Gnattu OC <gnattuoc@me.com>
+ *
  * This file is part of FFmpeg.
  *
  * FFmpeg is free software; you can redistribute it and/or
@@ -16,4 +20,25 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include "libswscale/filters.c"
+#ifndef AVFILTER_OVERLAY_D3D11_H
+#define AVFILTER_OVERLAY_D3D11_H
+
+#define OVERLAY_D3D11_THREAD_GROUP_X 16
+#define OVERLAY_D3D11_THREAD_GROUP_Y 16
+
+typedef struct OverlayD3D11Params {
+    int dst_w;
+    int dst_h;
+    int ov_x;
+    int ov_y;
+    int ov_w;
+    int ov_h;
+    int ov_src_w;
+    int ov_src_h;
+    float alpha;
+    float pad0;
+    float pad1;
+    float pad2;
+} OverlayD3D11Params;
+
+#endif /* AVFILTER_OVERLAY_D3D11_H */
