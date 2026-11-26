@@ -1,7 +1,7 @@
 # Jellyfin / Raspberry Pi 4 fork — additions
 
 This fork adds a **real-time HEVC→H.264 downscaling transcode path** for the Raspberry Pi 4
-(BCM2711, Cortex-A72, VideoCore VI) on top of Jellyfin FFmpeg 8.1.2. Everything below is
+(BCM2711, Cortex-A72, VideoCore VI) on top of Jellyfin FFmpeg 8.1.3. Everything below is
 additive to upstream; the base FFmpeg is unchanged except where noted.
 
 ## The pipeline
@@ -241,13 +241,13 @@ graph, 1080p → 1080p, 1500 frames, two runs each: 1.92× on 66 core-seconds �
 ### 7. Build enablement for the HDR reference
 `--enable-libzimg` (`zscale`) gives a correct CPU HDR→SDR reference (`zscale+tonemap`).
 `--enable-libplacebo --enable-vulkan` link a **locally rebuilt** libplacebo 7.360 (Debian
-bookworm ships 4.208, too old for FFmpeg 8.x; its shaderc is also broken).
+bookworm shipped 4.208, too old for FFmpeg 8.x).
 Note: the libplacebo *filter* does not run on the Pi's V3DV (missing renderable formats), so the
 usable HDR reference here is the CPU `zscale+tonemap` chain.
 
 ## Building
 
-### Production configure (Pi 4, aarch64, Debian bookworm)
+### Production configure (Pi 4, aarch64, Debian trixie)
 
 This is what the deployed binary is built with — it must be **feature-complete enough to run
 any command line Jellyfin would have handed to the stock jellyfin-ffmpeg**, because the
@@ -257,7 +257,7 @@ side of the graph and passes everything else (notably `-codec:a`) through untouc
 ```sh
 ./configure --disable-doc --enable-gpl --enable-version3 \
   --enable-sand --enable-v4l2-request --enable-libdrm --enable-libudev \
-  --enable-libzimg --enable-libplacebo --enable-vulkan \
+  --enable-libzimg --enable-libplacebo --enable-vulkan --enable-libshaderc \
   --enable-libx264 --enable-libx265 --enable-libdav1d --enable-libvpx --enable-libwebp \
   --enable-libmp3lame --enable-libopus --enable-libvorbis --enable-libfdk-aac \
   --enable-libass --enable-libfreetype --enable-libfontconfig --enable-libfribidi --enable-libharfbuzz \
@@ -269,7 +269,11 @@ make -j4                                    # ~25 min from clean
 
 The last line of enables closes gaps against the stock build: `libzvbi`
 (teletext subtitles), `chromaprint` (fingerprint muxer), `libopenmpt` (tracker
-modules), `gmp` (encrypted RTMP: `rtmpe`/`rtmpte`/`ffrtmpcrypt`).
+modules), `gmp` (encrypted RTMP: `rtmpe`/`rtmpte`/`ffrtmpcrypt`). `--enable-libshaderc`
+(`libshaderc-dev`) gives the Vulkan filters a SPIR-V compiler: the stock 8.1.3-2 build ships
+`scale_vulkan`, `overlay_vulkan` and 13 more, which this fork lacked until 8.1.3. Jellyfin only
+emits them for a Vulkan hardware-acceleration setup, never on a Pi, but the superset check below
+has no way to know that, and it shouldn't.
 
 **`--enable-libfdk-aac` is not optional in practice.** Jellyfin *prefers*
 `libfdk_aac` for AAC output when its startup probe finds it, so a fork without it
@@ -280,11 +284,7 @@ binary non-redistributable), but **jellyfin-ffmpeg's patch
 how their own .deb ships it. That patch is applied here (by hand: its second hunk
 misses on context drift, though the change is just moving one line between two
 lists), so `CONFIG_LIBFDK_AAC=yes` with no `CONFIG_NONFREE` and the build stays
-GPLv3. Needs `libfdk-aac-dev` (Debian main). Two things the
-stock build has cannot be matched — `pp` (libpostproc) and the `hls` *protocol*
-were both removed in FFmpeg 8.0, and this fork is 8.x while the packaged
-jellyfin-ffmpeg is 7.x. The hls muxer/demuxer, which is what Jellyfin uses, are
-present.
+GPLv3. Needs `libfdk-aac-dev` (Debian main).
 
 ### The jellyfin-ffmpeg patch series is applied in-tree
 
@@ -295,21 +295,30 @@ filter Jellyfin puts in its software HDR chains), no `alphasrc`, no AC-4 decoder
 no `0027-pass-dovi-sidedata-to-hlsenc-and-mpegtsenc` — which sits directly on top
 of the Dolby Vision and SPS/PPS work here.
 
-The series is **applied as one commit on `jellyfin-rpi`** (94 of 96; the Rockchip
-RK3588 patch is skipped as the wrong platform, and `0026-remove-fdk-aac-from-nonfree`
-is applied by hand — see the libfdk-aac note above). It is jellyfin's own series and
-current for this base, so it is written against exactly this tree and applies without
-rejects.
+The series is **applied as one commit on `jellyfin-rpi`** (105 of 107 at 8.1.3: the
+Rockchip RK3588 patch `0042` is skipped as the wrong platform, and
+`0026-remove-fdk-aac-from-nonfree` is skipped and redone by hand in the commit after it —
+see the libfdk-aac note above). Every other patch applies, some with fuzz, because the
+fork's own additions shift the context in shared lists (`configure`, `allfilters.c`).
 
-**Rebasing onto a newer jellyfin-ffmpeg:** revert that commit, merge the new base,
-re-apply the series, commit again:
+**Merging a newer jellyfin-ffmpeg** (as done for 8.1.3):
 
 ```sh
-git revert --no-commit <series-commit>
-git merge jellyfin-upstream/jellyfin          # or the new tag
-while read -r p; do patch -p1 --forward -i "debian/patches/$p"; done < debian/patches/series
-git add -u && git commit
+git revert <fdk-aac-by-hand-commit> <series-commit>   # back to fork + pristine base
+git merge jellyfin-upstream/jellyfin
+# apply the NEW series in a clean worktree -- in the build tree, generated files
+# (e.g. libavfilter/opencl/*.c) collide with the files some patches create, and
+# patch(1) then skips those files while applying the rest of the patch
+git worktree add --detach ../wt HEAD && cd ../wt
+grep -vE '^(#|$|0042-|0026-)' debian/patches/series |
+  while read -r p; do patch -p1 --forward -i "debian/patches/$p" || echo "FAIL $p"; done
+git add -A && git commit                              # the new series commit
+git cherry-pick <fdk-aac-by-hand-commit>              # 0026's intent
 ```
+
+To check the series landed as it does upstream, apply the same patches to a worktree of
+pristine `jellyfin-upstream/jellyfin` and compare the fork's delta against upstream before
+and after patching: the added/removed lines must be identical (only hunk offsets move).
 
 Deliberate departures from stock jellyfin-ffmpeg: **static, not `--enable-shared`** (so
 `/opt/rpi-ffmpeg-orchestrator/ffmpeg-real` is one self-contained binary that `install.sh`
