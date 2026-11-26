@@ -31,7 +31,7 @@ prepare_extra_common() {
     mkdir iconv
     pushd iconv
     iconv_ver="1.19"
-    iconv_link="https://mirrors.edge.kernel.org/gnu/libiconv/libiconv-${iconv_ver}.tar.gz"
+    iconv_link="https://ftpmirror.gnu.org/gnu/libiconv/libiconv-${iconv_ver}.tar.gz"
     wget ${iconv_link} -O iconv.tar.gz
     tar xaf iconv.tar.gz
     pushd libiconv-${iconv_ver}
@@ -177,6 +177,40 @@ prepare_extra_common() {
     popd
     popd
 
+    # OGG
+    pushd ${SOURCE_DIR}
+    git clone -b v1.3.6 --depth=1 https://github.com/xiph/ogg.git
+    pushd ogg
+    ./autogen.sh
+    ./configure \
+        ${CROSS_OPT} \
+        --prefix=${TARGET_DIR} \
+        --disable-static \
+        --enable-shared \
+        --with-pic
+    make -j$(nproc) && make install && make install DESTDIR=${SOURCE_DIR}/ogg
+    echo "ogg${TARGET_DIR}/lib/libogg.so* usr/lib/jellyfin-ffmpeg/lib" >> ${DPKG_INSTALL_LIST}
+    popd
+    popd
+
+    # THEORA
+    pushd ${SOURCE_DIR}
+    git clone -b v1.2.0 --depth=1 https://github.com/xiph/theora.git
+    pushd theora
+    # autotools: relax autoconf requirement to 2.69
+    wget -q -O - https://github.com/xiph/theora/commit/3ae2669.patch | git apply
+    ./autogen.sh
+    ./configure \
+        ${CROSS_OPT} \
+        --prefix=${TARGET_DIR} \
+        --disable-{static,examples,extra-programs,oggtest,vorbistest,spec,doc} \
+        --enable-shared \
+        --with-pic
+    make -j$(nproc) && make install && make install DESTDIR=${SOURCE_DIR}/theora
+    echo "theora${TARGET_DIR}/lib/libtheora{enc,dec}.so* usr/lib/jellyfin-ffmpeg/lib" >> ${DPKG_INSTALL_LIST}
+    popd
+    popd
+
     # FFTW3
     pushd ${SOURCE_DIR}
     mkdir fftw3
@@ -208,7 +242,7 @@ prepare_extra_common() {
 
     # CHROMAPRINT
     pushd ${SOURCE_DIR}
-    git clone --depth=1 https://github.com/acoustid/chromaprint.git
+    git clone -b v1.6.0 --depth=1 https://github.com/acoustid/chromaprint.git
     pushd chromaprint
     echo "Libs.private: -lfftw3f -lstdc++" >> libchromaprint.pc.cmake
     echo "Cflags.private: -DCHROMAPRINT_NODLL" >> libchromaprint.pc.cmake
@@ -230,7 +264,7 @@ prepare_extra_common() {
 
     # ZIMG
     pushd ${SOURCE_DIR}
-    git clone --recursive --depth=1 https://github.com/sekrit-twc/zimg.git
+    git clone -b release-3.0.6 --recursive --depth=1 https://github.com/sekrit-twc/zimg.git
     pushd zimg
     ./autogen.sh
     ./configure --prefix=${TARGET_DIR} ${CROSS_OPT}
@@ -241,7 +275,7 @@ prepare_extra_common() {
 
     # DAV1D
     pushd ${SOURCE_DIR}
-    git clone -b 1.5.3 --depth=1 https://code.videolan.org/videolan/dav1d.git
+    git clone -b 1.5.4 --depth=1 https://code.videolan.org/videolan/dav1d.git
     meson setup dav1d dav1d_build \
         ${MESON_CROSS_OPT} \
         --prefix=${TARGET_DIR} \
@@ -258,7 +292,7 @@ prepare_extra_common() {
 
     # SVT-AV1
     pushd ${SOURCE_DIR}
-    git clone -b v4.1.0 --depth=1 https://gitlab.com/AOMediaCodec/SVT-AV1.git
+    git clone -b v4.3.0 --depth=1 https://gitlab.com/AOMediaCodec/SVT-AV1.git
     pushd SVT-AV1
     mkdir build
     pushd build
@@ -300,6 +334,234 @@ prepare_extra_common() {
     make PREFIX=${TARGET_DIR} install
     popd
     popd
+
+    # Install crossbuild dependencies
+    apt-get install -y lib{udev,pciaccess,zstd,elf,expat1}-dev:${ARCH}
+
+    # LIBDRM
+    pushd ${SOURCE_DIR}
+    mkdir libdrm
+    pushd libdrm
+    libdrm_ver="libdrm-2.4.131"
+    libdrm_link="https://gitlab.freedesktop.org/mesa/libdrm/-/archive/${libdrm_ver}/libdrm-${libdrm_ver}.tar.gz"
+    wget ${libdrm_link} -O libdrm.tar.gz
+    tar xaf libdrm.tar.gz
+    meson setup libdrm-${libdrm_ver} drm_build \
+        ${MESON_CROSS_OPT} \
+        --prefix=${TARGET_DIR} \
+        --libdir=lib \
+        --buildtype=release \
+        -D{udev,tests,install-test-programs}=false \
+        -D{amdgpu,radeon,intel}=enabled \
+        -D{etnaviv,valgrind,freedreno,vc4,vmwgfx,nouveau,man-pages}=disabled
+    meson configure drm_build
+    ninja -j$(nproc) -C drm_build install
+    cp -a ${TARGET_DIR}/lib/libdrm*.so* ${SOURCE_DIR}/libdrm
+    cp ${TARGET_DIR}/share/libdrm/*.ids ${SOURCE_DIR}/libdrm
+    echo "libdrm/libdrm*.so* usr/lib/jellyfin-ffmpeg/lib" >> ${DPKG_INSTALL_LIST}
+    echo "libdrm/*.ids usr/lib/jellyfin-ffmpeg/share/libdrm" >> ${DPKG_INSTALL_LIST}
+    popd
+    popd
+
+    # LIBVA
+    pushd ${SOURCE_DIR}
+    git clone -b 2.24.1 --depth=1 https://github.com/intel/libva.git
+    pushd libva
+    if [ "${ARCH}" = "arm64" ]; then
+        libva_drv_arch_path="/usr/lib/aarch64-linux-gnu/dri"
+    else
+        libva_drv_arch_path="/usr/lib/x86_64-linux-gnu/dri"
+    fi
+    sed -i "s#secure_getenv(\"LIBVA_DRIVERS_PATH\")#\"/usr/lib/jellyfin-ffmpeg/lib/dri:${libva_drv_arch_path}:/usr/lib/dri:/usr/local/lib/dri\"#g" va/va.c
+    sed -i "s#secure_getenv(\"LIBVA_DRIVER_NAME\")#secure_getenv(\"LIBVA_DRIVER_NAME_JELLYFIN\")#g" va/va.c
+    ./autogen.sh
+    ./configure \
+        ${CROSS_OPT} \
+        --prefix=${TARGET_DIR} \
+        --enable-drm \
+        --disable-{glx,x11,wayland,docs}
+    make -j$(nproc) && make install && make install DESTDIR=${SOURCE_DIR}/intel
+    echo "intel${TARGET_DIR}/lib/libva.so* usr/lib/jellyfin-ffmpeg/lib" >> ${DPKG_INSTALL_LIST}
+    echo "intel${TARGET_DIR}/lib/libva-drm.so* usr/lib/jellyfin-ffmpeg/lib" >> ${DPKG_INSTALL_LIST}
+    popd
+    popd
+
+    # LIBVA-UTILS
+    pushd ${SOURCE_DIR}
+    git clone -b 2.24.0 --depth=1 https://github.com/intel/libva-utils.git
+    pushd libva-utils
+    ./autogen.sh
+    ./configure \
+        ${CROSS_OPT} \
+        --prefix=${TARGET_DIR}
+    make -j$(nproc) && make install && make install DESTDIR=${SOURCE_DIR}/intel
+    echo "intel${TARGET_DIR}/bin/vainfo usr/lib/jellyfin-ffmpeg" >> ${DPKG_INSTALL_LIST}
+    popd
+    popd
+
+    # Vulkan Headers
+    pushd ${SOURCE_DIR}
+    git clone -b v1.4.355 --depth=1 https://github.com/KhronosGroup/Vulkan-Headers.git
+    pushd Vulkan-Headers
+    mkdir build && pushd build
+    cmake \
+        ${CMAKE_TOOLCHAIN_OPT} \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=${TARGET_DIR} ..
+    make -j$(nproc) && make install
+    popd
+    popd
+    popd
+
+    # Vulkan ICD Loader
+    pushd ${SOURCE_DIR}
+    git clone -b v1.4.355 --depth=1 https://github.com/KhronosGroup/Vulkan-Loader.git
+    pushd Vulkan-Loader
+    sed -i 's/memset(disable_struct, 0, sizeof.*);/& disable_struct->disable_all_implicit = 1;/' loader/loader_environment.c
+    mkdir build && pushd build
+    cmake \
+        ${CMAKE_TOOLCHAIN_OPT} \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_INSTALL_PREFIX=${TARGET_DIR} \
+        -DVULKAN_HEADERS_INSTALL_DIR="${TARGET_DIR}" \
+        -DCMAKE_INSTALL_SYSCONFDIR=${TARGET_DIR}/share \
+        -DCMAKE_INSTALL_DATADIR=${TARGET_DIR}/share \
+        -DCMAKE_INSTALL_LIBDIR=lib \
+        -DBUILD_TESTS=OFF \
+        -DBUILD_WSI_{XCB,XLIB,XLIB_XRANDR,WAYLAND}_SUPPORT=OFF ..
+    make -j$(nproc) && make install
+    cp -a ${TARGET_DIR}/lib/libvulkan.so* ${SOURCE_DIR}/Vulkan-Loader
+    echo "Vulkan-Loader/libvulkan.so* usr/lib/jellyfin-ffmpeg/lib" >> ${DPKG_INSTALL_LIST}
+    popd
+    popd
+    popd
+
+    # SHADERC
+    shaderc_ver="v2026.2"
+    pushd ${SOURCE_DIR}
+    git clone -b ${shaderc_ver} --depth=1 https://github.com/google/shaderc.git
+    pushd shaderc
+    ./utils/git-sync-deps
+    shaderc_conf=$(echo -GNinja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DSHADERC_SKIP_{TESTS,EXAMPLES,COPYRIGHT_CHECK}=ON \
+        -DENABLE_EXCEPTIONS=ON \
+        -DSPIRV_SKIP_EXECUTABLES=ON \
+        -DSPIRV_TOOLS_BUILD_STATIC=ON \
+        -DBUILD_SHARED_LIBS=OFF)
+    # Build native glslangValidator for crossbuild
+    if [ "${ARCH}" != "amd64" ]; then
+        mkdir glslang_build && pushd glslang_build
+        cmake $shaderc_conf \
+            -DENABLE_GLSLANG_BINARIES=ON ..
+        ninja -j$(nproc) third_party/glslang/StandAlone/glslang
+        cp third_party/glslang/StandAlone/glslangValidator ${TARGET_DIR}/bin
+        popd
+    fi
+    # Build target shaderc
+    mkdir shaderc_build && pushd shaderc_build
+    cmake $shaderc_conf \
+        ${CMAKE_TOOLCHAIN_OPT} \
+        -DENABLE_GLSLANG_BINARIES=$([ "${ARCH}" = "amd64" ] && echo "ON" || echo "OFF") \
+        -DCMAKE_INSTALL_PREFIX=${TARGET_DIR} ..
+    ninja -j$(nproc)
+    ninja install
+    cp -a ${TARGET_DIR}/lib/libshaderc_shared.so* ${SOURCE_DIR}/shaderc
+    echo "shaderc/libshaderc_shared* usr/lib/jellyfin-ffmpeg/lib" >> ${DPKG_INSTALL_LIST}
+    popd
+    popd
+    popd
+
+    # MESA
+    # Minimal libs for AMD VAAPI, AMD RADV and Intel ANV
+    if [[ ${LLVM_VER} -ge 15 ]]; then
+        if [[ "${ARCH}" = "amd64" && ${LLVMSPIRVLIB_VER} -ge 15 && ${LLVMSPIRVLIB_VER} -le 21 ]]; then
+            # Intel ANV requires llvmspirvlib >= 15 (and <= 21 in mesa 26.0)
+            mesa_vk_drv="amd,intel"
+            mesa_llvm_clc="enabled"
+            apt-get install -y {llvm-,libllvmspirvlib-,libclc-,libclang-,libclang-cpp}${LLVMSPIRVLIB_VER}-dev
+        else
+            mesa_vk_drv="amd"
+            mesa_llvm_clc="disabled"
+        fi
+        pushd ${SOURCE_DIR}
+        mkdir mesa
+        pushd mesa
+        mesa_ver="26.0-backport"
+        mesa_link="https://gitlab.freedesktop.org/nyanmisaka/mesa/-/archive/${mesa_ver}/mesa-${mesa_ver}.tar.gz"
+        wget ${mesa_link} -O mesa.tar.gz
+        tar xaf mesa.tar.gz
+        meson setup mesa-${mesa_ver} mesa_build \
+            ${MESON_CROSS_OPT} \
+            --prefix=${TARGET_DIR} \
+            --libdir=lib \
+            --buildtype=release \
+            --wrap-mode=nofallback \
+            -Db_ndebug=true \
+            -Db_lto=false \
+            -Dplatforms=[] \
+            -Dgallium-drivers=radeonsi \
+            -Dvulkan-drivers=${mesa_vk_drv} \
+            -Dvulkan-layers=[] \
+            -Dvulkan-manifest-per-architecture=true \
+            -Degl=disabled \
+            -Dgallium-{extra-hud,rusticl}=false \
+            -Dgallium-mediafoundation=disabled \
+            -Dgallium-va=enabled \
+            -Dvideo-codecs=all \
+            -Dgbm=disabled \
+            -Dgles1=disabled \
+            -Dgles2=disabled \
+            -Dopengl=false \
+            -Dglvnd=disabled \
+            -Dglx=disabled \
+            -Dlibunwind=disabled \
+            -Dllvm=${mesa_llvm_clc} \
+            -Damd-use-llvm=false \
+            -Dlmsensors=disabled \
+            -Dvalgrind=disabled \
+            -Dtools=[] \
+            -Dzstd=enabled \
+            -Dmicrosoft-clc=disabled \
+            -Dintel-elk=false
+        meson configure mesa_build
+        ninja -j$(nproc) -C mesa_build install
+        cp -a ${TARGET_DIR}/lib/libvulkan_*.so ${SOURCE_DIR}/mesa
+        # radeonsi_drv_video.so -> libgallium_drv_video.so is soft link
+        cp ${TARGET_DIR}/lib/dri/radeonsi_drv_video.so ${SOURCE_DIR}/mesa
+        echo "mesa/lib*.so usr/lib/jellyfin-ffmpeg/lib" >> ${DPKG_INSTALL_LIST}
+        echo "mesa/radeonsi_drv_video.so usr/lib/jellyfin-ffmpeg/lib/dri" >> ${DPKG_INSTALL_LIST}
+        cp ${TARGET_DIR}/share/drirc.d/*.conf ${SOURCE_DIR}/mesa
+        echo "mesa/*defaults.conf usr/lib/jellyfin-ffmpeg/share/drirc.d" >> ${DPKG_INSTALL_LIST}
+        cp ${TARGET_DIR}/share/vulkan/icd.d/*.json ${SOURCE_DIR}/mesa
+        echo "mesa/*icd.*.json usr/lib/jellyfin-ffmpeg/share/vulkan/icd.d" >> ${DPKG_INSTALL_LIST}
+        popd
+        popd
+    fi
+
+    # LIBPLACEBO
+    pushd ${SOURCE_DIR}
+    git clone -b v7.360.1 --recursive --depth=1 https://github.com/haasn/libplacebo.git
+    # Fix bit shift when importing P01x non-multiplane image
+    git -C libplacebo apply ${SOURCE_DIR}/builder/patches/libplacebo/*.patch
+    sed -i 's/env: python_env,//g' libplacebo/src/vulkan/meson.build
+    meson setup libplacebo placebo_build \
+        ${MESON_CROSS_OPT} \
+        --prefix=${TARGET_DIR} \
+        --libdir=lib \
+        --buildtype=release \
+        --default-library=shared \
+        -Dvulkan=enabled \
+        -Dvk-proc-addr=enabled \
+        -Dvulkan-registry=${TARGET_DIR}/share/vulkan/registry/vk.xml \
+        -Dshaderc=enabled \
+        -Dglslang=disabled \
+        -D{demos,tests,bench,fuzz}=false
+    meson configure placebo_build
+    ninja -j$(nproc) -C placebo_build install
+    cp -a ${TARGET_DIR}/lib/libplacebo.so* ${SOURCE_DIR}/libplacebo
+    echo "libplacebo/libplacebo* usr/lib/jellyfin-ffmpeg/lib" >> ${DPKG_INSTALL_LIST}
+    popd
 }
 
 # Prepare extra headers, libs and drivers for x86_64-linux-gnu
@@ -320,58 +582,6 @@ prepare_extra_amd64() {
     popd
     popd
 
-    # LIBDRM
-    pushd ${SOURCE_DIR}
-    mkdir libdrm
-    pushd libdrm
-    libdrm_ver="libdrm-2.4.131"
-    libdrm_link="https://gitlab.freedesktop.org/mesa/libdrm/-/archive/${libdrm_ver}/libdrm-${libdrm_ver}.tar.gz"
-    wget ${libdrm_link} -O libdrm.tar.gz
-    tar xaf libdrm.tar.gz
-    meson setup libdrm-${libdrm_ver} drm_build \
-        --prefix=${TARGET_DIR} \
-        --libdir=lib \
-        --buildtype=release \
-        -D{udev,tests,install-test-programs}=false \
-        -D{amdgpu,radeon,intel}=enabled \
-        -D{valgrind,freedreno,vc4,vmwgfx,nouveau,man-pages}=disabled
-    meson configure drm_build
-    ninja -j$(nproc) -C drm_build install
-    cp -a ${TARGET_DIR}/lib/libdrm*.so* ${SOURCE_DIR}/libdrm
-    cp ${TARGET_DIR}/share/libdrm/*.ids ${SOURCE_DIR}/libdrm
-    echo "libdrm/libdrm*.so* usr/lib/jellyfin-ffmpeg/lib" >> ${DPKG_INSTALL_LIST}
-    echo "libdrm/*.ids usr/lib/jellyfin-ffmpeg/share/libdrm" >> ${DPKG_INSTALL_LIST}
-    popd
-    popd
-
-    # LIBVA
-    pushd ${SOURCE_DIR}
-    git clone -b 2.24.1 --depth=1 https://github.com/intel/libva.git
-    pushd libva
-    sed -i 's|secure_getenv("LIBVA_DRIVERS_PATH")|"/usr/lib/jellyfin-ffmpeg/lib/dri:/usr/lib/x86_64-linux-gnu/dri:/usr/lib/dri:/usr/local/lib/dri"|g' va/va.c
-    sed -i 's|secure_getenv("LIBVA_DRIVER_NAME")|secure_getenv("LIBVA_DRIVER_NAME_JELLYFIN")|g' va/va.c
-    ./autogen.sh
-    ./configure \
-        --prefix=${TARGET_DIR} \
-        --enable-drm \
-        --disable-{glx,x11,wayland,docs}
-    make -j$(nproc) && make install && make install DESTDIR=${SOURCE_DIR}/intel
-    echo "intel${TARGET_DIR}/lib/libva.so* usr/lib/jellyfin-ffmpeg/lib" >> ${DPKG_INSTALL_LIST}
-    echo "intel${TARGET_DIR}/lib/libva-drm.so* usr/lib/jellyfin-ffmpeg/lib" >> ${DPKG_INSTALL_LIST}
-    popd
-    popd
-
-    # LIBVA-UTILS
-    pushd ${SOURCE_DIR}
-    git clone -b 2.24.0 --depth=1 https://github.com/intel/libva-utils.git
-    pushd libva-utils
-    ./autogen.sh
-    ./configure --prefix=${TARGET_DIR}
-    make -j$(nproc) && make install && make install DESTDIR=${SOURCE_DIR}/intel
-    echo "intel${TARGET_DIR}/bin/vainfo usr/lib/jellyfin-ffmpeg" >> ${DPKG_INSTALL_LIST}
-    popd
-    popd
-
     # INTEL-VAAPI-DRIVER
     pushd ${SOURCE_DIR}
     git clone --depth=1 https://github.com/intel/intel-vaapi-driver.git
@@ -387,7 +597,7 @@ prepare_extra_amd64() {
 
     # GMMLIB
     pushd ${SOURCE_DIR}
-    git clone -b intel-gmmlib-22.10.0 --depth=1 https://github.com/intel/gmmlib.git
+    git clone -b intel-gmmlib-22.10.2 --depth=1 https://github.com/intel/gmmlib.git
     pushd gmmlib
     mkdir build && pushd build
     cmake -DCMAKE_INSTALL_PREFIX=${TARGET_DIR} ..
@@ -448,7 +658,7 @@ prepare_extra_amd64() {
     # VPL-GPU-RT (RT only)
     # Provides VPL runtime (libmfx-gen.so.1.2) for 11th Gen Tiger Lake and newer
     pushd ${SOURCE_DIR}
-    git clone -b intel-onevpl-26.2.4 --depth=1 https://github.com/intel/vpl-gpu-rt.git
+    git clone -b intel-onevpl-26.3.5 --depth=1 https://github.com/intel/vpl-gpu-rt.git
     pushd vpl-gpu-rt
     # Fix missing entries in PicStruct validation
     wget -q -O - https://github.com/intel/vpl-gpu-rt/commit/c7eb030.patch | git apply
@@ -470,12 +680,12 @@ prepare_extra_amd64() {
     # Full Feature Build: ENABLE_KERNELS=ON(Default) ENABLE_NONFREE_KERNELS=ON(Default)
     # Free Kernel Build: ENABLE_KERNELS=ON ENABLE_NONFREE_KERNELS=OFF
     pushd ${SOURCE_DIR}
-    git clone -b intel-media-26.2.4 --depth=1 https://github.com/intel/media-driver.git
+    git clone -b intel-media-26.3.5 --depth=1 https://github.com/intel/media-driver.git
     pushd media-driver
     # Enable VC1 decode on DG2 (note that MTL+ is not supported)
     wget -q -O - https://github.com/intel/media-driver/commit/e47702f.patch | git apply
-    # Fix iHD crashes when used with Xe KMD on small BAR systems
-    wget -q -O - https://github.com/intel/media-driver/commit/6fd4037.patch | git apply
+    # Fix use-after-free when DestroyContext races StatusCheck (MTL+ only)
+    wget -q -O - https://github.com/intel/media-driver/commit/576fd26.patch | git apply
     mkdir build && pushd build
     cmake -DCMAKE_INSTALL_PREFIX=${TARGET_DIR} \
           -DCMAKE_C_FLAGS="${CFLAGS} -Wno-error=array-bounds" \
@@ -491,169 +701,6 @@ prepare_extra_amd64() {
     echo "intel/dri/iHD*.so usr/lib/jellyfin-ffmpeg/lib/dri" >> ${DPKG_INSTALL_LIST}
     popd
     popd
-    popd
-
-    # Vulkan Headers
-    pushd ${SOURCE_DIR}
-    git clone -b v1.4.355 --depth=1 https://github.com/KhronosGroup/Vulkan-Headers.git
-    pushd Vulkan-Headers
-    mkdir build && pushd build
-    cmake \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_INSTALL_PREFIX=${TARGET_DIR} ..
-    make -j$(nproc) && make install
-    popd
-    popd
-    popd
-
-    # Vulkan ICD Loader
-    pushd ${SOURCE_DIR}
-    git clone -b v1.4.355 --depth=1 https://github.com/KhronosGroup/Vulkan-Loader.git
-    pushd Vulkan-Loader
-    mkdir build && pushd build
-    cmake \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_INSTALL_PREFIX=${TARGET_DIR} \
-        -DVULKAN_HEADERS_INSTALL_DIR="${TARGET_DIR}" \
-        -DCMAKE_INSTALL_SYSCONFDIR=${TARGET_DIR}/share \
-        -DCMAKE_INSTALL_DATADIR=${TARGET_DIR}/share \
-        -DCMAKE_INSTALL_LIBDIR=lib \
-        -DBUILD_TESTS=OFF \
-        -DBUILD_WSI_{XCB,XLIB,WAYLAND}_SUPPORT=ON ..
-    make -j$(nproc) && make install
-    cp -a ${TARGET_DIR}/lib/libvulkan.so* ${SOURCE_DIR}/Vulkan-Loader
-    echo "Vulkan-Loader/libvulkan.so* usr/lib/jellyfin-ffmpeg/lib" >> ${DPKG_INSTALL_LIST}
-    popd
-    popd
-    popd
-
-    # SHADERC
-    shaderc_ver="v2026.2"
-    pushd ${SOURCE_DIR}
-    git clone -b ${shaderc_ver} --depth=1 https://github.com/google/shaderc.git
-    pushd shaderc
-    ./utils/git-sync-deps
-    mkdir build && pushd build
-    cmake \
-        -GNinja \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_INSTALL_PREFIX=${TARGET_DIR} \
-        -DSHADERC_SKIP_{TESTS,EXAMPLES,COPYRIGHT_CHECK}=ON \
-        -DENABLE_{GLSLANG_BINARIES,EXCEPTIONS}=ON \
-        -DENABLE_CTEST=OFF \
-        -DSPIRV_SKIP_EXECUTABLES=ON \
-        -DSPIRV_TOOLS_BUILD_STATIC=ON \
-        -DBUILD_SHARED_LIBS=OFF ..
-    ninja -j$(nproc)
-    ninja install
-    cp -a ${TARGET_DIR}/lib/libshaderc_shared.so* ${SOURCE_DIR}/shaderc
-    echo "shaderc/libshaderc_shared* usr/lib/jellyfin-ffmpeg/lib" >> ${DPKG_INSTALL_LIST}
-    popd
-    popd
-    popd
-
-    # MESA
-    # Minimal libs for AMD VAAPI, AMD RADV and Intel ANV
-    if [[ ${LLVM_VER} -ge 15 ]]; then
-        if [[ ${LLVMSPIRVLIB_VER} -ge 15 && ${LLVMSPIRVLIB_VER} -le 21 ]]; then
-            # Intel ANV requires llvmspirvlib >= 15 (and <= 21 in mesa 26.0)
-            mesa_vk_drv="amd,intel"
-            mesa_llvm_clc="enabled"
-            apt-get install -y {llvm-,libllvmspirvlib-,libclc-,libclang-,libclang-cpp}${LLVMSPIRVLIB_VER}-dev libudev-dev
-        else
-            mesa_vk_drv="amd"
-            mesa_llvm_clc="disabled"
-            apt-get install -y libudev-dev
-        fi
-        pushd ${SOURCE_DIR}
-        mkdir mesa
-        pushd mesa
-        mesa_ver="mesa-26.0.8"
-        mesa_link="https://gitlab.freedesktop.org/mesa/mesa/-/archive/${mesa_ver}/mesa-${mesa_ver}.tar.gz"
-        wget ${mesa_link} -O mesa.tar.gz
-        tar xaf mesa.tar.gz
-        # Enable VAAPI VPP alpha blending support
-        wget -q -O - https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/41090.patch | \
-            patch -p1 -d mesa-${mesa_ver}
-        # Fix misc CSC issues in VAAPI VPP
-        wget -q -O - https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/42181.patch | \
-            patch -p1 -d mesa-${mesa_ver}
-        # Fix setting VPE rotation with horizontal flip enabled
-        wget -q -O - https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/42408.patch | \
-            sed 's#/mm/#/#g' | patch -p1 -d mesa-${mesa_ver}
-        # Fix setting chroma swizzle mode in VK Video on GFX9
-        wget -q -O - https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/42763.patch | \
-            patch -p1 -d mesa-${mesa_ver}
-        meson setup mesa-${mesa_ver} mesa_build \
-            --prefix=${TARGET_DIR} \
-            --libdir=lib \
-            --buildtype=release \
-            --wrap-mode=nofallback \
-            -Db_ndebug=true \
-            -Db_lto=false \
-            -Dplatforms=x11 \
-            -Dgallium-drivers=radeonsi \
-            -Dvulkan-drivers=${mesa_vk_drv} \
-            -Dvulkan-layers=device-select \
-            -Dvulkan-manifest-per-architecture=true \
-            -Degl=disabled \
-            -Dgallium-{extra-hud,rusticl}=false \
-            -Dgallium-mediafoundation=disabled \
-            -Dgallium-va=enabled \
-            -Dvideo-codecs=all \
-            -Dgbm=disabled \
-            -Dgles1=disabled \
-            -Dgles2=disabled \
-            -Dopengl=false \
-            -Dglvnd=disabled \
-            -Dglx=disabled \
-            -Dlibunwind=disabled \
-            -Dllvm=${mesa_llvm_clc} \
-            -Damd-use-llvm=false \
-            -Dlmsensors=disabled \
-            -Dvalgrind=disabled \
-            -Dtools=[] \
-            -Dzstd=enabled \
-            -Dmicrosoft-clc=disabled \
-            -Dintel-elk=false
-        meson configure mesa_build
-        ninja -j$(nproc) -C mesa_build install
-        cp -a ${TARGET_DIR}/lib/libvulkan_*.so ${SOURCE_DIR}/mesa
-        cp -a ${TARGET_DIR}/lib/libVkLayer_MESA_device_select.so ${SOURCE_DIR}/mesa
-        # radeonsi_drv_video.so -> libgallium_drv_video.so is soft link
-        cp ${TARGET_DIR}/lib/dri/radeonsi_drv_video.so ${SOURCE_DIR}/mesa
-        echo "mesa/lib*.so usr/lib/jellyfin-ffmpeg/lib" >> ${DPKG_INSTALL_LIST}
-        echo "mesa/radeonsi_drv_video.so usr/lib/jellyfin-ffmpeg/lib/dri" >> ${DPKG_INSTALL_LIST}
-        cp ${TARGET_DIR}/share/drirc.d/*.conf ${SOURCE_DIR}/mesa
-        echo "mesa/*defaults.conf usr/lib/jellyfin-ffmpeg/share/drirc.d" >> ${DPKG_INSTALL_LIST}
-        cp ${TARGET_DIR}/share/vulkan/{icd.d,implicit_layer.d}/*.json ${SOURCE_DIR}/mesa
-        echo "mesa/*icd.x86_64.json usr/lib/jellyfin-ffmpeg/share/vulkan/icd.d" >> ${DPKG_INSTALL_LIST}
-        echo "mesa/*device_select.json usr/lib/jellyfin-ffmpeg/share/vulkan/implicit_layer.d" >> ${DPKG_INSTALL_LIST}
-        popd
-        popd
-    fi
-
-    # LIBPLACEBO
-    pushd ${SOURCE_DIR}
-    git clone -b v7.360.1 --recursive --depth=1 https://github.com/haasn/libplacebo.git
-    # Fix bit shift when importing P01x non-multiplane image
-    git -C libplacebo apply ${SOURCE_DIR}/builder/patches/libplacebo/*.patch
-    sed -i 's/env: python_env,//g' libplacebo/src/vulkan/meson.build
-    meson setup libplacebo placebo_build \
-        --prefix=${TARGET_DIR} \
-        --libdir=lib \
-        --buildtype=release \
-        --default-library=shared \
-        -Dvulkan=enabled \
-        -Dvk-proc-addr=enabled \
-        -Dvulkan-registry=${TARGET_DIR}/share/vulkan/registry/vk.xml \
-        -Dshaderc=enabled \
-        -Dglslang=disabled \
-        -D{demos,tests,bench,fuzz}=false
-    meson configure placebo_build
-    ninja -j$(nproc) -C placebo_build install
-    cp -a ${TARGET_DIR}/lib/libplacebo.so* ${SOURCE_DIR}/libplacebo
-    echo "libplacebo/libplacebo* usr/lib/jellyfin-ffmpeg/lib" >> ${DPKG_INSTALL_LIST}
     popd
 }
 
@@ -733,6 +780,8 @@ EOF
     for tool in {gcc,g++,gcc-ar,gcc-ranlib,gcc-nm}; do
         ln -sf "/usr/bin/aarch64-linux-gnu-$tool-${GCC_VER}" "/usr/bin/aarch64-linux-gnu-$tool"
     done
+    # Update pkgconfig search path
+    export PKG_CONFIG_PATH=${PKG_CONFIG_PATH}:/usr/lib/aarch64-linux-gnu/pkgconfig
 }
 
 # Set the architecture-specific options

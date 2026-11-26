@@ -1,3 +1,61 @@
+jellyfin-ffmpeg (8.1.3-2) unstable; urgency=medium
+
+  * Fix SVT-AV1 regression on legacy Windows versions (Server/LTSC 2016)
+  * Remove VideoToolbox caption SEI merging
+  * Fix SSE2 scene detection with unaligned input
+  * Update backported Vulkan/CUDA fixes from upstream
+  * Backport some VAAPI and DXVA fixes from upstream
+  * Skip oversized A53 caption SEI in QSV H264 encoder
+  * Fix vf_hwmap crash during graph reinitialization
+  * Improve QSV DX11-OCL sharing performance
+
+ -- nyanmisaka <nst799610810@gmail.com>  Thu, 8 Oct 2026 13:31:45 +0800
+
+jellyfin-ffmpeg (8.1.3-1) unstable; urgency=medium
+
+  * New upstream version 8.1.3
+  * Fix instability when using MSDK for hwupload on Windows
+  * Update backported vulkan fixes from upstream
+
+ -- nyanmisaka <nst799610810@gmail.com>  Tue, 22 Sep 2026 20:34:13 +0800
+
+jellyfin-ffmpeg (8.1.2-5) unstable; urgency=medium
+
+  * Make HDR10+ removal more precise
+  * Sync some fixes for ac4dec
+  * Fix QSV AV1 decoder exporting HDR side data
+  * Fix using hwmap with swscale unstable
+  * Fix potential RADV hang with linear images on ARM64
+  * Fix the hard cap on frame pool size for D3D11 hwctx
+
+ -- nyanmisaka <nst799610810@gmail.com>  Wed, 9 Sep 2026 17:31:57 +0800
+
+jellyfin-ffmpeg (8.1.2-4) unstable; urgency=medium
+
+  * Fix AMD hevc_vaapi encoder extradata with overrides
+  * Drop support for EOL Debian Bullseye (old old stable)
+
+ -- nyanmisaka <nst799610810@gmail.com>  Thu, 3 Sep 2026 12:38:02 +0800
+
+jellyfin-ffmpeg (8.1.2-3) unstable; urgency=medium
+
+  * Update backported vulkan fixes from upstream
+  * Polish some DX11-OCL sharing patches
+  * Update fixes for relaxing safe filenames in mkv attachments
+  * Backport a fix to not stall sub2video on stream EOF
+
+ -- nyanmisaka <nst799610810@gmail.com>  Wed, 12 Aug 2026 17:23:38 +0800
+
+jellyfin-ffmpeg (8.1.2-2) unstable; urgency=medium
+
+  * Add d3d11 overlay/tonemap/transpose/deint/scale filters
+  * Fix full range input for mjpeg_vaapi encoder
+  * Fix a typo in HDR10 metadata mapping in hevc_nvenc encoder
+  * Add misc enhancements to mfenc hw encoder
+  * Enable Mesa AMD drivers for arm64 builds
+
+ -- nyanmisaka <nst799610810@gmail.com>  Sat, 18 Jul 2026 18:39:50 +0800
+
 jellyfin-ffmpeg (8.1.2-1) unstable; urgency=medium
 
   * New upstream version 8.1.2

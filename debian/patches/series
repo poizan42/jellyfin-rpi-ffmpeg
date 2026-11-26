@@ -74,7 +74,7 @@
 0074-fix-mapped-hwframe-to-swframe-swscale-conversion.patch
 0075-fix-hwupload-filter-cannot-use-devices-created-by-hwaccel.patch
 0076-fix-seeking-h264-open-gop-videos-with-d3d11va-on-amd.patch
-0077-fix-readrate-catchup-caused-remuxing-to-stall.patch
+0077-suppress-the-resumed-reading-at-pts-with-rate-warning.patch
 0078-backport-fixes-for-vulkan-from-upstream.patch
 0079-add-fixes-for-vaapi-drm-prime-vulkan-interop.patch
 0080-prefer-vulkan-device-with-higher-api-version.patch
@@ -83,7 +83,7 @@
 0083-backport-fixes-for-cuda-from-upstream.patch
 0084-backport-fixes-for-detecting-ac4-streams-in-mpegts.patch
 0085-fix-hdr10-sidedata-not-removed-in-libplacebo-outlink.patch
-0086-workaround-amd-hevc-vaapi-encoder-out-of-band-vtag-hvc1.patch
+0086-fix-amd-hevc-vaapi-encoder-extradata-with-overrides.patch
 0087-add-dtsx-detect-for-dts-hd-hra.patch
 0088-add-webp-to-matroskadec-image-mime-types.patch
 0089-relax-to-allow-safe-filenames-in-mkv-attachments.patch
@@ -94,3 +94,14 @@
 0094-add-d3d11-tonemap-filter.patch
 0095-add-scale-d3d11-p010-shader-fallback.patch
 0096-fix-full-range-input-for-mjpeg-vaapi-encoder.patch
+0097-add-misc-enhancements-to-mfenc-hw-encoder.patch
+0098-backport-a-fix-to-not-stall-sub2video-on-stream-eof.patch
+0099-fix-qsv-av1-decoder-exporting-hdr-side-data.patch
+0100-backport-trim-bitstream-filter.patch
+0101-fix-videotoolbox-closed-caption-sei.patch
+0102-fix-sse2-scene-sad-unaligned-input.patch
+0103-backport-a-fix-for-pts-overflow-in-deint-vaapi-filter.patch
+0104-backport-a-fix-for-data-race-with-frame-threading-in-dxva.patch
+0105-skip-oversized-a53-caption-sei-in-qsv-h264-encoder.patch
+0106-unref-the-last-frame-on-filter-graph-cleanup.patch
+0107-backport-fixes-to-preserve-display-matrix-in-filter-graph.patch
