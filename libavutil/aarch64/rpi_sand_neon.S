@@ -46,8 +46,14 @@ function ff_rpi_sand8_lines_to_planar_y8, export=1
     // w8 will contain the number of blocks per row
     // w8 = floor(_w/stride1)
     // stride1 is assumed to always be 128
-    mov w8, w1
+    // (This used to be dst_stride/128, which over-runs every row whenever the
+    // destination is padded past the width.)
+    mov w8, w7
     lsr w8, w8, #7
+
+    // w16 = dst_stride - _w: skip to the start of the next destination row
+    // (rows used to be written back to back, ignoring dst_stride)
+    sub w16, w1, w7
 
     // in case the width of the image is not a multiple of 128, there will
     // be an incomplete block at the end of every row
@@ -64,8 +70,10 @@ function ff_rpi_sand8_lines_to_planar_y8, export=1
     sub w10, w10, #128
 
     // w11 is the row offset, meaning the start offset of the first block of every collumn
-    // this will be increased with stride1 within every iteration of the row_loop
-    eor w11, w11, w11
+    // this will be increased with stride1 within every iteration of the row_loop.
+    // It starts at row y (y * stride1); it used to start at 0 whatever y was, so any
+    // call for a band below the top of the frame re-read the top rows.
+    lsl w11, w6, #7
 
     // w12 = 0, processed row count
     eor w12, w12, w12
@@ -120,6 +128,8 @@ incomplete_block_loop_end_y8:
    
     // increase the row offset by 128 (stride1) 
     add w11, w11, #128
+    // step dst over the stride padding to the next row
+    add x0, x0, w16, sxtw
     // increment the row counter
     add w12, w12, #1
     
@@ -170,8 +180,10 @@ function ff_rpi_sand8_lines_to_planar_c8, export=1
     lsl w10, w6, #7
     sub w10, w10, #128
 
-    // w11 = row address start offset = 0
-    eor w11, w11, w11
+    // w11 = row address start offset = y * stride1 (y is the 9th arg, on the stack;
+    // this used to be 0 whatever y was)
+    ldr w11, [sp, #0]
+    lsl w11, w11, #7
 
 row_loop_c8:
     // start of the first block within the current row

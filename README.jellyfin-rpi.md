@@ -100,6 +100,17 @@ Direct 10-bit `SAND30` → 8-bit planar conversion, bit-exact (`checkasm --test=
 - `hwcontext_drm.c` offers `YUV420P` for `RPI4_10` downloads.
 - **Software prefetch** of the ~400 KB-stride SAND stripe reads in the sand30 loops
   (`prfm pldl1strm`) — hides DRAM latency; +8–9% single-thread (inert; checkasm unchanged).
+- **Fixed the inherited aarch64 8-bit SAND kernels** (`ff_rpi_sand8_lines_to_planar_y8`/`_c8`,
+  used for 8-bit HEVC Main). They ignored the start row `y`, and `_y8` took its block count from
+  `dst_stride` and ignored the destination padding. A whole-frame download (y=0, stride == width)
+  happens to satisfy all of that, so `hwdownload` was always exact. The slice-threaded filter
+  isn't: every band below the first re-read the top of the frame, so **8-bit HEVC came out of the
+  hardware path visibly corrupted** (rows from the top repeated down the frame) until this fix.
+  The 32-bit `arm/` kernels were always right. `checkasm --test=rpi_sand` now covers both 8-bit
+  kernels against a scalar oracle with y≠0, a padded stride and a partial last stripe. (The C
+  wrapper is no oracle: for x=0 it dispatches to the kernel under test.)
+- The aarch64-only tone-curve kernel is guarded with `ARCH_AARCH64`, so the 32-bit ARM build links
+  again.
 
 ### 2. The NEON→ISP bridge filter  `vf_sand_to_yuv420p_drm`  (`libavfilter/`)
 The core of the pipeline. Takes the decoder's SAND `DRM_PRIME` frame and emits an 8-bit linear
@@ -118,6 +129,13 @@ eating ~1.2 CPU cores as swscale. Properly `configure`-integrated
   unpack over-subscribes the 4-core chip otherwise).
 - Pooled CMA dma-bufs (dma-heap) for the output; DRM_PRIME → zero-copy into the encoder.
 - `SAND_PROF=1` env var: per-phase profiler (map / unpack / flush / unmap μs/frame).
+- **8-bit input** (`SAND128`/`RPI4_8`, 8-bit HEVC Main) takes its own `out=half` path: an 8-bit
+  scratch unpack and a rounded 2×2 average ((a+b+c+d+2)>>2) written straight to the output.
+  The 10-bit path's `YUV420P10` scratch has no 8-bit SAND unpack and used to fail with
+  "tone-map failed (fmt 270)". Both 8-bit outputs are bit-exact against a software decode: full
+  size matches it, and `out=half` matches its rounded 2×2 average. The tone-map tiers read
+  10-bit SAND only, so an 8-bit frame tagged PQ/HLG passes through untone-mapped, with a
+  one-time warning.
 
 ### 3. HDR→SDR tone-mapping  (`tm=none|fast|veryfast|accurate` option on the bridge filter)
 Without it, HDR10 (PQ/BT.2020) sources transcode with a plain 10→8-bit truncation → washed-out.

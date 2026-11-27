@@ -35,7 +35,78 @@
 #define ff_rpi_sand30_lines_to_planar_c16 NULL
 #define ff_rpi_sand30_lines_to_planar_y8 NULL
 #define ff_rpi_sand30_lines_to_planar_c8 NULL
+#define ff_rpi_sand8_lines_to_planar_y8 NULL
+#define ff_rpi_sand8_lines_to_planar_c8 NULL
 #endif
+
+/* 8-bit SAND (SAND128): 128-byte-wide stripes of stride2 rows each. The kernels
+ * are only ever called from x = 0, but a slice-threaded caller starts them at any
+ * row y with a padded destination, so test exactly that against a scalar oracle
+ * (the C wrapper is no oracle: for x == 0 it dispatches to these very kernels). */
+static void check_rpi_sand8(void)
+{
+    const unsigned int w = 1344;          /* 10.5 stripes: exercises the partial last block */
+    const unsigned int sh = 72;           /* rows per stripe (stride2) */
+    const unsigned int y = 6, h = 50;     /* start below the top of the stripe */
+    const unsigned int ds = w + 48;       /* padded destination stride */
+    const unsigned int nstripes = (w + 127) / 128;
+    const unsigned int ssize = nstripes * 128 * sh;
+    const unsigned int dsize = ds * (h + 2);
+    uint8_t *sbuf = malloc(ssize);
+    uint8_t *d0 = malloc(dsize), *d1 = malloc(dsize);
+    uint8_t *v0 = malloc(dsize), *v1 = malloc(dsize);
+    unsigned int i, r, c;
+
+    for (i = 0; i != ssize; i += 4)
+        *(uint32_t*)(sbuf + i) = rnd();
+
+    if (have_neon(av_get_cpu_flags()) &&
+        check_func(ff_rpi_sand8_lines_to_planar_y8, "rpi_sand8_to_planar_y8")) {
+        declare_func(void, uint8_t * dst, const unsigned int dst_stride,
+                     const uint8_t * src,
+                     unsigned int stride1, unsigned int stride2,
+                     unsigned int _x, unsigned int y,
+                     unsigned int _w, unsigned int h);
+
+        memset(d0, 0xbb, dsize);
+        memset(d1, 0xbb, dsize);
+        for (r = 0; r < h; r++)
+            for (c = 0; c < w; c++)
+                d0[r * ds + c] = sbuf[(c / 128) * 128 * sh + (y + r) * 128 + c % 128];
+        call_new(d1, ds, sbuf, 128, sh, 0, y, w, h);
+        if (memcmp(d0, d1, dsize))
+            fail();
+        bench_new(d1, ds, sbuf, 128, sh, 0, y, w, h);
+    }
+
+    if (have_neon(av_get_cpu_flags()) &&
+        check_func(ff_rpi_sand8_lines_to_planar_c8, "rpi_sand8_to_planar_c8")) {
+        declare_func(void, uint8_t * u_dst, const unsigned int u_stride,
+                     uint8_t * v_dst, const unsigned int v_stride,
+                     const uint8_t * src,
+                     unsigned int stride1, unsigned int stride2,
+                     unsigned int _x, unsigned int y,
+                     unsigned int _w, unsigned int h);
+        const unsigned int cw = w / 2;    /* chroma pairs: U,V interleaved bytes */
+
+        memset(d0, 0xbb, dsize); memset(v0, 0xbb, dsize);
+        memset(d1, 0xbb, dsize); memset(v1, 0xbb, dsize);
+        for (r = 0; r < h; r++)
+            for (c = 0; c < cw; c++) {
+                const unsigned int b = 2 * c;
+                const uint8_t *p = sbuf + (b / 128) * 128 * sh + (y + r) * 128 + b % 128;
+                d0[r * ds + c] = p[0];
+                v0[r * ds + c] = p[1];
+            }
+        call_new(d1, ds, v1, ds, sbuf, 128, sh, 0, y, cw, h);
+        if (memcmp(d0, d1, dsize) || memcmp(v0, v1, dsize))
+            fail();
+        bench_new(d1, ds, v1, ds, sbuf, 128, sh, 0, y, cw, h);
+    }
+
+    report("sand8");
+    free(sbuf); free(d0); free(d1); free(v0); free(v1);
+}
 
 static inline uint32_t pack30(unsigned int a, unsigned int b, unsigned int c)
 {
@@ -204,6 +275,8 @@ void checkasm_check_rpi_sand(void)
 
 
     report("sand30");
+
+    check_rpi_sand8();
 
     free(sbuf0);
     free(sbuf1);

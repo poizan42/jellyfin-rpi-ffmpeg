@@ -153,6 +153,7 @@ typedef struct BridgeContext {
     int      gen_peak;                     /* nits the g_* tables hold (0 = invalid / use baked) */
     int      warned_nopeak;                /* one-shot "no zscale" fallback warning */
     int      warned_p5_none;               /* one-shot "P5 + tm=none is wrong colour" warning */
+    int      warned_8bit_hdr;              /* one-shot "8-bit HDR-tagged input: no tone-map" warning */
     uint8_t *g_luma1d, *g_cb1d, *g_cr1d, *g_lut3d;      /* runtime PQ 1D+3D tables */
     uint8_t  g_l64[64], g_cb64[64], g_cr64[64], g_l64_next[64];  /* derived 64-entry NEON tables */
 } BridgeContext;
@@ -1218,10 +1219,74 @@ static void box2x2_row(uint16_t *d, const uint16_t *s0, const uint16_t *s1, unsi
     box2x2_row_scalar(d, s0, s1, dw, x);
 }
 
+/* out=half on 8-bit SAND (SAND128 / RPI4_8 — 8-bit HEVC Main, H.264): the 10-bit path
+ * below can't take it (its scratch is YUV420P10, which has no 8-bit SAND unpack), and an
+ * 8-bit source has nothing to tone-map. So: unpack each band to an 8-bit scratch and
+ * write the rounded 2x2 average ((a+b+c+d+2)>>2) straight into the half-res output. */
+static int sand_is_8bit(const AVFrame *f)
+{
+    return f->format == AV_PIX_FMT_SAND128 || f->format == AV_PIX_FMT_RPI4_8;
+}
+static void box2x2_row8(uint8_t *d, const uint8_t *s0, const uint8_t *s1, unsigned dw)
+{
+    unsigned x = 0;
+#if defined(__aarch64__)
+    for (; x + 16 <= dw; x += 16) {
+        uint16x8_t p0 = vaddq_u16(vpaddlq_u8(vld1q_u8(s0 + 2*x)),      vpaddlq_u8(vld1q_u8(s1 + 2*x)));
+        uint16x8_t p1 = vaddq_u16(vpaddlq_u8(vld1q_u8(s0 + 2*x + 16)), vpaddlq_u8(vld1q_u8(s1 + 2*x + 16)));
+        vst1q_u8(d + x, vcombine_u8(vrshrn_n_u16(p0, 2), vrshrn_n_u16(p1, 2)));
+    }
+#endif
+    for (; x < dw; x++)
+        d[x] = (uint8_t)((s0[2*x] + s0[2*x+1] + s1[2*x] + s1[2*x+1] + 2) >> 2);
+}
+static int half8_slice(const TMData *td, int jobnr, int nb_jobs)
+{
+    const unsigned H = td->H;
+    const unsigned Wo = td->dst->width, cwo = Wo / 2;   /* output (half) dims */
+    const unsigned Ws = Wo * 2, cws = Ws / 2;           /* source (input) dims */
+    unsigned y0 = ((uint64_t)H *  jobnr      / nb_jobs) & ~3u;   /* whole 2x2 chroma blocks */
+    unsigned y1 = (jobnr == nb_jobs - 1) ? H : (((uint64_t)H * (jobnr + 1) / nb_jobs) & ~3u);
+    if (y1 <= y0)
+        return 0;
+    uint8_t *sy = av_malloc((size_t)TM_CHUNK * Ws);
+    uint8_t *su = av_malloc((size_t)(TM_CHUNK/2) * cws);
+    uint8_t *sv = av_malloc((size_t)(TM_CHUNK/2) * cws);
+    if (!sy || !su || !sv) { av_free(sy); av_free(su); av_free(sv); return AVERROR(ENOMEM); }
+    AVFrame s8 = { 0 };
+    s8.format = AV_PIX_FMT_YUV420P; s8.width = Ws;
+    s8.data[0] = sy; s8.linesize[0] = Ws;
+    s8.data[1] = su; s8.linesize[1] = cws;
+    s8.data[2] = sv; s8.linesize[2] = cws;
+    int rv = 0;
+    for (unsigned y = y0; y < y1; y += TM_CHUNK) {
+        unsigned ch = FFMIN((unsigned)TM_CHUNK, y1 - y);   /* multiple of 4 (aligned) */
+        s8.height = ch;
+        AVFrame src = *td->src;
+        src.crop_top    = td->src->crop_top + y;
+        src.crop_bottom = td->src->height - (td->src->crop_top + y + ch);
+        if ((rv = av_rpi_sand_to_planar_frame(&s8, &src)))
+            break;
+        for (unsigned r = 0; r < ch / 2; r++)
+            box2x2_row8(td->dst->data[0] + (size_t)(y/2 + r) * td->dst->linesize[0],
+                        sy + (size_t)(2*r) * Ws, sy + (size_t)(2*r + 1) * Ws, Wo);
+        for (unsigned r = 0; r < ch / 4; r++) {
+            box2x2_row8(td->dst->data[1] + (size_t)(y/4 + r) * td->dst->linesize[1],
+                        su + (size_t)(2*r) * cws, su + (size_t)(2*r + 1) * cws, cwo);
+            box2x2_row8(td->dst->data[2] + (size_t)(y/4 + r) * td->dst->linesize[2],
+                        sv + (size_t)(2*r) * cws, sv + (size_t)(2*r + 1) * cws, cwo);
+        }
+    }
+    av_free(sy); av_free(su); av_free(sv);
+    return rv;
+}
+
 static int tm_slice(AVFilterContext *avctx, void *arg, int jobnr, int nb_jobs)
 {
     const TMData *td = arg;
 
+    if (td->half && sand_is_8bit(td->src))
+        return half8_slice(td, jobnr, nb_jobs);
     if (td->half) {
         /* out=half: unpack each TM_CHUNK band of the 4K source to a full-width 10-bit
          * scratch, box-average 2x2 -> half-res scratch, then run the EXISTING apply at
@@ -1678,7 +1743,17 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
      * once instead; picking the tier is the caller's job. */
     const AVFrameSideData *dovi_sd = av_frame_get_side_data(in, AV_FRAME_DATA_DOVI_METADATA);
     const int is_p5 = dovi_sd && !frame_is_hdr(in);
-    const int do_tm = (s->tm != TM_NONE) && (is_p5 || frame_is_hdr(in));
+    /* The tone-map tiers all read 10-bit SAND (SAND30 kernels / a YUV420P10 scratch). An
+     * 8-bit source tagged PQ/HLG is legal but essentially never produced; pass it through
+     * untone-mapped rather than fail or read it as SAND30. */
+    const int is8 = sand_is_8bit(mapped);
+    const int do_tm = (s->tm != TM_NONE) && !is8 && (is_p5 || frame_is_hdr(in));
+    if (is8 && s->tm != TM_NONE && (is_p5 || frame_is_hdr(in)) && !s->warned_8bit_hdr) {
+        s->warned_8bit_hdr = 1;
+        av_log(avctx, AV_LOG_WARNING,
+               "8-bit input tagged HDR/Dolby Vision: tone-mapping needs 10-bit input; "
+               "passing it through untone-mapped\n");
+    }
     if (is_p5 && !do_tm && !s->warned_p5_none) {
         s->warned_p5_none = 1;
         av_log(avctx, AV_LOG_WARNING,
