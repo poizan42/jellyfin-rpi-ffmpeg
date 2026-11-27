@@ -353,6 +353,31 @@ slow transcode. `transcode-orchestrator/check-capabilities.sh` diffs this build 
 stock jellyfin-ffmpeg and `install.sh` refuses to deploy on an unexplained gap. The lean
 configure below is for fast iteration only.
 
+### The Raspberry Pi code: where it comes from and how far it is synced
+The RPi hardware support comes from **`jc-kynesim/rpi-ffmpeg`**: John Cox's repo for the
+Raspberry Pi FFmpeg work. Raspberry Pi OS packages it via `RPi-Distro/ffmpeg`; there is no
+`raspberrypi/rpi-ffmpeg`. It covers the v4l2-request rpivid HEVC decoder, the SAND pixel
+formats, DRM_PRIME, and the `*_v4l2m2m` and sand filters. Add it with
+`git remote add rpi https://github.com/jc-kynesim/rpi-ffmpeg.git`. Its branches are
+`test/<ffmpeg version>/main`, rebased on each FFmpeg release.
+
+There is **no merge relationship.** jellyfin-ffmpeg's history is Debian packaging and shares no
+ancestor with FFmpeg's git, where the RPi branches live. So the RPi delta was applied once as a
+squashed commit (`5395eecb9b`): `n8.1.2..test/8.1.2/main` as of 2026-07-20. Later upstream
+changes come in by cherry-pick (`-x`, so the source sha is recorded). To check for drift,
+compare file contents, not dates. For every file in `git diff --name-only n8.1.2
+rpi/test/<ver>/main`, compare its blob in our snapshot point, in upstream's tip and on
+`jellyfin-rpi`.
+
+Synced as of 2026-11-27: everything on `test/8.1.2/main` up to `f60aae1702`, except two `pi-util`
+test-script commits, plus `12cc1f42f0` from `test/9.0.2/main`. That commit frees the software-
+decode helper arrays when the hardware decoder is in use. It cuts peak RSS for a 4K hardware
+transcode from 180 MB to 61 MB, and for 1080p from 70 MB to 35 MB. It sits next to our HW→SW
+fallback fix, which re-allocates the arrays if decode drops to software. A HW→SW→HW splice
+(1080p Main10, then 4:4:4, then Main10) decodes identically with and without frame threading.
+Upstream has none of this fork's RPi fixes. In particular, 9.0.2's aarch64 `sand8` kernels still
+ignore the start row (see §1).
+
 ### Minimal configure (fast iteration on the video kernels only)
 
 ```sh
